@@ -3,6 +3,7 @@ name = "sbrs"
 version = "0.1.0"
 edition = "2024"
 description = "Shell Buddy (sb)"
+repository = "https://github.com/hjelev/sbrs"
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
@@ -20,3 +21,8 @@ lto = true          # Enable Link Time Optimization (huge help)
 codegen-units = 1   # Reduces parallel builds to allow better optimization
 panic = 'abort'     # Removes stack unwinding code (saves space)
 strip = true        # Automatically removes debug symbols (the biggest saver!)
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
