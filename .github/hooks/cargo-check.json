@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/scripts/cargo-check.py",
+        "timeout": 30
+      }
+    ]
+  }
+}
