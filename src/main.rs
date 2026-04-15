@@ -2561,11 +2561,14 @@ fn main() -> io::Result<()> {
             ];
             if app.integration_enabled("git") {
                 if let Some((branch, is_dirty)) = App::get_git_info(&app.current_dir) {
-                path_spans.push(Span::styled(format!(" ({})", branch), Style::default().fg(Color::Rgb(100, 150, 255))));
-                if is_dirty {
-                    path_spans.push(Span::styled("*", Style::default().fg(Color::White)));
+                    let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
+                    path_spans.push(Span::styled(" (", branch_style));
+                    path_spans.push(Span::styled(branch, branch_style));
+                    path_spans.push(Span::styled(")", branch_style));
+                    if is_dirty {
+                        path_spans.push(Span::styled("*", Style::default().fg(Color::White)));
+                    }
                 }
-            }
             }
             f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             if app.mode == AppMode::PathEditing {
@@ -2582,6 +2585,30 @@ fn main() -> io::Result<()> {
             let show_date = term_w >= 90;
             let show_size = term_w >= 70;
             let show_meta = term_w >= 50;
+            let meta_width = 18usize;
+            let size_width = 8usize;
+            let date_width = 16usize;
+            let reserved_width = (if show_meta { meta_width } else { 0 })
+                + (if show_size { size_width } else { 0 })
+                + (if show_date { date_width } else { 0 });
+            let name_cell_width = (term_w as usize).saturating_sub(reserved_width);
+            // Keep a small safety margin so truncation occurs before the table widget clips.
+            let file_name_width = name_cell_width.saturating_sub(6).max(1);
+
+            let truncate_with_ellipsis = |s: &str, max: usize| -> String {
+                if s.chars().count() <= max {
+                    return s.to_string();
+                }
+                if max <= 1 {
+                    return "…".to_string();
+                }
+                let mut out = String::new();
+                for ch in s.chars().take(max - 1) {
+                    out.push(ch);
+                }
+                out.push('…');
+                out
+            };
 
             let rows: Vec<Row> = app.entries.iter().enumerate().map(|(idx, e)| {
                 let path = e.path();
@@ -2666,25 +2693,41 @@ fn main() -> io::Result<()> {
                 
                 let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
                 let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
-                let meta_col = format!("{} {}", perms, owner);
+                let meta_raw = format!("{} {}", perms, owner);
+                let meta_trimmed = if meta_raw.chars().count() > meta_width {
+                    meta_raw
+                        .chars()
+                        .rev()
+                        .take(meta_width)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<String>()
+                } else {
+                    meta_raw
+                };
+                let meta_col = format!("{:>width$}", meta_trimmed, width = meta_width);
                 let size = meta.as_ref().map(|m| if m.is_dir() { "-".into() } else { App::format_size(m.len()) }).unwrap_or_default();
-                let size_col = format!("{:>8}", size);
+                let size_col = format!("{:>width$}", size, width = size_width);
                 let date = meta.as_ref().and_then(|m| m.modified().ok()).map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+                let date_col = format!("{:>width$}", date, width = date_width);
+                let raw_name = e.file_name().to_string_lossy().into_owned();
+                let rendered_name = truncate_with_ellipsis(&raw_name, file_name_width);
 
                 let mut cells = vec![Cell::from(Line::from(vec![
                     Span::styled(format!("{} ", icon_glyph), icon_style),
-                    Span::styled(e.file_name().to_string_lossy().into_owned(), name_style),
+                    Span::styled(rendered_name, name_style),
                 ]))];
                 if show_meta { cells.push(Cell::from(Span::styled(meta_col, Style::default().fg(Color::Rgb(180, 150, 100))))); }
                 if show_size { cells.push(Cell::from(Span::styled(size_col, Style::default().fg(Color::Green)))); }
-                if show_date { cells.push(Cell::from(Span::styled(date, Style::default().fg(Color::Blue)))); }
+                if show_date { cells.push(Cell::from(Span::styled(date_col, Style::default().fg(Color::Blue)))); }
                 Row::new(cells).style(if is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
 
             let mut col_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
-            if show_meta { col_constraints.push(Constraint::Length(20)); }
-            if show_size { col_constraints.push(Constraint::Length(8)); }
-            if show_date { col_constraints.push(Constraint::Min(20)); }
+            if show_meta { col_constraints.push(Constraint::Length(meta_width as u16)); }
+            if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
+            if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
             let table = Table::new(rows, col_constraints)
                 .highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)))
                 .highlight_symbol(""); 
@@ -2692,6 +2735,124 @@ fn main() -> io::Result<()> {
             let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
             app.page_size = (table_area.height as usize).saturating_sub(1).max(1);
             f.render_stateful_widget(table, table_area, &mut app.table_state);
+
+            // If the selected item is truncated, temporarily hide its metadata and
+            // render its full name across the whole row width.
+            if let Some(selected_idx) = app.table_state.selected() {
+                if let Some(entry) = app.entries.get(selected_idx) {
+                    let full_name = entry.file_name().to_string_lossy().into_owned();
+                    if full_name.chars().count() > file_name_width {
+                        let offset = app.table_state.offset();
+                        if selected_idx >= offset {
+                            let row_in_view = selected_idx - offset;
+                            if row_in_view < table_area.height as usize {
+                                let row_area = Rect::new(
+                                    table_area.x,
+                                    table_area.y + row_in_view as u16,
+                                    table_area.width,
+                                    1,
+                                );
+
+                                let path = entry.path();
+                                let meta = entry.metadata().ok();
+                                let is_dir = path.is_dir();
+                                let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
+                                let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
+
+                                let icon_data = if app.nerd_font_active {
+                                    Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
+                                } else {
+                                    None
+                                };
+
+                                let (icon, icon_style) = if app.nerd_font_active {
+                                    if is_symlink {
+                                        ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
+                                    } else if is_dir {
+                                        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                        let dir_style = Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD);
+                                        if let Some((glyph, _)) = named_dir_icon(dir_name) {
+                                            (glyph.to_string(), dir_style)
+                                        } else {
+                                            ("\u{F07B}".to_string(), dir_style)
+                                        }
+                                    } else {
+                                        let icon = icon_data.as_ref().map(|i| i.icon.to_string()).unwrap_or_else(|| "?".to_string());
+                                        let color = icon_data
+                                            .as_ref()
+                                            .and_then(|i| Color::from_str(i.color).ok())
+                                            .unwrap_or(Color::White);
+                                        (icon, Style::default().fg(color))
+                                    }
+                                } else if is_symlink {
+                                    ("↪".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
+                                } else if is_dir {
+                                    ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
+                                } else {
+                                    let ext = path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|s| s.to_ascii_lowercase())
+                                        .unwrap_or_default();
+                                    if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico"].contains(&ext.as_str()) {
+                                        ("🖼".to_string(), Style::default().fg(Color::Rgb(255, 200, 60)))
+                                    } else if ["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "aif", "alac", "mid", "midi"].contains(&ext.as_str()) {
+                                        ("♪".to_string(), Style::default().fg(Color::Rgb(180, 100, 220)))
+                                    } else if ["zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa", "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc", "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl"].contains(&ext.as_str()) {
+                                        ("🗜".to_string(), Style::default().fg(Color::Rgb(255, 183, 77)))
+                                    } else if ["json", "jsonc", "jsonl", "ndjson", "geojson", "toml", "yaml", "yml"].contains(&ext.as_str()) {
+                                        ("⚙".to_string(), Style::default().fg(Color::Rgb(120, 200, 255)))
+                                    } else {
+                                        ("📄".to_string(), Style::default().fg(Color::White))
+                                    }
+                                };
+
+                                let mut name_style = if is_dir {
+                                    Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD)
+                                } else {
+                                    let file_color = icon_data
+                                        .as_ref()
+                                        .and_then(|i| Color::from_str(i.color).ok())
+                                        .unwrap_or(Color::White);
+                                    Style::default().fg(file_color)
+                                };
+
+                                if is_symlink {
+                                    name_style = Style::default().fg(Color::Rgb(100, 220, 220));
+                                }
+
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    if !is_dir && meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
+                                        name_style = Style::default().fg(Color::Rgb(120, 220, 120));
+                                    }
+                                }
+
+                                if is_hidden {
+                                    name_style = name_style.add_modifier(Modifier::DIM);
+                                }
+
+                                f.render_widget(Clear, row_area);
+                                f.render_widget(
+                                    Block::default().style(Style::default().bg(Color::Rgb(50, 50, 50))),
+                                    row_area,
+                                );
+                                f.render_widget(
+                                    Paragraph::new(Line::from(vec![
+                                        Span::styled(format!("{} ", icon), icon_style),
+                                        Span::styled(
+                                            full_name,
+                                            name_style,
+                                        ),
+                                    ])),
+                                    row_area,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // --- Overlays ---
             if app.mode == AppMode::Help {
