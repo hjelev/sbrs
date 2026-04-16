@@ -94,15 +94,26 @@ If an optional tool is not available, the feature is skipped or falls back grace
 - `EDITOR`: editor command used by `e`/`F4`
 - `SB_BOOKMARK_0` ... `SB_BOOKMARK_9`: bookmark directories
 
-## Shell Integration Idea
+## Shell Integration
 
-On exit, `sbrs` writes its final directory to:
+To enable automatic directory change on exit, add the following function to your shell configuration file (e.g., `~/.bashrc`, `~/.zshrc`):
 
-```text
-/tmp/sb_path
+```bash
+sb () {
+    "$HOME/.cargo/bin/sbrs" "$@"
+    if [ -f /tmp/sb_path ]
+    then
+        cd "$(cat /tmp/sb_path)"
+        rm -i -f /tmp/sb_path
+    fi
+}
 ```
 
-You can use that file in a wrapper function to `cd` your shell after quitting the app.
+After adding the function, reload your shell configuration:
+
+```bash
+source ~/.bashrc  # or source ~/.zshrc
+```
 
 ## Project Structure
 
