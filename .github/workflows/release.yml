@@ -77,6 +77,13 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
+          VERSION="$(printf '%s\n' "${{ github.ref_name }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
+          if [ -z "$VERSION" ]; then
+            echo "Failed to parse semver from tag: ${{ github.ref_name }}" >&2
+            exit 1
+          fi
+          sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+          grep '^version\s*=' Cargo.toml
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
@@ -141,6 +148,11 @@ jobs:
           ${{ matrix.packages_install }}
       - name: Build artifacts
         run: |
+          VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
+          if [ -n "$VERSION" ]; then
+            sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+            grep '^version\s*=' Cargo.toml
+          fi
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
@@ -195,6 +207,11 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
+          VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
+          if [ -n "$VERSION" ]; then
+            sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+            grep '^version\s*=' Cargo.toml
+          fi
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
@@ -245,6 +262,11 @@ jobs:
       - id: host
         shell: bash
         run: |
+          VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
+          if [ -n "$VERSION" ]; then
+            sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+            grep '^version\s*=' Cargo.toml
+          fi
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
