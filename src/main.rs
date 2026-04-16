@@ -3541,12 +3541,14 @@ fn main() -> io::Result<()> {
             }
 
             // --- Footer ---
-            let left_status = format!(
-                "[total:{} sel:{} clip:{}]",
-                app.entries.len(),
-                app.marked_indices.len(),
-                app.clipboard.len()
-            );
+            let mut left_status_parts = vec![format!("Total:{}", app.entries.len())];
+            if !app.marked_indices.is_empty() {
+                left_status_parts.push(format!("Selected:{}", app.marked_indices.len()));
+            }
+            if !app.clipboard.is_empty() {
+                left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
+            }
+            let left_status = left_status_parts.join(" │ ");
             let right_status = "c:copy v:paste m:move r:rename d:del e:edit o:open-gui ~:home h:help q:quit";
             let width = chunks[1].width as usize;
             let left_len = left_status.chars().count();
@@ -3574,6 +3576,57 @@ fn main() -> io::Result<()> {
                 };
                 (" ".to_string(), right_trimmed)
             };
+
+            let mut left_spans: Vec<Span> = Vec::new();
+            let mut left_segment = String::new();
+            let mut left_in_ws = true;
+            for ch in left_status.chars() {
+                let is_ws = ch.is_whitespace();
+                if left_segment.is_empty() {
+                    left_in_ws = is_ws;
+                }
+                if is_ws == left_in_ws {
+                    left_segment.push(ch);
+                } else {
+                    if left_in_ws {
+                        left_spans.push(Span::styled(left_segment.clone(), Style::default().fg(Color::DarkGray)));
+                    } else if let Some(colon_idx) = left_segment.find(':') {
+                        let (key, rest) = left_segment.split_at(colon_idx);
+                        if !key.is_empty() {
+                            left_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::DarkGray)));
+                        }
+                        if let Some(stripped) = rest.strip_prefix(':') {
+                            left_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
+                            left_spans.push(Span::styled(stripped.to_string(), Style::default().fg(Color::White)));
+                        } else {
+                            left_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
+                        }
+                    } else {
+                        left_spans.push(Span::styled(left_segment.clone(), Style::default().fg(Color::DarkGray)));
+                    }
+                    left_segment.clear();
+                    left_segment.push(ch);
+                    left_in_ws = is_ws;
+                }
+            }
+            if !left_segment.is_empty() {
+                if left_in_ws {
+                    left_spans.push(Span::styled(left_segment, Style::default().fg(Color::DarkGray)));
+                } else if let Some(colon_idx) = left_segment.find(':') {
+                    let (key, rest) = left_segment.split_at(colon_idx);
+                    if !key.is_empty() {
+                        left_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::DarkGray)));
+                    }
+                    if let Some(stripped) = rest.strip_prefix(':') {
+                        left_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
+                        left_spans.push(Span::styled(stripped.to_string(), Style::default().fg(Color::White)));
+                    } else {
+                        left_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
+                    }
+                } else {
+                    left_spans.push(Span::styled(left_segment, Style::default().fg(Color::DarkGray)));
+                }
+            }
 
             let mut right_spans: Vec<Span> = Vec::new();
             let mut segment = String::new();
@@ -3616,7 +3669,8 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            let mut status_spans: Vec<Span> = vec![Span::raw(left_status), Span::raw(gap)];
+            let mut status_spans: Vec<Span> = left_spans;
+            status_spans.push(Span::raw(gap));
             status_spans.extend(right_spans);
             let status = Line::from(status_spans);
             f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
