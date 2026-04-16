@@ -137,8 +137,12 @@ struct App {
     archive_started_at: Option<Instant>,
     archive_name: String,
     nerd_font_active: bool,
+    no_color: bool,
+    show_icons: bool,
     integration_selected: usize,
     integration_overrides: HashMap<String, bool>,
+    help_scroll_offset: u16,
+    help_max_offset: u16,
 }
 
 #[derive(Clone)]
@@ -165,6 +169,26 @@ const ZIP_BASED_EXTENSIONS: &[&str] = &[
     "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc",
     "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl",
 ];
+
+fn env_flag_true(names: &[&str]) -> bool {
+    for name in names {
+        if let Ok(raw) = env::var(name) {
+            let v = raw.trim();
+            let is_true = v == "1" || v.eq_ignore_ascii_case("true");
+            if !is_true && *name == "NO_COLOR" {
+                // SAFETY: This runs during startup/list-mode initialization before any
+                // worker threads are spawned, so mutating the process environment here
+                // avoids races while ensuring falsey NO_COLOR values do not leak through
+                // to downstream color handling.
+                unsafe {
+                    env::remove_var(name);
+                }
+            }
+            return is_true;
+        }
+    }
+    false
+}
 
 impl App {
     fn new() -> io::Result<Self> {
@@ -210,8 +234,12 @@ impl App {
             archive_started_at: None,
             archive_name: String::new(),
             nerd_font_active: env::var("NERD_FONT_ACTIVE").map(|v| v == "1").unwrap_or(false),
+            no_color: env_flag_true(&["NO_COLOR"]),
+            show_icons: env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true),
             integration_selected: 0,
             integration_overrides: HashMap::new(),
+            help_scroll_offset: 0,
+            help_max_offset: 0,
         };
         app.refresh_entries()?;
         Ok(app)
@@ -351,6 +379,10 @@ impl App {
 
     fn is_fuse_zip_archive(path: &PathBuf) -> bool {
         matches!(Self::archive_kind(path), Some(ArchiveKind::Zip))
+    }
+
+    fn is_archivemount_archive(path: &PathBuf) -> bool {
+        matches!(Self::archive_kind(path), Some(ArchiveKind::Tar) | Some(ArchiveKind::Zip))
     }
 
     fn archive_kind(path: &PathBuf) -> Option<ArchiveKind> {
@@ -720,8 +752,12 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn try_mount_archive(&mut self, archive_path: PathBuf) -> bool {
-        if !self.integration_active("fuse-zip") {
-            self.set_status("fuse-zip not installed");
+        self.try_mount_archive_with(archive_path, "fuse-zip")
+    }
+
+    fn try_mount_archive_with(&mut self, archive_path: PathBuf, tool: &str) -> bool {
+        if !self.integration_active(tool) {
+            self.set_status(&format!("{} not installed", tool));
             return false;
         }
 
@@ -747,7 +783,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             return false;
         }
 
-        match Command::new("fuse-zip").arg(&archive_path).arg(&mount_path).status() {
+        match Command::new(tool).arg(&archive_path).arg(&mount_path).status() {
             Ok(status) if status.success() => {
                 let archive_name = archive_path
                     .file_name()
@@ -765,7 +801,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             }
             _ => {
                 let _ = fs::remove_dir(&mount_path);
-                self.set_status("failed to mount archive with fuse-zip");
+                self.set_status(&format!("failed to mount archive with {}", tool));
                 false
             }
         }
@@ -2198,6 +2234,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "7z", description: "extract .7z archives", category: "archive", required: false },
             IntegrationSpec { key: "rar", description: "extract .rar archives", category: "archive", required: false },
             IntegrationSpec { key: "fuse-zip", description: "browse zip-based archives as folders", category: "archive", required: false },
+            IntegrationSpec { key: "archivemount", description: "browse tar/zip archives as folders (Enter)", category: "archive", required: false },
             IntegrationSpec { key: "sox", description: "play audio files on Enter", category: "preview", required: false },
             IntegrationSpec { key: "viu", description: "image preview on Enter (preferred)", category: "preview", required: false },
             IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
@@ -2460,6 +2497,8 @@ fn named_dir_icon(name: &str) -> Option<(&'static str, (u8, u8, u8))> {
 fn list_current_directory(include_hidden: bool) -> io::Result<()> {
     let current_dir = env::current_dir()?;
     let nerd_font_active = env::var("NERD_FONT_ACTIVE").map(|v| v == "1").unwrap_or(false);
+    let no_color = env_flag_true(&["NO_COLOR"]);
+    let show_icons = env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true);
     let term_w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
     let show_date = term_w >= 90;
     let show_size = term_w >= 70;
@@ -2540,7 +2579,9 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
             None
         };
 
-        let (icon_glyph, icon_color) = if nerd_font_active {
+        let (icon_glyph, icon_color) = if !show_icons {
+            (String::new(), CtColor::Reset)
+        } else if nerd_font_active {
             if is_symlink {
                 ("".to_string(), CtColor::Rgb { r: 100, g: 220, b: 220 })
             } else if is_dir {
@@ -2589,8 +2630,16 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
                 name_color = CtColor::Rgb { r: 120, g: 220, b: 120 };
             }
         }
+        if no_color {
+            name_color = CtColor::Reset;
+        }
 
-        let rendered_name = truncate_to(&format!("{} {}", icon_glyph, name), name_width);
+        let icon_prefix = if show_icons && !icon_glyph.is_empty() {
+            format!("{} ", icon_glyph)
+        } else {
+            String::new()
+        };
+        let rendered_name = truncate_to(&format!("{}{}", icon_prefix, name), name_width);
         let rendered_name = format!("{:<width$}", rendered_name, width = name_width);
 
         let mut styled_name = style(rendered_name).with(name_color);
@@ -2822,7 +2871,9 @@ fn main() -> io::Result<()> {
                 let is_symlink = e.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
                 let is_dir = path.is_dir();
 
-                let (icon_glyph, icon_style) = if app.nerd_font_active {
+                let (icon_glyph, icon_style) = if !app.show_icons {
+                    (String::new(), Style::default())
+                } else if app.nerd_font_active {
                     if is_symlink {
                         ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
                     } else if is_dir {
@@ -2872,7 +2923,13 @@ fn main() -> io::Result<()> {
                 if is_hidden {
                     name_style = name_style.add_modifier(Modifier::DIM);
                 }
-                
+                if app.no_color {
+                    if idx == app.selected_index {
+                        name_style = name_style.fg(Color::White);
+                    } else {
+                        name_style.fg = None;
+                    }
+                }
                 let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
                 let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
                 let meta_raw = format!("{} {}", perms, owner);
@@ -2896,10 +2953,14 @@ fn main() -> io::Result<()> {
                 let raw_name = e.file_name().to_string_lossy().into_owned();
                 let rendered_name = truncate_with_ellipsis(&raw_name, file_name_width);
 
-                let mut cells = vec![Cell::from(Line::from(vec![
-                    Span::styled(format!("{} ", icon_glyph), icon_style),
-                    Span::styled(rendered_name, name_style),
-                ]))];
+                let mut cells = vec![Cell::from(Line::from({
+                    let mut spans = vec![];
+                    if app.show_icons {
+                        spans.push(Span::styled(format!("{} ", icon_glyph), icon_style));
+                    }
+                    spans.push(Span::styled(rendered_name, name_style));
+                    spans
+                }))];
                 if show_meta { cells.push(Cell::from(Span::styled(meta_col, Style::default().fg(Color::Rgb(180, 150, 100))))); }
                 if show_size { cells.push(Cell::from(Span::styled(size_col, Style::default().fg(Color::Green)))); }
                 if show_date { cells.push(Cell::from(Span::styled(date_col, Style::default().fg(Color::Blue)))); }
@@ -2911,7 +2972,7 @@ fn main() -> io::Result<()> {
             if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
             if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
             let table = Table::new(rows, col_constraints)
-                .highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)))
+                .highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White))
                 .highlight_symbol(""); 
 
             let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
@@ -2947,7 +3008,9 @@ fn main() -> io::Result<()> {
                                     None
                                 };
 
-                                let (icon, icon_style) = if app.nerd_font_active {
+                                let (icon, icon_style) = if !app.show_icons {
+                                    (String::new(), Style::default())
+                                } else if app.nerd_font_active {
                                     if is_symlink {
                                         ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
                                     } else if is_dir {
@@ -2997,6 +3060,7 @@ fn main() -> io::Result<()> {
                                 if is_hidden {
                                     name_style = name_style.add_modifier(Modifier::DIM);
                                 }
+                                name_style = name_style.fg(Color::White);
 
                                 f.render_widget(Clear, row_area);
                                 f.render_widget(
@@ -3004,13 +3068,14 @@ fn main() -> io::Result<()> {
                                     row_area,
                                 );
                                 f.render_widget(
-                                    Paragraph::new(Line::from(vec![
-                                        Span::styled(format!("{} ", icon), icon_style),
-                                        Span::styled(
-                                            full_name,
-                                            name_style,
-                                        ),
-                                    ])),
+                                    Paragraph::new(Line::from({
+                                        let mut spans = vec![];
+                                        if app.show_icons {
+                                            spans.push(Span::styled(format!("{} ", icon), icon_style));
+                                        }
+                                        spans.push(Span::styled(full_name, name_style));
+                                        spans
+                                    })),
                                     row_area,
                                 );
                             }
@@ -3127,13 +3192,26 @@ fn main() -> io::Result<()> {
                     }
                 }
 
+                let visible_lines = (help_area.height as usize).saturating_sub(2);
+                let total_lines = lines.len();
+                let max_scroll = total_lines.saturating_sub(visible_lines);
+                app.help_max_offset = max_scroll as u16;
+                let clamped_offset = (app.help_scroll_offset as usize).min(max_scroll) as u16;
+                
+                let scroll_hint = if total_lines > visible_lines {
+                    " Help (↑↓ scroll) ".to_string()
+                } else {
+                    " Help ".to_string()
+                };
+
                 f.render_widget(
                     Paragraph::new(lines)
                         .wrap(Wrap { trim: true })
+                        .scroll((clamped_offset, 0))
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .title(" Help ")
+                                .title(scroll_hint)
                                 .border_style(Style::default().fg(Color::Rgb(110, 170, 240))),
                         ),
                     help_area,
@@ -3240,17 +3318,26 @@ fn main() -> io::Result<()> {
                     );
                     lines.push(Line::from(vec![status_span, name_span, state_span, category_span, purpose_span]));
                 }
-                let int_h = (lines.len() as u16 + 2).min(area.height);
+                let int_h = (lines.len() as u16 + 2).min(chunks[0].height);
                 let int_w = (area.width * 5 / 6).max(70).min(area.width);
+                // Auto-scroll so the selected row stays visible
+                let visible_rows = (int_h as usize).saturating_sub(2); // minus top/bottom borders
+                let selected_line = app.integration_selected + 2; // +2 for hint line + blank line
+                let int_scroll = if selected_line + 1 <= visible_rows {
+                    0u16
+                } else {
+                    (selected_line + 1 - visible_rows) as u16
+                };
                 let int_area = Rect::new(
                     (area.width.saturating_sub(int_w)) / 2,
-                    (area.height.saturating_sub(int_h)) / 2,
+                    (chunks[0].height.saturating_sub(int_h)) / 2,
                     int_w,
                     int_h,
                 );
                 f.render_widget(Clear, int_area);
                 f.render_widget(
                     Paragraph::new(lines)
+                        .scroll((int_scroll, 0))
                         .block(Block::default().borders(Borders::ALL).title(" Integrations ")
                             .border_style(Style::default().fg(Color::Rgb(180, 130, 255)))),
                     int_area,
@@ -3569,7 +3656,10 @@ fn main() -> io::Result<()> {
             match app.mode {
                 AppMode::Browsing => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('h') => app.mode = AppMode::Help,
+                    KeyCode::Char('h') => {
+                        app.help_scroll_offset = 0;
+                        app.mode = AppMode::Help;
+                    }
                     KeyCode::Tab => {
                         let current = app.current_dir.to_string_lossy().into_owned();
                         app.begin_input_edit(AppMode::PathEditing, current);
@@ -3749,6 +3839,9 @@ fn main() -> io::Result<()> {
                             if selected_path.is_dir() { app.try_enter_dir(selected_path); }
                             else if App::is_fuse_zip_archive(&selected_path) && app.integration_active("fuse-zip") {
                                 let _ = app.try_mount_archive(selected_path);
+                            }
+                            else if App::is_archivemount_archive(&selected_path) && app.integration_active("archivemount") {
+                                let _ = app.try_mount_archive_with(selected_path, "archivemount");
                             }
                             else if App::is_supported_archive(&selected_path) {
                                 let _ = app.preview_archive_contents(&selected_path);
@@ -4060,7 +4153,30 @@ fn main() -> io::Result<()> {
                     KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
-                AppMode::Help => { if key.code != KeyCode::Null { app.mode = AppMode::Browsing; } }
+                AppMode::Help => match key.code {
+                    KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
+                        app.mode = AppMode::Browsing;
+                    }
+                    KeyCode::Up => {
+                        app.help_scroll_offset = app.help_scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        app.help_scroll_offset = (app.help_scroll_offset + 1).min(app.help_max_offset);
+                    }
+                    KeyCode::PageUp => {
+                        app.help_scroll_offset = app.help_scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        app.help_scroll_offset = (app.help_scroll_offset + 10).min(app.help_max_offset);
+                    }
+                    KeyCode::Home => {
+                        app.help_scroll_offset = 0;
+                    }
+                    KeyCode::End => {
+                        app.help_scroll_offset = app.help_max_offset;
+                    }
+                    _ => {}
+                }
                 AppMode::Integrations => {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {

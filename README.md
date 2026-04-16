@@ -91,6 +91,8 @@ If an optional tool is not available, the feature is skipped or falls back grace
 ## Environment Notes
 
 - `NERD_FONT_ACTIVE=1`: enable Nerd Font icons
+- `NO_COLOR=1`: disable file name colors (modifiers like bold/dim still apply)
+- `TERMINAL_ICONS=0`: hide all file icons (Nerd Font glyphs and emoji)
 - `EDITOR`: editor command used by `e`/`F4`
 - `SB_BOOKMARK_0` ... `SB_BOOKMARK_9`: bookmark directories
 
@@ -99,7 +101,7 @@ If an optional tool is not available, the feature is skipped or falls back grace
 To enable automatic directory change on exit, add the following function to your shell configuration file (e.g., `~/.bashrc`, `~/.zshrc`):
 
 ```bash
-sb () {
+sb() {
     "$HOME/.cargo/bin/sbrs" "$@"
     if [ -f /tmp/sb_path ]
     then
