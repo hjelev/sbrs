@@ -41,6 +41,7 @@ struct SshHost {
 enum RemoteEntry {
     Ssh(SshHost),
     Rclone { name: String, rtype: String },
+    ArchiveMount { archive_name: String, mount_path: PathBuf },
 }
 
 impl RemoteEntry {
@@ -48,6 +49,7 @@ impl RemoteEntry {
         match self {
             RemoteEntry::Ssh(h) => &h.alias,
             RemoteEntry::Rclone { name, .. } => name,
+            RemoteEntry::ArchiveMount { archive_name, .. } => archive_name,
         }
     }
 }
@@ -109,6 +111,7 @@ struct App {
     paste_current_src: Option<PathBuf>,
     paste_move_mode: bool,
     input_buffer: String,
+    input_cursor: usize,
     status_message: String,
     page_size: usize,
     ssh_mounts: Vec<SshMount>,
@@ -157,6 +160,12 @@ struct IntegrationRow {
     required: bool,
 }
 
+const ZIP_BASED_EXTENSIONS: &[&str] = &[
+    "zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa",
+    "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc",
+    "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl",
+];
+
 impl App {
     fn new() -> io::Result<Self> {
         let current_dir = env::current_dir()?;
@@ -175,6 +184,7 @@ impl App {
             paste_current_src: None,
             paste_move_mode: false,
             input_buffer: String::new(),
+            input_cursor: 0,
             status_message: String::new(),
             page_size: 20,
             ssh_mounts: Vec::new(),
@@ -211,6 +221,78 @@ impl App {
         self.status_message = msg.into();
     }
 
+    fn begin_input_edit(&mut self, mode: AppMode, initial: String) {
+        self.mode = mode;
+        self.input_buffer = initial;
+        self.input_cursor = self.input_buffer.chars().count();
+    }
+
+    fn clear_input_edit(&mut self) {
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    fn clamp_input_cursor(&mut self) {
+        let len = self.input_buffer.chars().count();
+        self.input_cursor = self.input_cursor.min(len);
+    }
+
+    fn byte_index_for_char(s: &str, char_index: usize) -> usize {
+        if char_index == 0 {
+            return 0;
+        }
+        s.char_indices()
+            .nth(char_index)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| s.len())
+    }
+
+    fn input_insert_char(&mut self, c: char) {
+        self.clamp_input_cursor();
+        let insert_at = Self::byte_index_for_char(&self.input_buffer, self.input_cursor);
+        self.input_buffer.insert(insert_at, c);
+        self.input_cursor = self.input_cursor.saturating_add(1);
+    }
+
+    fn input_backspace(&mut self) {
+        self.clamp_input_cursor();
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = Self::byte_index_for_char(&self.input_buffer, self.input_cursor - 1);
+        let end = Self::byte_index_for_char(&self.input_buffer, self.input_cursor);
+        self.input_buffer.drain(start..end);
+        self.input_cursor -= 1;
+    }
+
+    fn input_delete(&mut self) {
+        self.clamp_input_cursor();
+        let len = self.input_buffer.chars().count();
+        if self.input_cursor >= len {
+            return;
+        }
+        let start = Self::byte_index_for_char(&self.input_buffer, self.input_cursor);
+        let end = Self::byte_index_for_char(&self.input_buffer, self.input_cursor + 1);
+        self.input_buffer.drain(start..end);
+    }
+
+    fn input_move_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn input_move_right(&mut self) {
+        let len = self.input_buffer.chars().count();
+        self.input_cursor = (self.input_cursor + 1).min(len);
+    }
+
+    fn input_move_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn input_move_end(&mut self) {
+        self.input_cursor = self.input_buffer.chars().count();
+    }
+
     fn refresh_entries_or_status(&mut self) -> bool {
         match self.refresh_entries() {
             Ok(()) => {
@@ -238,12 +320,6 @@ impl App {
     }
 
     fn is_supported_archive(path: &PathBuf) -> bool {
-        const ZIP_BASED_EXTENSIONS: &[&str] = &[
-            "zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa",
-            "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc",
-            "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl",
-        ];
-
         let lower_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -274,19 +350,7 @@ impl App {
     }
 
     fn is_fuse_zip_archive(path: &PathBuf) -> bool {
-        const ZIP_BASED_EXTENSIONS: &[&str] = &[
-            "zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa",
-            "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc",
-            "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl",
-        ];
-
-        let ext_supported = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ZIP_BASED_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
-            .unwrap_or(false);
-
-        ext_supported || Self::has_zip_signature(path)
+        matches!(Self::archive_kind(path), Some(ArchiveKind::Zip))
     }
 
     fn archive_kind(path: &PathBuf) -> Option<ArchiveKind> {
@@ -299,15 +363,7 @@ impl App {
         let is_zip = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .map(|ext| {
-                [
-                    "zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa",
-                    "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc",
-                    "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl",
-                ]
-                .iter()
-                .any(|e| ext.eq_ignore_ascii_case(e))
-            })
+            .map(|ext| ZIP_BASED_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
             .unwrap_or(false)
             || Self::has_zip_signature(path);
         if is_zip {
@@ -350,6 +406,16 @@ impl App {
             return Some(path);
         }
         if let (true, path) = Self::integration_probe("rar") {
+            return Some(path);
+        }
+        None
+    }
+
+    fn bat_tool() -> Option<String> {
+        if let (true, path) = Self::integration_probe("bat") {
+            return Some(path);
+        }
+        if let (true, path) = Self::integration_probe("batcat") {
             return Some(path);
         }
         None
@@ -469,6 +535,105 @@ fi
 while true; do
   clear
   chafa -- "${paths[$idx]}"
+  printf '\n[←/→ prev/next (exits at ends), q/Esc/Enter exit]\n'
+
+  IFS= read -rsn1 key || break
+  if [[ "$key" == $'\x1b' ]]; then
+    IFS= read -rsn2 key2
+    key+="$key2"
+  fi
+
+  case "$key" in
+    $'\x1b[D')
+      if (( idx == 0 )); then break; fi
+      ((idx--))
+      ;;
+    $'\x1b[C')
+      if (( idx + 1 >= count )); then break; fi
+      ((idx++))
+      ;;
+    q|$'\x1b'|$'\n'|$'\r')
+      break
+      ;;
+  esac
+done
+
+printf '%s\n' "${paths[$idx]}" > "$out_file"
+"#;
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-lc")
+            .arg(script)
+            .arg("--")
+            .arg(idx.to_string())
+            .arg(result_file.to_string_lossy().to_string());
+        for image in &images {
+            cmd.arg(image);
+        }
+        let _ = cmd.status();
+
+        if let Ok(selected_path) = fs::read_to_string(&result_file) {
+            let selected = selected_path.trim();
+            if !selected.is_empty() {
+                let selected_buf = PathBuf::from(selected);
+                if let Some(pos) = images.iter().position(|p| *p == selected_buf) {
+                    idx = pos;
+                }
+            }
+        }
+        let _ = fs::remove_file(&result_file);
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+
+        if let Some(name) = images[idx].file_name() {
+            self.select_entry_named(&name.to_string_lossy());
+        }
+
+        Ok(())
+    }
+
+    fn preview_images_with_viu(&mut self, start_path: PathBuf) -> io::Result<()> {
+        let images: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .map(|e| e.path())
+            .filter(Self::is_image_file)
+            .collect();
+
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        let mut idx = images.iter().position(|p| *p == start_path).unwrap_or(0);
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let result_file = env::temp_dir().join(format!(
+            "sbrs_viu_sel_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let script = r#"
+idx="$1"
+out_file="$2"
+shift 2
+paths=("$@")
+count="${#paths[@]}"
+
+if [[ "$count" -eq 0 ]]; then
+  exit 1
+fi
+
+while true; do
+  clear
+  viu -- "${paths[$idx]}"
   printf '\n[←/→ prev/next (exits at ends), q/Esc/Enter exit]\n'
 
   IFS= read -rsn1 key || break
@@ -720,6 +885,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn unmount_archive_mount_by_path(&mut self, mount_path: &PathBuf) -> bool {
+        let Some(idx) = self
+            .archive_mounts
+            .iter()
+            .rposition(|m| &m.mount_path == mount_path)
+        else {
+            return false;
+        };
+
+        let mount = self.archive_mounts.remove(idx);
+        let was_inside = self.current_dir == mount.mount_path || self.current_dir.starts_with(&mount.mount_path);
+        if was_inside {
+            self.current_dir = mount.return_dir.clone();
+            if self.refresh_entries_or_status() {
+                self.select_entry_named(&mount.archive_name);
+            }
+        }
+        Self::unmount_archive_path(&mount.mount_path);
+        let _ = fs::remove_dir(&mount.mount_path);
+        true
+    }
+
     fn parse_ssh_config() -> Vec<SshHost> {
         let config_path = match env::var("HOME") {
             Ok(h) => PathBuf::from(h).join(".ssh/config"),
@@ -916,6 +1103,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn unmount_ssh_mount_by_alias(&mut self, alias: &str) -> bool {
+        let Some(idx) = self.ssh_mounts.iter().rposition(|m| m._host_alias == alias) else {
+            return false;
+        };
+
+        let mount = self.ssh_mounts.remove(idx);
+        if self.current_dir == mount.mount_path || self.current_dir.starts_with(&mount.mount_path) {
+            self.current_dir = mount.return_dir.clone();
+            self.refresh_entries_or_status();
+        }
+
+        let path_str = mount.mount_path.to_string_lossy().to_string();
+        let _ = Command::new("fusermount").args(["-u", &path_str]).status();
+        let _ = Command::new("fusermount3").args(["-u", &path_str]).status();
+        let _ = Command::new("fusermount").args(["-uz", &path_str]).status();
+        let _ = Command::new("fusermount3").args(["-uz", &path_str]).status();
+        let _ = Command::new("umount").args([&path_str]).status();
+        let _ = Command::new("umount").args(["-l", &path_str]).status();
+        let _ = fs::remove_dir(&mount.mount_path);
+        true
+    }
+
     fn remember_current_selection(&mut self) {
         self.directory_selection
             .insert(self.current_dir.clone(), self.selected_index);
@@ -989,7 +1198,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         if target.is_dir() {
             self.try_enter_dir(target);
             self.mode = AppMode::Browsing;
-            self.input_buffer.clear();
+            self.clear_input_edit();
         } else {
             self.set_status("path is not a directory");
         }
@@ -1021,7 +1230,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         match result {
             Ok(()) => {
                 self.mode = AppMode::Browsing;
-                self.input_buffer.clear();
+                self.clear_input_edit();
                 self.refresh_entries_or_status();
                 self.select_entry_named(&name);
                 self.set_status(if is_dir { "folder created" } else { "file created" });
@@ -1191,8 +1400,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         self.archive_create_targets = targets;
-        self.input_buffer = archive_name;
-        self.mode = AppMode::ArchiveCreate;
+        self.begin_input_edit(AppMode::ArchiveCreate, archive_name);
         self.set_status("confirm archive name and press Enter");
     }
 
@@ -1312,7 +1520,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let targets = self.archive_create_targets.clone();
         if targets.is_empty() {
             self.mode = AppMode::Browsing;
-            self.input_buffer.clear();
+            self.clear_input_edit();
             self.set_status("nothing to archive");
             return;
         }
@@ -1331,14 +1539,14 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         if item_names.is_empty() {
             self.mode = AppMode::Browsing;
             self.archive_create_targets.clear();
-            self.input_buffer.clear();
+            self.clear_input_edit();
             self.set_status("nothing to archive");
             return;
         }
 
         self.mode = AppMode::Browsing;
         let targets = std::mem::take(&mut self.archive_create_targets);
-        self.input_buffer.clear();
+        self.clear_input_edit();
         self.start_archive_job(archive_name, targets);
     }
 
@@ -1926,8 +2134,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             let dest = self.current_dir.join(&name);
             if dest.exists() {
                 self.paste_current_src = Some(src);
-                self.input_buffer = name;
-                self.mode = AppMode::PasteRenaming;
+                self.begin_input_edit(AppMode::PasteRenaming, name);
                 self.set_status("target exists: edit name and press Enter");
                 return;
             }
@@ -1946,7 +2153,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         self.paste_current_src = None;
         self.paste_move_mode = false;
-        self.input_buffer.clear();
+        self.clear_input_edit();
         self.mode = AppMode::Browsing;
         self.copy_started_at = None;
         self.copy_current_src = None;
@@ -1985,13 +2192,14 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "delta", description: "side-by-side colored compare (C: marked file vs cursor)", category: "diff", required: false },
             IntegrationSpec { key: "hexyl", description: "hex view for binary files on Enter", category: "preview", required: false },
             IntegrationSpec { key: "hexedit", description: "hex edit for binary files (e / F4)", category: "editor", required: false },
-            IntegrationSpec { key: "vidir", description: "bulk rename when >1 marked (F2)", category: "rename", required: false },
+            IntegrationSpec { key: "vidir", description: "bulk rename when >1 marked (F2/r)", category: "rename", required: false },
             IntegrationSpec { key: "zip", description: "create/extract archives (Z)", category: "archive", required: false },
             IntegrationSpec { key: "tar", description: "extract tar/tar.gz/tar.xz/... archives", category: "archive", required: false },
             IntegrationSpec { key: "7z", description: "extract .7z archives", category: "archive", required: false },
             IntegrationSpec { key: "rar", description: "extract .rar archives", category: "archive", required: false },
             IntegrationSpec { key: "fuse-zip", description: "browse zip-based archives as folders", category: "archive", required: false },
             IntegrationSpec { key: "sox", description: "play audio files on Enter", category: "preview", required: false },
+            IntegrationSpec { key: "viu", description: "image preview on Enter (preferred)", category: "preview", required: false },
             IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "sshfs", description: "mount SSH hosts via S picker", category: "network", required: false },
             IntegrationSpec { key: "rclone", description: "mount rclone remotes via S picker", category: "network", required: false },
@@ -2051,6 +2259,13 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                     String::new()
                 };
                 (play_ok || sox_ok, detail)
+            }
+            "bat" => {
+                if let Some(path) = Self::bat_tool() {
+                    (true, path)
+                } else {
+                    (false, String::new())
+                }
             }
             "tar" => Self::integration_probe("tar"),
             "7z" => {
@@ -2347,27 +2562,10 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
                     .unwrap_or(CtColor::White);
                 (icon, color)
             }
+        } else if is_dir {
+            ("📁".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
         } else {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            if is_symlink {
-                ("↪".to_string(), CtColor::Rgb { r: 100, g: 220, b: 220 })
-            } else if is_dir {
-                ("📁".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
-            } else if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico"].contains(&ext.as_str()) {
-                ("🖼".to_string(), CtColor::Rgb { r: 255, g: 200, b: 60 })
-            } else if ["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "aif", "alac", "mid", "midi"].contains(&ext.as_str()) {
-                ("♪".to_string(), CtColor::Rgb { r: 180, g: 100, b: 220 })
-            } else if ["zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa", "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc", "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl"].contains(&ext.as_str()) {
-                ("🗜".to_string(), CtColor::Rgb { r: 255, g: 183, b: 77 })
-            } else if ["json", "jsonc", "jsonl", "ndjson", "geojson", "toml", "yaml", "yml"].contains(&ext.as_str()) {
-                ("⚙".to_string(), CtColor::Rgb { r: 120, g: 200, b: 255 })
-            } else {
-                ("📄".to_string(), CtColor::White)
-            }
+            ("📄".to_string(), CtColor::White)
         };
 
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2564,16 +2762,17 @@ fn main() -> io::Result<()> {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
                     path_spans.push(Span::styled(" (", branch_style));
                     path_spans.push(Span::styled(branch, branch_style));
-                    path_spans.push(Span::styled(")", branch_style));
                     if is_dirty {
                         path_spans.push(Span::styled("*", Style::default().fg(Color::White)));
                     }
+                    path_spans.push(Span::styled(")", branch_style));
                 }
             }
             f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             if app.mode == AppMode::PathEditing {
                 let prefix_len = format!("{}@{} » ", user, hostname).chars().count() as u16;
-                let cursor_x = chunks[0].x + prefix_len + app.input_buffer.chars().count() as u16;
+                app.clamp_input_cursor();
+                let cursor_x = chunks[0].x + prefix_len + app.input_cursor as u16;
                 let cursor_y = chunks[0].y;
                 f.set_cursor(cursor_x, cursor_y);
             }
@@ -2642,27 +2841,10 @@ fn main() -> io::Result<()> {
                             .unwrap_or(Color::White);
                         (icon, Style::default().fg(color))
                     }
+                } else if is_dir {
+                    ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
                 } else {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s.to_ascii_lowercase())
-                        .unwrap_or_default();
-                    if is_symlink {
-                        ("↪".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
-                    } else if is_dir {
-                        ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
-                    } else if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico"].contains(&ext.as_str()) {
-                        ("🖼".to_string(), Style::default().fg(Color::Rgb(255, 200, 60)))
-                    } else if ["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "aif", "alac", "mid", "midi"].contains(&ext.as_str()) {
-                        ("♪".to_string(), Style::default().fg(Color::Rgb(180, 100, 220)))
-                    } else if ["zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa", "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc", "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl"].contains(&ext.as_str()) {
-                        ("🗜".to_string(), Style::default().fg(Color::Rgb(255, 183, 77)))
-                    } else if ["json", "jsonc", "jsonl", "ndjson", "geojson", "toml", "yaml", "yml"].contains(&ext.as_str()) {
-                        ("⚙".to_string(), Style::default().fg(Color::Rgb(120, 200, 255)))
-                    } else {
-                        ("📄".to_string(), Style::default().fg(Color::White))
-                    }
+                    ("📄".to_string(), Style::default().fg(Color::White))
                 };
 
                 let mut name_style = if is_dir {
@@ -2784,27 +2966,10 @@ fn main() -> io::Result<()> {
                                             .unwrap_or(Color::White);
                                         (icon, Style::default().fg(color))
                                     }
-                                } else if is_symlink {
-                                    ("↪".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
                                 } else if is_dir {
                                     ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
                                 } else {
-                                    let ext = path
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .map(|s| s.to_ascii_lowercase())
-                                        .unwrap_or_default();
-                                    if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico"].contains(&ext.as_str()) {
-                                        ("🖼".to_string(), Style::default().fg(Color::Rgb(255, 200, 60)))
-                                    } else if ["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "aif", "alac", "mid", "midi"].contains(&ext.as_str()) {
-                                        ("♪".to_string(), Style::default().fg(Color::Rgb(180, 100, 220)))
-                                    } else if ["zip", "jar", "war", "ear", "apk", "xpi", "crx", "cbz", "epub", "ipa", "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "sxw", "sxc", "sxi", "docx", "xlsx", "pptx", "vsix", "nupkg", "kmz", "whl"].contains(&ext.as_str()) {
-                                        ("🗜".to_string(), Style::default().fg(Color::Rgb(255, 183, 77)))
-                                    } else if ["json", "jsonc", "jsonl", "ndjson", "geojson", "toml", "yaml", "yml"].contains(&ext.as_str()) {
-                                        ("⚙".to_string(), Style::default().fg(Color::Rgb(120, 200, 255)))
-                                    } else {
-                                        ("📄".to_string(), Style::default().fg(Color::White))
-                                    }
+                                    ("📄".to_string(), Style::default().fg(Color::White))
                                 };
 
                                 let mut name_style = if is_dir {
@@ -2867,13 +3032,12 @@ fn main() -> io::Result<()> {
                 );
                 f.render_widget(Clear, help_area);
                 let inner_w = help_area.width.saturating_sub(4) as usize;
-                let shortcut_w = inner_w.clamp(10, 16);
+                let shortcut_w = inner_w.clamp(10, 18);
                 let section_style = Style::default().fg(Color::Rgb(120, 200, 255)).add_modifier(Modifier::BOLD);
                 let shortcut_style = Style::default().fg(Color::Rgb(255, 220, 140)).add_modifier(Modifier::BOLD);
                 let desc_style = Style::default().fg(Color::Rgb(200, 200, 200));
 
                 let mut lines: Vec<Line> = vec![
-                    Line::from(""),
                     Line::from(vec![
                         Span::styled(
                             format!("{:<width$}", "Shortcut", width = shortcut_w),
@@ -2881,7 +3045,6 @@ fn main() -> io::Result<()> {
                         ),
                         Span::styled("Description", Style::default().fg(Color::Rgb(190, 190, 190)).add_modifier(Modifier::BOLD)),
                     ]),
-                    Line::from(Span::styled("", Style::default())),
                 ];
 
                 let sections: [(&str, [(&str, &str); 7]); 5] = [
@@ -2914,7 +3077,7 @@ fn main() -> io::Result<()> {
                         [
                             ("n", "Create new file"),
                             ("N", "Create new folder"),
-                            ("F2", "Rename or bulk rename"),
+                            ("F2 / r", "Rename or bulk rename"),
                             ("d", "Delete selected/marked item(s)"),
                             ("x", "Toggle executable bit"),
                             ("Z", "Create or extract archive"),
@@ -2987,11 +3150,15 @@ fn main() -> io::Result<()> {
                     _ => " New Name ",
                 };
                 f.render_widget(Paragraph::new(app.input_buffer.as_str()).block(Block::default().borders(Borders::ALL).title(title)), rename_area);
+                app.clamp_input_cursor();
+                let cursor_x = rename_area.x + 1 + app.input_cursor as u16;
+                let cursor_y = rename_area.y + 1;
+                f.set_cursor(cursor_x.min(rename_area.x + rename_area.width.saturating_sub(1)), cursor_y);
             } else if app.mode == AppMode::Bookmarks {
                 let area = f.size();
                 let bookmarks = App::load_bookmarks();
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("Press 0-9 to jump  ·  Esc or b to close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("Press 0-9 to jump  ·  Esc/b/q to close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, path) in &bookmarks {
@@ -3033,7 +3200,7 @@ fn main() -> io::Result<()> {
                     app.integration_selected = integrations.len() - 1;
                 }
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ navigate  Space toggle  Esc/i close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("↑↓ navigate  Space toggle  Esc/i/q close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, row) in integrations.iter().enumerate() {
@@ -3090,12 +3257,41 @@ fn main() -> io::Result<()> {
                 );
             } else if app.mode == AppMode::SshPicker {
                 let area = f.size();
+                let ssh_w = (area.width * 2 / 3).max(60).min(area.width);
+                let content_w = ssh_w.saturating_sub(4) as usize;
+                let type_w = 6usize;
+                let mounted_w = 10usize;
+                let available_for_alias_and_detail = content_w.saturating_sub(type_w + mounted_w + 3);
+                let alias_w = if available_for_alias_and_detail >= 12 {
+                    available_for_alias_and_detail.min(22)
+                } else {
+                    available_for_alias_and_detail
+                };
+                let detail_w = available_for_alias_and_detail.saturating_sub(alias_w);
+                let trunc = |s: &str, max: usize| -> String {
+                    if max == 0 {
+                        return String::new();
+                    }
+                    if s.chars().count() <= max {
+                        return s.to_string();
+                    }
+                    if max == 1 {
+                        return "…".to_string();
+                    }
+                    let mut out = String::new();
+                    for ch in s.chars().take(max - 1) {
+                        out.push(ch);
+                    }
+                    out.push('…');
+                    out
+                };
+
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("\u{2191}\u{2193}: navigate  Enter: mount  Esc: close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("\u{2191}\u{2193}: navigate  Enter: open/mount  u/Delete: unmount  Esc/q: close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 if app.remote_entries.is_empty() {
-                    lines.push(Line::from(Span::styled(" No SSH hosts or rclone remotes found", Style::default().fg(Color::Rgb(180, 80, 80)))));
+                    lines.push(Line::from(Span::styled(" No SSH hosts, rclone remotes, or mounted archives found", Style::default().fg(Color::Rgb(180, 80, 80)))));
                 } else {
                     let mounted_aliases: HashSet<String> = app.ssh_mounts
                         .iter()
@@ -3103,7 +3299,10 @@ fn main() -> io::Result<()> {
                         .collect();
                     for (i, entry) in app.remote_entries.iter().enumerate() {
                         let is_selected = i == app.ssh_picker_selection;
-                        let is_mounted = mounted_aliases.contains(entry.alias());
+                        let is_mounted = match entry {
+                            RemoteEntry::ArchiveMount { .. } => true,
+                            _ => mounted_aliases.contains(entry.alias()),
+                        };
                         let mount_tag = if is_mounted { "  \u{25cf} mounted" } else { "" };
                         let (type_tag, detail) = match entry {
                             RemoteEntry::Ssh(h) => {
@@ -3115,8 +3314,16 @@ fn main() -> io::Result<()> {
                                 ("ssh", format!("{}{}", user_at_host, port_str))
                             }
                             RemoteEntry::Rclone { rtype, .. } => ("rclone", rtype.clone()),
+                            RemoteEntry::ArchiveMount { mount_path, .. } => ("zip", mount_path.to_string_lossy().into_owned()),
                         };
-                        let label = format!(" {:<4} {:<20} {}{} ", type_tag, entry.alias(), detail, mount_tag);
+                        let type_col = format!("{:<width$}", type_tag, width = type_w);
+                        let alias_col = format!(
+                            "{:<width$}",
+                            trunc(entry.alias(), alias_w),
+                            width = alias_w
+                        );
+                        let detail_col = trunc(&detail, detail_w);
+                        let label = format!(" {} {} {}{}", type_col, alias_col, detail_col, mount_tag);
                         let style = if is_selected {
                             Style::default().fg(Color::Rgb(20, 20, 30)).bg(Color::Rgb(80, 200, 180)).add_modifier(Modifier::BOLD)
                         } else if is_mounted {
@@ -3128,7 +3335,6 @@ fn main() -> io::Result<()> {
                     }
                 }
                 let ssh_h = (lines.len() as u16 + 2).max(8).min(area.height);
-                let ssh_w = (area.width * 2 / 3).max(60).min(area.width);
                 let ssh_area = Rect::new(
                     (area.width.saturating_sub(ssh_w)) / 2,
                     (area.height.saturating_sub(ssh_h)) / 2,
@@ -3248,10 +3454,84 @@ fn main() -> io::Result<()> {
             }
 
             // --- Footer ---
-            let status = Line::from(vec![
-                Span::raw(format!("[total:{} sel:{} clip:{}] ", app.entries.len(), app.marked_indices.len(), app.clipboard.len())),
-                Span::styled("Tab:path h:help i:integrations n:new-file N:new-dir Z:archive C:delta o:open-gui ~:home F2:rename/bulk c:copy v:paste m:move d:del q:quit", Style::default().fg(Color::DarkGray)),
-            ]);
+            let left_status = format!(
+                "[total:{} sel:{} clip:{}]",
+                app.entries.len(),
+                app.marked_indices.len(),
+                app.clipboard.len()
+            );
+            let right_status = "c:copy v:paste m:move r:rename d:del e:edit o:open-gui ~:home h:help q:quit";
+            let width = chunks[1].width as usize;
+            let left_len = left_status.chars().count();
+            let right_len = right_status.chars().count();
+
+            let (gap, right_display) = if left_len + right_len <= width {
+                (
+                    " ".repeat(width.saturating_sub(left_len + right_len)),
+                    right_status.to_string(),
+                )
+            } else {
+                let available = width.saturating_sub(left_len + 1);
+                let right_trimmed = if available == 0 {
+                    String::new()
+                } else {
+                    let tail: String = right_status
+                        .chars()
+                        .rev()
+                        .take(available)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("{:>width$}", tail, width = available)
+                };
+                (" ".to_string(), right_trimmed)
+            };
+
+            let mut right_spans: Vec<Span> = Vec::new();
+            let mut segment = String::new();
+            let mut in_ws = true;
+            for ch in right_display.chars() {
+                let is_ws = ch.is_whitespace();
+                if segment.is_empty() {
+                    in_ws = is_ws;
+                }
+                if is_ws == in_ws {
+                    segment.push(ch);
+                } else {
+                    if in_ws {
+                        right_spans.push(Span::styled(segment.clone(), Style::default().fg(Color::DarkGray)));
+                    } else if let Some(colon_idx) = segment.find(':') {
+                        let (key, rest) = segment.split_at(colon_idx);
+                        if !key.is_empty() {
+                            right_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::White)));
+                        }
+                        right_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
+                    } else {
+                        right_spans.push(Span::styled(segment.clone(), Style::default().fg(Color::DarkGray)));
+                    }
+                    segment.clear();
+                    segment.push(ch);
+                    in_ws = is_ws;
+                }
+            }
+            if !segment.is_empty() {
+                if in_ws {
+                    right_spans.push(Span::styled(segment, Style::default().fg(Color::DarkGray)));
+                } else if let Some(colon_idx) = segment.find(':') {
+                    let (key, rest) = segment.split_at(colon_idx);
+                    if !key.is_empty() {
+                        right_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::White)));
+                    }
+                    right_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
+                } else {
+                    right_spans.push(Span::styled(segment, Style::default().fg(Color::DarkGray)));
+                }
+            }
+
+            let mut status_spans: Vec<Span> = vec![Span::raw(left_status), Span::raw(gap)];
+            status_spans.extend(right_spans);
+            let status = Line::from(status_spans);
             f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
             if !app.status_message.is_empty() {
                 let msg_area = Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, 1);
@@ -3291,8 +3571,8 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('h') => app.mode = AppMode::Help,
                     KeyCode::Tab => {
-                        app.input_buffer = app.current_dir.to_string_lossy().into_owned();
-                        app.mode = AppMode::PathEditing;
+                        let current = app.current_dir.to_string_lossy().into_owned();
+                        app.begin_input_edit(AppMode::PathEditing, current);
                     }
                     KeyCode::Char(' ') | KeyCode::Insert => {
                         if !app.entries.is_empty() {
@@ -3354,12 +3634,10 @@ fn main() -> io::Result<()> {
                         terminal.clear()?;
                     }
                     KeyCode::Char('n') => {
-                        app.input_buffer.clear();
-                        app.mode = AppMode::NewFile;
+                        app.begin_input_edit(AppMode::NewFile, String::new());
                     }
                     KeyCode::Char('N') => {
-                        app.input_buffer.clear();
-                        app.mode = AppMode::NewFolder;
+                        app.begin_input_edit(AppMode::NewFolder, String::new());
                     }
                     KeyCode::Char('Z') => {
                         app.run_zip_action();
@@ -3380,23 +3658,28 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('S') => {
                         let has_sshfs = app.integration_active("sshfs");
                         let has_rclone = app.integration_active("rclone");
-                        if !has_sshfs && !has_rclone {
-                            app.set_status("Neither sshfs nor rclone found in PATH");
-                        } else {
-                            let mut entries: Vec<RemoteEntry> = Vec::new();
-                            if has_sshfs {
-                                entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
-                            }
-                            if has_rclone {
-                                entries.extend(App::parse_rclone_remotes());
-                            }
-                            app.remote_entries = entries;
-                            app.ssh_picker_selection = 0;
-                            if app.remote_entries.is_empty() {
-                                app.set_status("No SSH hosts or rclone remotes found");
+                        let mut entries: Vec<RemoteEntry> = Vec::new();
+                        if has_sshfs {
+                            entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
+                        }
+                        if has_rclone {
+                            entries.extend(App::parse_rclone_remotes());
+                        }
+                        entries.extend(app.archive_mounts.iter().map(|m| RemoteEntry::ArchiveMount {
+                            archive_name: m.archive_name.clone(),
+                            mount_path: m.mount_path.clone(),
+                        }));
+
+                        app.remote_entries = entries;
+                        app.ssh_picker_selection = 0;
+                        if app.remote_entries.is_empty() {
+                            if !has_sshfs && !has_rclone {
+                                app.set_status("No remotes or mounted archives (sshfs/rclone not installed)");
                             } else {
-                                app.mode = AppMode::SshPicker;
+                                app.set_status("No SSH hosts, rclone remotes, or mounted archives found");
                             }
+                        } else {
+                            app.mode = AppMode::SshPicker;
                         }
                     }
                     KeyCode::Char(c @ '0'..='9') => {
@@ -3409,7 +3692,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('.') => { app.show_hidden = !app.show_hidden; app.refresh_entries_or_status(); }
-                    KeyCode::F(2) => {
+                    KeyCode::F(2) | KeyCode::Char('r') => {
                         if app.marked_indices.len() > 1 {
                             if !app.integration_active("vidir") {
                                 app.set_status("vidir not found in PATH");
@@ -3445,8 +3728,8 @@ fn main() -> io::Result<()> {
                             if let Some(e) = app.entries.get(target_idx) {
                                 app.selected_index = target_idx;
                                 app.table_state.select(Some(target_idx));
-                                app.input_buffer = e.file_name().to_string_lossy().into_owned();
-                                app.mode = AppMode::Renaming;
+                                let current_name = e.file_name().to_string_lossy().into_owned();
+                                app.begin_input_edit(AppMode::Renaming, current_name);
                             }
                         }
                     }
@@ -3471,6 +3754,10 @@ fn main() -> io::Result<()> {
                                 let _ = app.preview_archive_contents(&selected_path);
                                 terminal.clear()?;
                             }
+                            else if App::is_image_file(&selected_path) && app.integration_active("viu") {
+                                app.preview_images_with_viu(selected_path)?;
+                                terminal.clear()?;
+                            }
                             else if App::is_image_file(&selected_path) && app.integration_active("chafa") {
                                 app.preview_images_with_chafa(selected_path)?;
                                 terminal.clear()?;
@@ -3489,6 +3776,7 @@ fn main() -> io::Result<()> {
                             else if App::is_json_file(&selected_path) && app.integration_active("jnv") {
                                 disable_raw_mode()?;
                                 execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
                                 let _ = Command::new("jnv").arg(&selected_path).status();
                                 execute!(io::stdout(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
@@ -3565,8 +3853,9 @@ fn main() -> io::Result<()> {
                                             .status();
                                     }
                                 } else if app.integration_active("bat") {
-                                    let _ = Command::new("bat")
-                                        .args(["--paging=always", "--style=plain", "--color=always"])
+                                    let bat_cmd = App::bat_tool().unwrap_or_else(|| "bat".to_string());
+                                    let _ = Command::new(bat_cmd)
+                                        .args(["--paging=always", "--style=full", "--color=always"])
                                         .arg(&selected_path)
                                         .status();
                                 } else {
@@ -3661,15 +3950,16 @@ fn main() -> io::Result<()> {
                         app.apply_path_input();
                     }
                     KeyCode::Esc => {
-                        app.input_buffer.clear();
+                        app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }
-                    KeyCode::Backspace => {
-                        app.input_buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        app.input_buffer.push(c);
-                    }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
                 AppMode::Renaming => match key.code {
@@ -3677,12 +3967,18 @@ fn main() -> io::Result<()> {
                         if let Some(e) = app.entries.get(app.selected_index) {
                             let _ = fs::rename(e.path(), app.current_dir.join(&app.input_buffer));
                         }
+                        app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.refresh_entries_or_status();
                     }
-                    KeyCode::Esc => app.mode = AppMode::Browsing,
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => { app.input_buffer.push(c); }
+                    KeyCode::Esc => { app.clear_input_edit(); app.mode = AppMode::Browsing; }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
                 AppMode::PasteRenaming => match key.code {
@@ -3696,7 +3992,7 @@ fn main() -> io::Result<()> {
                                 app.set_status("target still exists: choose another name");
                             } else {
                                 app.paste_current_src = None;
-                                app.input_buffer.clear();
+                                app.clear_input_edit();
                                 app.mode = AppMode::Browsing;
                                 if app.paste_move_mode && fs::rename(&src, &dest).is_ok() {
                                     app.paste_ok_items += 1;
@@ -3713,13 +4009,18 @@ fn main() -> io::Result<()> {
                     KeyCode::Esc => {
                         app.paste_queue.clear();
                         app.paste_current_src = None;
-                        app.input_buffer.clear();
+                        app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("paste cancelled");
                         app.refresh_entries_or_status();
                     }
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => { app.input_buffer.push(c); }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
                 AppMode::NewFile | AppMode::NewFolder => match key.code {
@@ -3728,11 +4029,16 @@ fn main() -> io::Result<()> {
                         app.create_entry_from_input(is_dir);
                     }
                     KeyCode::Esc => {
-                        app.input_buffer.clear();
+                        app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => { app.input_buffer.push(c); }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
                 AppMode::ArchiveCreate => match key.code {
@@ -3741,18 +4047,23 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Esc => {
                         app.archive_create_targets.clear();
-                        app.input_buffer.clear();
+                        app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("archive creation cancelled");
                     }
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => { app.input_buffer.push(c); }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
                 AppMode::Help => { if key.code != KeyCode::Null { app.mode = AppMode::Browsing; } }
                 AppMode::Integrations => {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Char('i') => {
+                        KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
                             app.mode = AppMode::Browsing;
                         }
                         KeyCode::Up => {
@@ -3778,7 +4089,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 AppMode::SshPicker => match key.code {
-                    KeyCode::Esc => { app.mode = AppMode::Browsing; }
+                    KeyCode::Esc | KeyCode::Char('q') => { app.mode = AppMode::Browsing; }
                     KeyCode::Up => {
                         if app.ssh_picker_selection > 0 {
                             app.ssh_picker_selection -= 1;
@@ -3792,9 +4103,9 @@ fn main() -> io::Result<()> {
                     KeyCode::Enter => {
                         if let Some(entry) = app.remote_entries.get(app.ssh_picker_selection).cloned() {
                             let alias = entry.alias().to_string();
-                            let already_mounted = app.ssh_mounts.iter().any(|m| m._host_alias == alias);
                             match entry {
                                 RemoteEntry::Ssh(host) => {
+                                    let already_mounted = app.ssh_mounts.iter().any(|m| m._host_alias == alias);
                                     if already_mounted {
                                         app.mount_ssh_host(&host)?;
                                     } else {
@@ -3811,6 +4122,7 @@ fn main() -> io::Result<()> {
                                     }
                                 }
                                 RemoteEntry::Rclone { name, rtype } => {
+                                    let already_mounted = app.ssh_mounts.iter().any(|m| m._host_alias == alias);
                                     if already_mounted {
                                         app.mount_rclone_remote(&name, &rtype)?;
                                     } else {
@@ -3826,13 +4138,69 @@ fn main() -> io::Result<()> {
                                         }
                                     }
                                 }
+                                RemoteEntry::ArchiveMount { mount_path, archive_name } => {
+                                    if mount_path.is_dir() {
+                                        app.mode = AppMode::Browsing;
+                                        app.try_enter_dir(mount_path);
+                                    } else {
+                                        app.set_status(format!("mount not available: {}", archive_name));
+                                        app.mode = AppMode::Browsing;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('u') | KeyCode::Delete => {
+                        if let Some(entry) = app.remote_entries.get(app.ssh_picker_selection).cloned() {
+                            match entry {
+                                RemoteEntry::Ssh(host) => {
+                                    if app.unmount_ssh_mount_by_alias(&host.alias) {
+                                        app.set_status(format!("unmounted {}", host.alias));
+                                    } else {
+                                        app.set_status(format!("not mounted: {}", host.alias));
+                                    }
+                                }
+                                RemoteEntry::Rclone { name, .. } => {
+                                    if app.unmount_ssh_mount_by_alias(&name) {
+                                        app.set_status(format!("unmounted {}", name));
+                                    } else {
+                                        app.set_status(format!("not mounted: {}", name));
+                                    }
+                                }
+                                RemoteEntry::ArchiveMount { mount_path, archive_name } => {
+                                    if app.unmount_archive_mount_by_path(&mount_path) {
+                                        app.set_status(format!("unmounted {}", archive_name));
+                                    } else {
+                                        app.set_status(format!("not mounted: {}", archive_name));
+                                    }
+                                }
+                            }
+
+                            let has_sshfs = app.integration_active("sshfs");
+                            let has_rclone = app.integration_active("rclone");
+                            let mut entries: Vec<RemoteEntry> = Vec::new();
+                            if has_sshfs {
+                                entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
+                            }
+                            if has_rclone {
+                                entries.extend(App::parse_rclone_remotes());
+                            }
+                            entries.extend(app.archive_mounts.iter().map(|m| RemoteEntry::ArchiveMount {
+                                archive_name: m.archive_name.clone(),
+                                mount_path: m.mount_path.clone(),
+                            }));
+                            app.remote_entries = entries;
+                            if app.remote_entries.is_empty() {
+                                app.ssh_picker_selection = 0;
+                            } else {
+                                app.ssh_picker_selection = app.ssh_picker_selection.min(app.remote_entries.len() - 1);
                             }
                         }
                     }
                     _ => {}
                 },
                 AppMode::Bookmarks => match key.code {
-                    KeyCode::Esc | KeyCode::Char('b') => { app.mode = AppMode::Browsing; }
+                    KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => { app.mode = AppMode::Browsing; }
                     KeyCode::Char(c @ '0'..='9') => {
                         let idx = (c as u8 - b'0') as usize;
                         if let Ok(path_str) = env::var(format!("SB_BOOKMARK_{}", idx)) {
@@ -3877,7 +4245,12 @@ fn main() -> io::Result<()> {
     app.cleanup_archive_mounts();
     app.cleanup_ssh_mounts();
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        TermClear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
     let _ = std::fs::write("/tmp/sb_path", app.current_dir.to_string_lossy().as_bytes());
     Ok(())
 }
