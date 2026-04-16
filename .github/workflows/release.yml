@@ -82,19 +82,7 @@ jobs:
             echo "Failed to parse semver from tag: ${{ github.ref_name }}" >&2
             exit 1
           fi
-          python3 - "$VERSION" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          version = sys.argv[1]
-          path = Path("Cargo.toml")
-          text = path.read_text()
-          updated, count = re.subn(r'^version\s*=\s*"[^"]+"', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
-          if count != 1:
-              raise SystemExit("Failed to update version in Cargo.toml")
-          path.write_text(updated)
-          PY
+          perl -0pi -e 's/^version\s*=\s*"[^"]+"/version = "'"$VERSION"'"/m or die "Failed to update version in Cargo.toml\n"' Cargo.toml
           grep '^version\s*=' Cargo.toml
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
@@ -163,19 +151,7 @@ jobs:
         run: |
           VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
           if [ -n "$VERSION" ]; then
-            python3 - "$VERSION" <<'PY'
-            from pathlib import Path
-            import re
-            import sys
-
-            version = sys.argv[1]
-            path = Path("Cargo.toml")
-            text = path.read_text()
-            updated, count = re.subn(r'^version\s*=\s*"[^"]+"', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
-            if count != 1:
-                raise SystemExit("Failed to update version in Cargo.toml")
-            path.write_text(updated)
-            PY
+            perl -0pi -e 's/^version\s*=\s*"[^"]+"/version = "'"$VERSION"'"/m or die "Failed to update version in Cargo.toml\n"' Cargo.toml
             grep '^version\s*=' Cargo.toml
           fi
           # Actually do builds and make zips and whatnot
@@ -234,19 +210,7 @@ jobs:
         run: |
           VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
           if [ -n "$VERSION" ]; then
-            python3 - "$VERSION" <<'PY'
-            from pathlib import Path
-            import re
-            import sys
-
-            version = sys.argv[1]
-            path = Path("Cargo.toml")
-            text = path.read_text()
-            updated, count = re.subn(r'^version\s*=\s*"[^"]+"', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
-            if count != 1:
-                raise SystemExit("Failed to update version in Cargo.toml")
-            path.write_text(updated)
-            PY
+            perl -0pi -e 's/^version\s*=\s*"[^"]+"/version = "'"$VERSION"'"/m or die "Failed to update version in Cargo.toml\n"' Cargo.toml
             grep '^version\s*=' Cargo.toml
           fi
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
@@ -301,19 +265,7 @@ jobs:
         run: |
           VERSION="$(printf '%s\n' "${{ needs.plan.outputs.tag }}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?' | tail -1)"
           if [ -n "$VERSION" ]; then
-            python3 - "$VERSION" <<'PY'
-            from pathlib import Path
-            import re
-            import sys
-
-            version = sys.argv[1]
-            path = Path("Cargo.toml")
-            text = path.read_text()
-            updated, count = re.subn(r'^version\s*=\s*"[^"]+"', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
-            if count != 1:
-                raise SystemExit("Failed to update version in Cargo.toml")
-            path.write_text(updated)
-            PY
+            perl -0pi -e 's/^version\s*=\s*"[^"]+"/version = "'"$VERSION"'"/m or die "Failed to update version in Cargo.toml\n"' Cargo.toml
             grep '^version\s*=' Cargo.toml
           fi
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
