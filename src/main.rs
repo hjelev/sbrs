@@ -3746,7 +3746,7 @@ fn main() -> io::Result<()> {
                 left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
             }
             let left_status = left_status_parts.join(" │ ");
-            let right_status = "c:copy v:paste m:move r:rename d:del e:edit o:open-gui ~:home h:help q:quit";
+            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit o:Open-GUI ~:home h:Help q:Quit";
             let width = chunks[1].width as usize;
             let left_len = left_status.chars().count();
             let right_len = right_status.chars().count();
