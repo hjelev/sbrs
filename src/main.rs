@@ -4552,8 +4552,12 @@ fn named_dir_icon(name: &str) -> Option<(&'static str, (u8, u8, u8))> {
     }
 }
 
-fn list_current_directory(include_hidden: bool) -> io::Result<()> {
-    let current_dir = env::current_dir()?;
+fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Result<()> {
+    let current_dir = if let Some(p) = path {
+        std::path::PathBuf::from(p)
+    } else {
+        env::current_dir()?
+    };
     let nerd_font_active = env::var("NERD_FONT_ACTIVE").map(|v| v == "1").unwrap_or(false);
     let no_color = env_flag_true(&["NO_COLOR"]);
     let show_icons = env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true);
@@ -4835,11 +4839,13 @@ fn main() -> io::Result<()> {
         print_version();
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "-la") {
-        return list_current_directory(true);
+    if let Some(pos) = args.iter().position(|arg| arg == "-la") {
+        let path = args.get(pos + 1).map(|s| s.as_str());
+        return list_current_directory(true, path);
     }
-    if args.iter().any(|arg| arg == "-l") {
-        return list_current_directory(false);
+    if let Some(pos) = args.iter().position(|arg| arg == "-l") {
+        let path = args.get(pos + 1).map(|s| s.as_str());
+        return list_current_directory(false, path);
     }
 
     enable_raw_mode()?;
