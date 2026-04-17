@@ -889,20 +889,14 @@ impl App {
         let date_width = 16usize;
         let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
         let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
-        let meta_raw = format!("{} {}", perms, owner);
-        let meta_trimmed = if meta_raw.chars().count() > meta_width {
-            meta_raw
-                .chars()
-                .rev()
-                .take(meta_width)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<String>()
+        let perms_len = perms.chars().count();
+        let owner_width = meta_width.saturating_sub(perms_len + 1);
+        let owner_trimmed = if owner.chars().count() > owner_width {
+            owner.chars().take(owner_width).collect::<String>()
         } else {
-            meta_raw
+            owner
         };
-        let meta_col = format!("{:>width$}", meta_trimmed, width = meta_width);
+        let meta_col = format!("{:<width$}", format!("{} {}", perms, owner_trimmed), width = meta_width);
         let size = meta.as_ref().map(|m| if m.is_dir() { "-".into() } else { App::format_size(m.len()) }).unwrap_or_default();
         let size_col = format!("{:>width$}", size, width = size_width);
         let date = meta
