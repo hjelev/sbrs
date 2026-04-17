@@ -106,6 +106,10 @@ enum CurrentDirTotalSizeMsg {
     Finished(u64, u64),
 }
 
+enum NotesLoadMsg {
+    Finished(u64, PathBuf, HashMap<String, String>),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchiveKind {
     Zip,
@@ -144,6 +148,7 @@ enum AppMode {
     Browsing,
     PathEditing,
     InternalSearch,
+    NoteEditing,
     Renaming,
     PasteRenaming,
     NewFile,
@@ -231,6 +236,11 @@ struct App {
     internal_search_regex_mode: bool,
     internal_search_regex: Option<Regex>,
     internal_search_regex_error: Option<String>,
+    notes_by_name: HashMap<String, String>,
+    notes_rx: Option<Receiver<NotesLoadMsg>>,
+    notes_scan_id: u64,
+    notes_loaded_for: Option<PathBuf>,
+    note_edit_targets: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -354,8 +364,14 @@ impl App {
             internal_search_regex_mode: false,
             internal_search_regex: None,
             internal_search_regex_error: None,
+            notes_by_name: HashMap::new(),
+            notes_rx: None,
+            notes_scan_id: 0,
+            notes_loaded_for: None,
+            note_edit_targets: Vec::new(),
         };
         app.refresh_entries()?;
+        app.request_notes_for_current_dir_once();
         app.request_git_info_for_current_dir_once();
         Ok(app)
     }
@@ -2813,7 +2829,261 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             self.start_folder_size_scan();
             self.start_current_dir_total_size_scan();
         }
+        self.request_notes_for_current_dir_once();
         Ok(())
+    }
+
+    fn notes_file_path(dir: &PathBuf) -> PathBuf {
+        dir.join(".sb")
+    }
+
+    fn escape_note_field(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for ch in input.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    fn unescape_note_field(input: &str) -> Option<String> {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+
+            let esc = chars.next()?;
+            match esc {
+                '\\' => out.push('\\'),
+                't' => out.push('\t'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn load_notes_map_for_dir(dir: &PathBuf) -> HashMap<String, String> {
+        let path = Self::notes_file_path(dir);
+        let Ok(raw) = fs::read_to_string(path) else {
+            return HashMap::new();
+        };
+
+        let mut notes = HashMap::new();
+        for line in raw.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, '\t');
+            let Some(name_raw) = parts.next() else {
+                continue;
+            };
+            let Some(note_raw) = parts.next() else {
+                continue;
+            };
+            let Some(name) = Self::unescape_note_field(name_raw) else {
+                continue;
+            };
+            let Some(note) = Self::unescape_note_field(note_raw) else {
+                continue;
+            };
+            if name.is_empty() || note.trim().is_empty() {
+                continue;
+            }
+            notes.insert(name, note);
+        }
+        notes
+    }
+
+    fn request_notes_for_current_dir_once(&mut self) {
+        if self.notes_rx.is_some() {
+            return;
+        }
+        if self
+            .notes_loaded_for
+            .as_ref()
+            .map(|p| p == &self.current_dir)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.notes_scan_id = self.notes_scan_id.wrapping_add(1);
+        let scan_id = self.notes_scan_id;
+        let dir = self.current_dir.clone();
+        self.notes_by_name.clear();
+        let (tx, rx) = mpsc::channel();
+        self.notes_rx = Some(rx);
+
+        thread::spawn(move || {
+            let notes = App::load_notes_map_for_dir(&dir);
+            let _ = tx.send(NotesLoadMsg::Finished(scan_id, dir, notes));
+        });
+    }
+
+    fn pump_notes_progress(&mut self) {
+        let Some(rx) = self.notes_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(NotesLoadMsg::Finished(scan_id, path, notes)) => {
+                    if scan_id == self.notes_scan_id && path == self.current_dir {
+                        self.notes_by_name = notes;
+                        self.notes_loaded_for = Some(path);
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx {
+            self.notes_rx = Some(rx);
+        }
+    }
+
+    fn selected_note_targets(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if !self.marked_indices.is_empty() {
+            for idx in &self.marked_indices {
+                if let Some(entry) = self.entries.get(*idx) {
+                    out.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        } else if let Some(entry) = self.entries.get(self.selected_index) {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn begin_note_edit(&mut self) {
+        let targets = self.selected_note_targets();
+        if targets.is_empty() {
+            self.set_status("no selected item");
+            return;
+        }
+
+        let initial = if targets.len() == 1 {
+            self.notes_by_name
+                .get(&targets[0])
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        self.note_edit_targets = targets;
+        self.begin_input_edit(AppMode::NoteEditing, initial);
+    }
+
+    fn current_dir_entry_names_all(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let Ok(entries) = fs::read_dir(&self.current_dir) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".sb" {
+                continue;
+            }
+            names.insert(name);
+        }
+        names
+    }
+
+    fn save_notes_for_current_dir(&mut self) -> io::Result<()> {
+        let existing = self.current_dir_entry_names_all();
+        self.notes_by_name
+            .retain(|name, note| existing.contains(name) && !note.trim().is_empty());
+
+        let notes_path = Self::notes_file_path(&self.current_dir);
+        if self.notes_by_name.is_empty() {
+            match fs::remove_file(notes_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            self.notes_loaded_for = Some(self.current_dir.clone());
+            return Ok(());
+        }
+
+        let mut keys: Vec<String> = self.notes_by_name.keys().cloned().collect();
+        keys.sort();
+        let mut lines: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(note) = self.notes_by_name.get(&key) {
+                lines.push(format!(
+                    "{}\t{}",
+                    Self::escape_note_field(&key),
+                    Self::escape_note_field(note)
+                ));
+            }
+        }
+
+        let mut payload = lines.join("\n");
+        payload.push('\n');
+
+        let tmp_path = self
+            .current_dir
+            .join(format!(".sb.tmp.{}", self.notes_scan_id));
+        fs::write(&tmp_path, payload)?;
+        fs::rename(&tmp_path, &notes_path)?;
+        self.notes_loaded_for = Some(self.current_dir.clone());
+        Ok(())
+    }
+
+    fn commit_note_edit(&mut self) {
+        if self.note_edit_targets.is_empty() {
+            self.clear_input_edit();
+            self.mode = AppMode::Browsing;
+            return;
+        }
+
+        let note = self.input_buffer.clone();
+        let is_empty = note.trim().is_empty();
+        for target in &self.note_edit_targets {
+            if is_empty {
+                self.notes_by_name.remove(target);
+            } else {
+                self.notes_by_name.insert(target.clone(), note.clone());
+            }
+        }
+
+        let count = self.note_edit_targets.len();
+        match self.save_notes_for_current_dir() {
+            Ok(()) => {
+                if is_empty {
+                    self.set_status(format!("cleared note for {} item(s)", count));
+                } else {
+                    self.set_status(format!("saved note for {} item(s)", count));
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("save note failed: {}", e));
+            }
+        }
+
+        self.note_edit_targets.clear();
+        self.clear_input_edit();
+        self.mode = AppMode::Browsing;
     }
 
     fn delete_targets(&self) -> Vec<PathBuf> {
@@ -4552,6 +4822,7 @@ fn main() -> io::Result<()> {
         app.pump_current_dir_total_size_progress();
         app.pump_selected_total_size_progress();
         app.pump_git_info();
+        app.pump_notes_progress();
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -4630,6 +4901,8 @@ fn main() -> io::Result<()> {
                 out
             };
 
+            let note_style = Style::default().fg(Color::Rgb(150, 150, 150));
+
             let selection_style = Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White);
             let marker_width = if app.no_color { 3 } else { 0 };
             let name_text_width = file_name_width.saturating_sub(marker_width).max(1);
@@ -4658,7 +4931,25 @@ fn main() -> io::Result<()> {
                 } else {
                     String::new()
                 };
+                let note_text = app
+                    .notes_by_name
+                    .get(&entry_cache.raw_name)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, name_text_width);
+                let mut rendered_note = String::new();
+                if !note_text.is_empty() {
+                    let used = rendered_name.chars().count();
+                    let sep = "  ";
+                    let sep_len = sep.chars().count();
+                    if used + sep_len < name_text_width {
+                        let remaining = name_text_width - used - sep_len;
+                        let clipped_note = truncate_with_ellipsis(note_text, remaining);
+                        if !clipped_note.is_empty() {
+                            rendered_note = format!("{}{}", sep, clipped_note);
+                        }
+                    }
+                }
 
                 let mut cells = vec![Cell::from(Line::from({
                     let mut spans = vec![];
@@ -4669,6 +4960,9 @@ fn main() -> io::Result<()> {
                         spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                     }
                     spans.push(Span::styled(rendered_name, name_style));
+                    if !rendered_note.is_empty() {
+                        spans.push(Span::styled(rendered_note, note_style));
+                    }
                     spans
                 }))];
                 if show_meta { cells.push(Cell::from(Span::styled(entry_cache.meta_col.as_str(), meta_style))); }
@@ -4713,6 +5007,16 @@ fn main() -> io::Result<()> {
                                 } else {
                                     String::new()
                                 };
+                                let note_text = app
+                                    .notes_by_name
+                                    .get(full_name)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                let note_suffix = if note_text.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("  {}", note_text)
+                                };
 
                                 f.render_widget(Clear, row_area);
                                 f.render_widget(
@@ -4729,6 +5033,9 @@ fn main() -> io::Result<()> {
                                             spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                                         }
                                         spans.push(Span::styled(full_name, name_style));
+                                        if !note_suffix.is_empty() {
+                                            spans.push(Span::styled(note_suffix, note_style));
+                                        }
                                         spans
                                     })),
                                     row_area,
@@ -4894,7 +5201,7 @@ fn main() -> io::Result<()> {
                     ]),
                 ];
 
-                let sections: [(&str, [(&str, &str); 7]); 5] = [
+                let sections: [(&str, [(&str, &str); 8]); 5] = [
                     (
                         "Navigation",
                         [
@@ -4905,6 +5212,7 @@ fn main() -> io::Result<()> {
                             ("Left / Backspace", "Go to parent folder"),
                             ("Tab", "Edit current path"),
                             ("~", "Go to home folder"),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -4917,6 +5225,7 @@ fn main() -> io::Result<()> {
                             ("v", "Paste clipboard into current folder"),
                             ("m", "Move clipboard into current folder"),
                             ("", ""),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -4924,6 +5233,7 @@ fn main() -> io::Result<()> {
                         [
                             ("n", "Create new file"),
                             ("N", "Create new folder"),
+                            ("Ctrl+n", "Add/edit note for selected item(s)"),
                             ("F2 / r", "Rename or bulk rename"),
                             ("d", "Delete selected/marked item(s)"),
                             ("x / p", "Toggle executable bit / protect/unprotect file"),
@@ -4941,6 +5251,7 @@ fn main() -> io::Result<()> {
                             ("S", "Open SSH/rclone mount picker"),
                             ("i", "Open integrations panel"),
                             ("b / 0-9", "Open bookmarks / jump to bookmark"),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -4948,6 +5259,7 @@ fn main() -> io::Result<()> {
                         [
                             ("h", "Open help"),
                             ("q / Esc", "Quit Shell Buddy"),
+                            ("", ""),
                             ("", ""),
                             ("", ""),
                             ("", ""),
@@ -5002,7 +5314,7 @@ fn main() -> io::Result<()> {
                         ),
                     help_area,
                 );
-            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate) {
+            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing) {
                 let area = f.size();
                 let rename_area = Rect::new(area.width/4, area.height/2 - 1, area.width/2, 3);
                 f.render_widget(Clear, rename_area);
@@ -5011,6 +5323,7 @@ fn main() -> io::Result<()> {
                     AppMode::NewFile => " New File Name ",
                     AppMode::NewFolder => " New Folder Name ",
                     AppMode::ArchiveCreate => " Create Archive (Enter=Confirm, Esc=Cancel) ",
+                    AppMode::NoteEditing => " Note (Enter=Save, Esc=Cancel) ",
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
@@ -5590,6 +5903,9 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.copy_full_paths_to_system_clipboard();
                     }
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.begin_note_edit();
+                    }
                     KeyCode::Char('c') | KeyCode::F(5) => {
                         app.clipboard.clear();
                         if !app.marked_indices.is_empty() {
@@ -6046,6 +6362,24 @@ fn main() -> io::Result<()> {
                         app.apply_path_input();
                     }
                     KeyCode::Esc => {
+                        app.clear_input_edit();
+                        app.mode = AppMode::Browsing;
+                    }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c) => app.input_insert_char(c),
+                    _ => {}
+                },
+                AppMode::NoteEditing => match key.code {
+                    KeyCode::Enter => {
+                        app.commit_note_edit();
+                    }
+                    KeyCode::Esc => {
+                        app.note_edit_targets.clear();
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }
