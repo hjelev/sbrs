@@ -3214,6 +3214,21 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn drop_to_shell(&mut self) -> io::Result<()> {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let _ = Command::new(&shell)
+            .current_dir(&self.current_dir)
+            .status();
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+        self.set_status("returned from shell");
+        self.refresh_entries_or_status();
+        Ok(())
+    }
+
     fn run_zip_action(&mut self) {
         if self.archive_rx.is_some() {
             self.set_status("archive creation already in progress");
@@ -5245,7 +5260,7 @@ fn main() -> io::Result<()> {
                     ]),
                 ];
 
-                let sections: [(&str, [(&str, &str); 8]); 5] = [
+                let sections: [(&str, [(&str, &str); 9]); 5] = [
                     (
                         "Navigation",
                         [
@@ -5256,6 +5271,7 @@ fn main() -> io::Result<()> {
                             ("Left / Backspace", "Go to parent folder"),
                             ("Tab", "Edit current path"),
                             ("~", "Go to home folder"),
+                            ("", ""),
                             ("", ""),
                         ],
                     ),
@@ -5270,6 +5286,7 @@ fn main() -> io::Result<()> {
                             ("m", "Move clipboard into current folder"),
                             ("", ""),
                             ("", ""),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -5278,6 +5295,7 @@ fn main() -> io::Result<()> {
                             ("n", "Create new file"),
                             ("N", "Create new folder"),
                             ("Ctrl+n", "Add/edit note for selected item(s)"),
+                            ("Ctrl+z", "Drop to shell in current directory"),
                             ("F2 / r", "Rename or bulk rename"),
                             ("d", "Delete selected/marked item(s)"),
                             ("x / p", "Toggle executable bit / protect/unprotect file"),
@@ -5296,6 +5314,7 @@ fn main() -> io::Result<()> {
                             ("i", "Open integrations panel"),
                             ("b / 0-9", "Open bookmarks / jump to bookmark"),
                             ("", ""),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -5303,6 +5322,7 @@ fn main() -> io::Result<()> {
                         [
                             ("h", "Open help"),
                             ("q / Esc", "Quit Shell Buddy"),
+                            ("", ""),
                             ("", ""),
                             ("", ""),
                             ("", ""),
@@ -5949,6 +5969,10 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.begin_note_edit();
+                    }
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let _ = app.drop_to_shell();
+                        let _ = terminal.clear();
                     }
                     KeyCode::Char('c') | KeyCode::F(5) => {
                         app.clipboard.clear();
