@@ -58,6 +58,8 @@ struct SshMount {
     _host_alias: String,
     mount_path: PathBuf,
     return_dir: PathBuf,
+    remote_label: String,
+    remote_root: String,
 }
 
 struct GitInfoCache {
@@ -218,6 +220,7 @@ struct App {
     selected_total_size_items: usize,
     sort_mode: SortMode,
     sort_menu_selected: usize,
+    panel_tab: u8,
 }
 
 #[derive(Clone)]
@@ -334,6 +337,7 @@ impl App {
             selected_total_size_items: 0,
             sort_mode: SortMode::NameAsc,
             sort_menu_selected: 0,
+            panel_tab: 0,
         };
         app.refresh_entries()?;
         app.request_git_info_for_current_dir_once();
@@ -2093,6 +2097,66 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn refresh_remote_entries(&mut self) {
+        let has_sshfs = self.integration_active("sshfs");
+        let has_rclone = self.integration_active("rclone");
+        let mut entries: Vec<RemoteEntry> = Vec::new();
+        if has_sshfs {
+            entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
+        }
+        if has_rclone {
+            entries.extend(App::parse_rclone_remotes());
+        }
+        entries.extend(self.archive_mounts.iter().map(|m| RemoteEntry::ArchiveMount {
+            archive_name: m.archive_name.clone(),
+            mount_path: m.mount_path.clone(),
+        }));
+        self.remote_entries = entries;
+        if self.remote_entries.is_empty() {
+            self.ssh_picker_selection = 0;
+        } else {
+            self.ssh_picker_selection = self.ssh_picker_selection.min(self.remote_entries.len() - 1);
+        }
+    }
+
+    fn current_remote_mount(&self) -> Option<&SshMount> {
+        self.ssh_mounts
+            .iter()
+            .filter(|mount| self.current_dir == mount.mount_path || self.current_dir.starts_with(&mount.mount_path))
+            .max_by_key(|mount| mount.mount_path.components().count())
+    }
+
+    fn current_header_identity(&self, local_user: &str, local_host: &str) -> String {
+        self.current_remote_mount()
+            .map(|mount| mount.remote_label.clone())
+            .unwrap_or_else(|| format!("{}@{}", local_user, local_host))
+    }
+
+    fn current_dir_display_path(&self) -> String {
+        let Some(mount) = self.current_remote_mount() else {
+            return self.current_dir.to_string_lossy().into_owned();
+        };
+
+        let rel = self
+            .current_dir
+            .strip_prefix(&mount.mount_path)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        if rel.is_empty() {
+            return mount.remote_root.clone();
+        }
+
+        if mount.remote_root == "/" {
+            format!("/{}", rel)
+        } else if mount.remote_root.ends_with('/') {
+            format!("{}{}", mount.remote_root, rel)
+        } else {
+            format!("{}/{}", mount.remote_root, rel)
+        }
+    }
+
     fn mount_rclone_remote(&mut self, name: &str, rtype: &str) -> io::Result<()> {
         // If already mounted, just navigate there
         if let Some(existing) = self.ssh_mounts.iter().find(|m| m._host_alias == name) {
@@ -2115,7 +2179,13 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .status()?;
         if status.success() {
             Self::wait_for_mount_ready(&mount_dir);
-            self.ssh_mounts.push(SshMount { _host_alias: name.to_string(), mount_path: mount_dir.clone(), return_dir });
+            self.ssh_mounts.push(SshMount {
+                _host_alias: name.to_string(),
+                mount_path: mount_dir.clone(),
+                return_dir,
+                remote_label: name.to_string(),
+                remote_root: "/".to_string(),
+            });
             self.mode = AppMode::Browsing;
             self.try_enter_dir(mount_dir);
             Ok(())
@@ -2156,7 +2226,17 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let status = cmd.status()?;
         if status.success() {
             Self::wait_for_mount_ready(&mount_dir);
-            self.ssh_mounts.push(SshMount { _host_alias: host.alias.clone(), mount_path: mount_dir.clone(), return_dir });
+            let remote_label = match &host.user {
+                Some(user) => format!("{}@{}", user, host.hostname),
+                None => host.hostname.clone(),
+            };
+            self.ssh_mounts.push(SshMount {
+                _host_alias: host.alias.clone(),
+                mount_path: mount_dir.clone(),
+                return_dir,
+                remote_label,
+                remote_root: "~".to_string(),
+            });
             self.mode = AppMode::Browsing;
             self.try_enter_dir(mount_dir);
             Ok(())
@@ -3639,6 +3719,27 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .all(|s| self.integration_enabled(s.key))
     }
 
+    fn panel_tab_bar_line(active: u8) -> Line<'static> {
+        let tabs: &[(&str, u8)] = &[
+            (" Help ", 0),
+            (" Bookmarks ", 1),
+            (" Remote Mounts ", 2),
+            (" Integrations ", 3),
+        ];
+        let active_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let inactive_style = Style::default().fg(Color::Rgb(100, 100, 100));
+        let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, (label, idx)) in tabs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("│", sep_style));
+            }
+            let style = if *idx == active { active_style } else { inactive_style };
+            spans.push(Span::styled(*label, style));
+        }
+        Line::from(spans)
+    }
+
     fn integration_rows(&self) -> Vec<IntegrationRow> {
         let mut rows = Vec::new();
         let all_on = self.all_optional_integrations_enabled();
@@ -4095,13 +4196,14 @@ fn main() -> io::Result<()> {
                 .split(f.size());
 
             // --- Header ---
+            let header_identity = app.current_header_identity(&user, &hostname);
             let mut path_spans = vec![
-                Span::styled(format!("{}@{}", user, hostname), Style::default().fg(Color::Cyan)),
+                Span::styled(header_identity.as_str(), Style::default().fg(Color::Cyan)),
                 Span::raw(" » "),
                 if app.mode == AppMode::PathEditing {
                     Span::styled(app.input_buffer.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
                 } else {
-                    Span::raw(app.current_dir.to_string_lossy().into_owned())
+                    Span::raw(app.current_dir_display_path())
                 },
             ];
             if app.integration_enabled("git") {
@@ -4117,13 +4219,17 @@ fn main() -> io::Result<()> {
             }
             if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
                 path_spans.push(Span::styled(
+                    " »",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                path_spans.push(Span::styled(
                     total_suffix,
                     Style::default().fg(Color::Rgb(150, 220, 150)),
                 ));
             }
             f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             if app.mode == AppMode::PathEditing {
-                let prefix_len = format!("{}@{} » ", user, hostname).chars().count() as u16;
+                let prefix_len = format!("{} » ", header_identity).chars().count() as u16;
                 app.clamp_input_cursor();
                 let cursor_x = chunks[0].x + prefix_len + app.input_cursor as u16;
                 let cursor_y = chunks[0].y;
@@ -4389,12 +4495,6 @@ fn main() -> io::Result<()> {
                 app.help_max_offset = max_scroll as u16;
                 let clamped_offset = (app.help_scroll_offset as usize).min(max_scroll) as u16;
                 
-                let scroll_hint = if total_lines > visible_lines {
-                    " Help (↑↓ scroll) ".to_string()
-                } else {
-                    " Help ".to_string()
-                };
-
                 f.render_widget(
                     Paragraph::new(lines)
                         .wrap(Wrap { trim: true })
@@ -4402,7 +4502,7 @@ fn main() -> io::Result<()> {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .title(scroll_hint)
+                                .title(App::panel_tab_bar_line(app.panel_tab))
                                 .border_style(Style::default().fg(Color::Rgb(110, 170, 240))),
                         ),
                     help_area,
@@ -4428,7 +4528,7 @@ fn main() -> io::Result<()> {
                 let area = f.size();
                 let bookmarks = App::load_bookmarks();
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("Press 0-9 to jump  ·  Esc/b/q to close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("Press 0-9 to jump  ·  Tab/Shift+Tab switch tabs  ·  Esc/b/q close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, path) in &bookmarks {
@@ -4459,7 +4559,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, bm_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(" Bookmarks ")
+                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(100, 150, 255)))),
                     bm_area,
                 );
@@ -4470,7 +4570,7 @@ fn main() -> io::Result<()> {
                     app.integration_selected = integrations.len() - 1;
                 }
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ navigate  Space toggle  Esc/i/q close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("↑↓ navigate  Space toggle  Tab/Shift+Tab switch tabs  Esc/i/q close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, row) in integrations.iter().enumerate() {
@@ -4530,7 +4630,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(
                     Paragraph::new(lines)
                         .scroll((int_scroll, 0))
-                        .block(Block::default().borders(Borders::ALL).title(" Integrations ")
+                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(180, 130, 255)))),
                     int_area,
                 );
@@ -4602,7 +4702,7 @@ fn main() -> io::Result<()> {
                 };
 
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("\u{2191}\u{2193}: navigate  Enter: open/mount  u/Delete: unmount  Esc/q: close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("\u{2191}\u{2193}: navigate  Enter/→: open or mount  Shift+Tab/Tab: switch tabs  u/Delete: unmount  Esc/q: close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 if app.remote_entries.is_empty() {
@@ -4659,7 +4759,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, ssh_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(" Remote Mounts ")
+                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(80, 200, 180)))),
                     ssh_area,
                 );
@@ -4960,6 +5060,7 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('h') => {
                         app.help_scroll_offset = 0;
+                        app.panel_tab = 0;
                         app.mode = AppMode::Help;
                     }
                     KeyCode::Tab => {
@@ -5066,29 +5167,17 @@ fn main() -> io::Result<()> {
                             }
                         }
                     }
-                    KeyCode::Char('b') => { app.mode = AppMode::Bookmarks; }
+                    KeyCode::Char('b') => { app.panel_tab = 1; app.mode = AppMode::Bookmarks; }
                     KeyCode::Char('i') => {
                         app.integration_selected = 0;
                         app.refresh_integration_rows_cache();
+                        app.panel_tab = 3;
                         app.mode = AppMode::Integrations;
                     }
                     KeyCode::Char('S') => {
                         let has_sshfs = app.integration_active("sshfs");
                         let has_rclone = app.integration_active("rclone");
-                        let mut entries: Vec<RemoteEntry> = Vec::new();
-                        if has_sshfs {
-                            entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
-                        }
-                        if has_rclone {
-                            entries.extend(App::parse_rclone_remotes());
-                        }
-                        entries.extend(app.archive_mounts.iter().map(|m| RemoteEntry::ArchiveMount {
-                            archive_name: m.archive_name.clone(),
-                            mount_path: m.mount_path.clone(),
-                        }));
-
-                        app.remote_entries = entries;
-                        app.ssh_picker_selection = 0;
+                        app.refresh_remote_entries();
                         if app.remote_entries.is_empty() {
                             if !has_sshfs && !has_rclone {
                                 app.set_status("No remotes or mounted archives (sshfs/rclone not installed)");
@@ -5096,6 +5185,7 @@ fn main() -> io::Result<()> {
                                 app.set_status("No SSH hosts, rclone remotes, or mounted archives found");
                             }
                         } else {
+                            app.panel_tab = 2;
                             app.mode = AppMode::SshPicker;
                         }
                     }
@@ -5566,6 +5656,12 @@ fn main() -> io::Result<()> {
                     KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
                         app.mode = AppMode::Browsing;
                     }
+                    KeyCode::BackTab => {
+                        app.panel_tab = 3;
+                        app.integration_selected = 0;
+                        app.refresh_integration_rows_cache();
+                        app.mode = AppMode::Integrations;
+                    }
                     KeyCode::Up => {
                         app.help_scroll_offset = app.help_scroll_offset.saturating_sub(1);
                     }
@@ -5584,6 +5680,10 @@ fn main() -> io::Result<()> {
                     KeyCode::End => {
                         app.help_scroll_offset = app.help_max_offset;
                     }
+                    KeyCode::Tab => {
+                        app.panel_tab = 1;
+                        app.mode = AppMode::Bookmarks;
+                    }
                     _ => {}
                 }
                 AppMode::Integrations => {
@@ -5591,6 +5691,11 @@ fn main() -> io::Result<()> {
                         KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
                             app.mode = AppMode::Browsing;
                         }
+                        KeyCode::BackTab => {
+                            app.panel_tab = 2;
+                        app.refresh_remote_entries();
+                        app.mode = AppMode::SshPicker;
+                    }
                         KeyCode::Up => {
                             app.integration_selected = app.integration_selected.saturating_sub(1);
                         }
@@ -5610,6 +5715,11 @@ fn main() -> io::Result<()> {
                                 }
                             }
                             app.refresh_integration_rows_cache();
+                        }
+                        KeyCode::Tab => {
+                            app.panel_tab = 0;
+                            app.help_scroll_offset = 0;
+                            app.mode = AppMode::Help;
                         }
                         _ => {}
                     }
@@ -5634,6 +5744,16 @@ fn main() -> io::Result<()> {
                 }
                 AppMode::SshPicker => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => { app.mode = AppMode::Browsing; }
+                    KeyCode::BackTab => {
+                        app.panel_tab = 1;
+                        app.mode = AppMode::Bookmarks;
+                    }
+                    KeyCode::Tab => {
+                        app.panel_tab = 3;
+                        app.integration_selected = 0;
+                        app.refresh_integration_rows_cache();
+                        app.mode = AppMode::Integrations;
+                    }
                     KeyCode::Up => {
                         if app.ssh_picker_selection > 0 {
                             app.ssh_picker_selection -= 1;
@@ -5644,7 +5764,7 @@ fn main() -> io::Result<()> {
                             app.ssh_picker_selection += 1;
                         }
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Enter | KeyCode::Right => {
                         if let Some(entry) = app.remote_entries.get(app.ssh_picker_selection).cloned() {
                             let alias = entry.alias().to_string();
                             match entry {
@@ -5720,31 +5840,22 @@ fn main() -> io::Result<()> {
                                 }
                             }
 
-                            let has_sshfs = app.integration_active("sshfs");
-                            let has_rclone = app.integration_active("rclone");
-                            let mut entries: Vec<RemoteEntry> = Vec::new();
-                            if has_sshfs {
-                                entries.extend(App::parse_ssh_config().into_iter().map(RemoteEntry::Ssh));
-                            }
-                            if has_rclone {
-                                entries.extend(App::parse_rclone_remotes());
-                            }
-                            entries.extend(app.archive_mounts.iter().map(|m| RemoteEntry::ArchiveMount {
-                                archive_name: m.archive_name.clone(),
-                                mount_path: m.mount_path.clone(),
-                            }));
-                            app.remote_entries = entries;
-                            if app.remote_entries.is_empty() {
-                                app.ssh_picker_selection = 0;
-                            } else {
-                                app.ssh_picker_selection = app.ssh_picker_selection.min(app.remote_entries.len() - 1);
-                            }
+                            app.refresh_remote_entries();
                         }
                     }
                     _ => {}
                 },
                 AppMode::Bookmarks => match key.code {
                     KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => { app.mode = AppMode::Browsing; }
+                    KeyCode::BackTab => {
+                        app.panel_tab = 0;
+                        app.mode = AppMode::Help;
+                    }
+                    KeyCode::Tab => {
+                        app.panel_tab = 2;
+                        app.refresh_remote_entries();
+                        app.mode = AppMode::SshPicker;
+                    }
                     KeyCode::Char(c @ '0'..='9') => {
                         let idx = (c as u8 - b'0') as usize;
                         if let Ok(path_str) = env::var(format!("SB_BOOKMARK_{}", idx)) {
