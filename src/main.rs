@@ -1087,8 +1087,23 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        let _ = Command::new("fusermount")
+            .args(["-uz", path.to_string_lossy().as_ref()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("fusermount3")
+            .args(["-uz", path.to_string_lossy().as_ref()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = Command::new("umount")
             .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("umount")
+            .args(["-l", path.to_string_lossy().as_ref()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1114,6 +1129,18 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn cleanup_archive_mounts(&mut self) {
+        // If current_dir is inside an archive mount, switch back to that mount's
+        // return directory before unmounting so shell integration doesn't keep
+        // a now-removed temp path.
+        if let Some(mount) = self
+            .archive_mounts
+            .iter()
+            .rev()
+            .find(|m| self.current_dir == m.mount_path || self.current_dir.starts_with(&m.mount_path))
+        {
+            self.current_dir = mount.return_dir.clone();
+        }
+
         while let Some(mount) = self.archive_mounts.pop() {
             let _ = mount.archive_path;
             Self::unmount_archive_path(&mount.mount_path);
@@ -2874,7 +2901,7 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
             None
         };
 
-        let (icon_glyph, icon_color) = if !show_icons {
+        let (icon_glyph, mut icon_color) = if !show_icons {
             (String::new(), CtColor::Reset)
         } else if nerd_font_active {
             if is_symlink {
@@ -2927,6 +2954,7 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
         }
         if no_color {
             name_color = CtColor::Reset;
+            icon_color = CtColor::Reset;
         }
 
         let icon_prefix = if show_icons && !icon_glyph.is_empty() {
@@ -3156,60 +3184,41 @@ fn main() -> io::Result<()> {
                 out
             };
 
-            let no_color_selected_bg = Color::White;
-            let no_color_selected_fg = Color::Black;
-            let selection_style = if app.no_color {
-                Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
-            } else {
-                Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White)
+            let selection_style = Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White);
+            let marker_width = if app.no_color { 3 } else { 0 };
+            let name_text_width = file_name_width.saturating_sub(marker_width).max(1);
+            let entry_styles = |mut icon_style: Style, mut name_style: Style, is_selected: bool| {
+                if app.no_color && !is_selected {
+                    icon_style.fg = None;
+                    name_style.fg = None;
+                }
+                (icon_style, name_style)
             };
 
             let rows: Vec<Row> = app.entry_render_cache.iter().enumerate().map(|(idx, entry_cache)| {
                 let is_marked = app.marked_indices.contains(&idx);
-                let no_color_selected = app.no_color && idx == app.selected_index;
-                let mut icon_style = entry_cache.icon_style;
-                let mut name_style = entry_cache.name_style;
-                if app.no_color {
-                    if no_color_selected {
-                        name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
-                        icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
-                    } else {
-                        name_style.fg = None;
-                        icon_style.fg = None;
-                    }
-                }
+                let is_selected = idx == app.selected_index;
+                let (icon_style, name_style) = entry_styles(entry_cache.icon_style, entry_cache.name_style, is_selected);
 
-                let meta_style = if app.no_color {
-                    if no_color_selected {
-                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
-                    } else {
-                        Style::default()
-                    }
+                let meta_style = Style::default().fg(Color::Rgb(180, 150, 100));
+                let size_style = Style::default().fg(Color::Green);
+                let date_style = Style::default().fg(Color::Rgb(120, 190, 210));
+                let marker = if app.no_color {
+                    format!(
+                        "{}{} ",
+                        if is_selected { '>' } else { ' ' },
+                        if is_marked { '*' } else { ' ' }
+                    )
                 } else {
-                    Style::default().fg(Color::Rgb(180, 150, 100))
+                    String::new()
                 };
-                let size_style = if app.no_color {
-                    if no_color_selected {
-                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
-                    } else {
-                        Style::default()
-                    }
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                let date_style = if app.no_color {
-                    if no_color_selected {
-                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
-                    } else {
-                        Style::default()
-                    }
-                } else {
-                    Style::default().fg(Color::Rgb(120, 190, 210))
-                };
-                let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, file_name_width);
+                let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, name_text_width);
 
                 let mut cells = vec![Cell::from(Line::from({
                     let mut spans = vec![];
+                    if !marker.is_empty() {
+                        spans.push(Span::raw(marker));
+                    }
                     if app.show_icons {
                         spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                     }
@@ -3219,7 +3228,7 @@ fn main() -> io::Result<()> {
                 if show_meta { cells.push(Cell::from(Span::styled(entry_cache.meta_col.as_str(), meta_style))); }
                 if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
                 if show_date { cells.push(Cell::from(Span::styled(entry_cache.date_col.as_str(), date_style))); }
-                Row::new(cells).style(if !no_color_selected && is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
+                Row::new(cells).style(if is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
 
             let mut col_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
@@ -3227,7 +3236,7 @@ fn main() -> io::Result<()> {
             if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
             if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
             let table = Table::new(rows, col_constraints)
-                .highlight_style(if app.no_color { Style::default() } else { selection_style })
+                .highlight_style(selection_style)
                 .highlight_symbol(""); 
 
             let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
@@ -3250,23 +3259,26 @@ fn main() -> io::Result<()> {
                                     table_area.width,
                                     1,
                                 );
-                                let mut icon_style = entry_cache.icon_style;
-                                let mut name_style = entry_cache.name_style;
-                                if app.no_color {
-                                    icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
-                                    name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
+                                let is_marked = app.marked_indices.contains(&selected_idx);
+                                let icon_style = entry_cache.icon_style.fg(Color::White);
+                                let name_style = entry_cache.name_style.fg(Color::White);
+                                let marker = if app.no_color {
+                                    format!(">{} ", if is_marked { '*' } else { ' ' })
                                 } else {
-                                    name_style = name_style.fg(Color::White);
-                                }
+                                    String::new()
+                                };
 
                                 f.render_widget(Clear, row_area);
                                 f.render_widget(
-                                    Block::default().style(if app.no_color { Style::default().bg(no_color_selected_bg) } else { selection_style }),
+                                    Block::default().style(selection_style),
                                     row_area,
                                 );
                                 f.render_widget(
                                     Paragraph::new(Line::from({
                                         let mut spans = vec![];
+                                        if !marker.is_empty() {
+                                            spans.push(Span::raw(marker));
+                                        }
                                         if app.show_icons {
                                             spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                                         }
