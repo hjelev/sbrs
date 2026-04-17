@@ -13,11 +13,13 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 - Delete with confirmation dialog
 - Archive create/extract workflows (`zip`, `tar`, `7z`, `rar` toolchain)
 - Optional archive-as-folder mount for zip-based files (`fuse-zip`)
-- Rich previews via optional tools (`bat`, `glow`, `jnv`, `csvlens`, `chafa`, `sox`)
+- Rich previews via optional tools (`bat`, `glow`, `jnv`, `csvlens`, `chafa`, `viu`, `sox`, `pdftotext`, `asciinema`)
 - Side-by-side file compare with `delta`
-- SSH/rclone remote mount picker
+- SSH/rclone/local-media mount picker
+- Age file protection/decryption (`.age`) with `p`
 - Clipboard full-path copy via `Ctrl+c` (`wl-copy`/`xclip`/`xsel`/`pbcopy`)
 - Integration manager (`i`) to enable/disable optional integrations
+- Tabbed Help/Bookmarks/Remote Mounts/Integrations overlays (`Tab` / `Shift+Tab`)
 - Writes last directory to `/tmp/sb_path` on exit for shell integration
 
 ## Build and Run
@@ -39,6 +41,19 @@ Release binary path:
 target/release/sbrs
 ```
 
+## Installation
+
+### From Source
+
+```bash
+cargo install --path .
+```
+
+### From Releases
+
+Prebuilt binaries and the auto-installer script are available in GitHub Releases.
+Use the installer there if you want the fastest setup without building from source.
+
 ## Core Controls
 
 - `q` / `Esc`: quit
@@ -50,9 +65,11 @@ target/release/sbrs
 - `c` or `F5`: copy to internal clipboard
 - `Ctrl+c`: copy selected full path(s) to system clipboard
 - `v`: paste
+- `m`: move (cut+paste behavior) from internal clipboard
 - `d`: delete (with confirmation)
 - `x`: toggle executable bit on selected file(s)
-- `F2`: rename (or bulk rename with `vidir` when multiple are marked)
+- `p`: protect/unprotect file with `age` (`.age`)
+- `F2` or `r`: rename (or bulk rename with `vidir` when multiple are marked)
 - `e` or `F4`: open in `$EDITOR` (or `hexedit` for binary if available)
 - `n`: new file
 - `N`: new folder
@@ -64,6 +81,10 @@ target/release/sbrs
 - `S`: SSH/rclone remote picker
 - `i`: integrations panel
 - `b`: bookmarks panel
+- `Tab` (in browsing): edit current path inline
+- `Tab` / `Shift+Tab` in Help/Bookmarks/Remote Mounts/Integrations: cycle tabs forward/backward
+- `s`: toggle folder size calculation in listing
+- `Ctrl+s`: open sort mode menu
 - `0-9`: jump to bookmark (`SB_BOOKMARK_0..9`)
 - `.`: toggle hidden files
 - `~`: jump to home
@@ -79,12 +100,20 @@ Required behavior:
 Optional integrations (auto-detected, toggle in `i` panel):
 
 - VCS: `git`
-- Viewers/previews: `bat`, `glow`, `jnv`, `csvlens`, `hexyl`, `chafa`, `sox`
+- Viewers/previews: `bat`, `glow`, `jnv`, `csvlens`, `hexyl`, `chafa`, `viu`, `sox`, `pdftotext`, `asciinema`
 - Diff/edit helpers: `delta`, `hexedit`, `vidir`
-- Archives: `zip`/`unzip`, `tar`, `7z` family (`7z`/`7zz`/`7zr`), `rar`/`unrar`, `fuse-zip`
+- Archives: `zip`/`unzip`, `tar`, `7z` family (`7z`/`7zz`/`7zr`), `rar`/`unrar`, `fuse-zip`, `archivemount`
+- Security: `age`
 - Remote mounts: `sshfs`, `rclone`
 - Search: `rg`, `fzf`
 - Clipboard backends: `wl-copy`, `xclip`, `xsel`, `pbcopy`
+
+Remote picker (`S`) also lists existing local mounted folders discovered under:
+
+- `/media/$USER`
+- `/run/media/$USER`
+- `/mnt`
+- `/run/user/$UID/gvfs`
 
 If an optional tool is not available, the feature is skipped or falls back gracefully.
 
