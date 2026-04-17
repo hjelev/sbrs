@@ -134,7 +134,7 @@ impl SortMode {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AppMode {
     Browsing,
     PathEditing,
@@ -338,6 +338,330 @@ impl App {
         app.refresh_entries()?;
         app.request_git_info_for_current_dir_once();
         Ok(app)
+    }
+
+    fn age_encrypt_file_interactive(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+        let status = Command::new("age")
+            .args(["-p", "-o"])
+            .arg(output)
+            .arg(input)
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("age encryption failed".to_string())
+        }
+    }
+
+    fn age_decrypt_file_interactive(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+        let status = Command::new("age")
+            .args(["-d", "-o"])
+            .arg(output)
+            .arg(input)
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("age decryption failed".to_string())
+        }
+    }
+
+    fn protect_file_with_age(&mut self, input: &PathBuf) -> io::Result<()> {
+        let protected_path = Self::age_protected_output_path(input);
+        if protected_path.exists() {
+            self.set_status(format!(
+                "protected target exists: {}",
+                protected_path.file_name().and_then(|n| n.to_str()).unwrap_or("target")
+            ));
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let result = Self::age_encrypt_file_interactive(input, &protected_path);
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        match result {
+            Ok(()) => {
+                let _ = fs::remove_file(input);
+                self.set_status("file protected with age password");
+                self.refresh_entries_or_status();
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&protected_path);
+                self.set_status(format!("protect failed: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    fn unprotect_file_with_age(&mut self, input: &PathBuf) -> io::Result<()> {
+        let plain_path = Self::age_plain_output_path(input);
+        if plain_path.exists() {
+            self.set_status(format!(
+                "unprotect target exists: {}",
+                plain_path.file_name().and_then(|n| n.to_str()).unwrap_or("target")
+            ));
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let result = Self::age_decrypt_file_interactive(input, &plain_path);
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        match result {
+            Ok(()) => {
+                let _ = fs::remove_file(input);
+                self.set_status("password protection removed");
+                self.refresh_entries_or_status();
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&plain_path);
+                self.set_status(format!("unprotect failed: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn preview_age_file(&mut self, input: &PathBuf) -> io::Result<bool> {
+        let Ok((tmp_dir, tmp_path)) = Self::age_temp_decrypt_paths(input, "preview") else {
+            self.set_status("failed to prepare temporary file");
+            return Ok(false);
+        };
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let decrypted = Self::age_decrypt_file_interactive(input, &tmp_path);
+
+        let mut shown = false;
+        if decrypted.is_ok() {
+            if Self::is_image_file(&tmp_path) && self.integration_active("viu") {
+                shown = Self::preview_single_image_with_tool(&tmp_path, "viu");
+            } else if Self::is_image_file(&tmp_path) && self.integration_active("chafa") {
+                shown = Self::preview_single_image_with_tool(&tmp_path, "chafa");
+            } else if Self::is_markdown_file(&tmp_path) && self.integration_active("glow") {
+                shown = Command::new("glow")
+                    .arg("-p")
+                    .arg(&tmp_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            } else if Self::is_json_file(&tmp_path) && self.integration_active("jnv") {
+                shown = Command::new("jnv")
+                    .arg(&tmp_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            } else if Self::is_delimited_text_file(&tmp_path) && self.integration_active("csvlens") {
+                shown = Command::new("csvlens")
+                    .arg(&tmp_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            } else if Self::is_audio_file(&tmp_path) && self.integration_active("sox") {
+                let mut child = if Self::integration_probe("play").0 {
+                    Command::new("play")
+                        .arg(&tmp_path)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                } else {
+                    Command::new("sox")
+                        .arg(&tmp_path)
+                        .arg("-d")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                };
+
+                if let Ok(ref mut proc) = child {
+                    println!("Playing decrypted audio: {}", input.display());
+                    println!("Press q, Esc, or Left to stop playback.");
+                    enable_raw_mode()?;
+                    loop {
+                        if proc.try_wait()?.is_some() {
+                            break;
+                        }
+                        if event::poll(Duration::from_millis(120))? {
+                            if let Event::Key(k) = event::read()? {
+                                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left) {
+                                    let _ = proc.kill();
+                                    let _ = proc.wait();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    disable_raw_mode()?;
+                    shown = true;
+                }
+            } else if Self::is_cast_file(&tmp_path) && self.integration_active("asciinema") {
+                shown = Self::preview_cast_with_asciinema(&tmp_path)?;
+            } else if Self::is_supported_archive(&tmp_path) {
+                shown = self.preview_archive_contents(&tmp_path);
+            } else if Self::is_pdf_file(&tmp_path) && self.integration_active("pdftotext") {
+                if let Ok(mut child) = Command::new("pdftotext")
+                    .args(["-layout", "-nopgbrk"])
+                    .arg(&tmp_path)
+                    .arg("-")
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(pdf_text) = child.stdout.take() {
+                        shown = Command::new("less")
+                            .args(["-R"])
+                            .stdin(pdf_text)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                    }
+                    let _ = child.wait();
+                }
+            } else if Self::is_binary_file(&tmp_path) && self.integration_active("hexyl") {
+                let hexyl = Command::new("hexyl")
+                    .arg(&tmp_path)
+                    .stdout(Stdio::piped())
+                    .spawn();
+                if let Ok(child) = hexyl {
+                    shown = Command::new("less")
+                        .args(["-R"])
+                        .stdin(child.stdout.unwrap())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                }
+            } else if self.integration_active("bat") {
+                let bat_cmd = Self::bat_tool().unwrap_or_else(|| "bat".to_string());
+                shown = Command::new(bat_cmd)
+                    .args(["--paging=always", "--style=full", "--color=always"])
+                    .arg(&tmp_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            } else {
+                shown = Command::new("less")
+                    .args(["-R", tmp_path.to_str().unwrap_or_default()])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            }
+        }
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        if let Err(e) = decrypted {
+            self.set_status(format!("decrypt failed: {}", e));
+            return Ok(false);
+        }
+        Ok(shown)
+    }
+
+    fn preview_single_image_with_tool(path: &PathBuf, tool: &str) -> bool {
+        let script = r#"
+tool="$1"
+img="$2"
+clear
+"$tool" -- "$img"
+printf '\n[Press any key to return]\n'
+IFS= read -rsn1 _
+"#;
+
+        Command::new("bash")
+            .arg("-lc")
+            .arg(script)
+            .arg("--")
+            .arg(tool)
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn preview_cast_with_asciinema(path: &PathBuf) -> io::Result<bool> {
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+
+        let mut child = match Command::new("asciinema")
+            .arg("play")
+            .arg(path)
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
+
+        println!("Playing cast: {}", path.display());
+        println!("Press q or Esc to stop playback.");
+
+        enable_raw_mode()?;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if event::poll(Duration::from_millis(120))? {
+                if let Event::Key(k) = event::read()? {
+                    if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+        disable_raw_mode()?;
+        Ok(true)
+    }
+
+    fn edit_age_file(&mut self, input: &PathBuf) -> io::Result<bool> {
+        let Ok((tmp_dir, tmp_path)) = Self::age_temp_decrypt_paths(input, "edit") else {
+            self.set_status("failed to prepare temporary file");
+            return Ok(false);
+        };
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let decrypted = Self::age_decrypt_file_interactive(input, &tmp_path);
+        if decrypted.is_err() {
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            enable_raw_mode()?;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_dir_all(&tmp_dir);
+            self.set_status(format!("decrypt failed: {}", decrypted.err().unwrap_or_default()));
+            return Ok(false);
+        }
+
+        let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string()))
+            .arg(&tmp_path)
+            .status();
+
+        let result = Self::age_encrypt_file_interactive(&tmp_path, input);
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        match result {
+            Ok(()) => self.set_status("protected file updated"),
+            Err(e) => self.set_status(format!("re-protect failed: {}", e)),
+        }
+        self.refresh_entries_or_status();
+        Ok(true)
     }
 
     fn sort_mode_options() -> [SortMode; 7] {
@@ -844,6 +1168,8 @@ impl App {
                 } else {
                     ("\u{F07B}".to_string(), dir_style)
                 }
+            } else if Self::is_age_protected_file(&path) {
+                ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
             } else {
                 let icon = icon_data.as_ref().map(|i| i.icon.to_string()).unwrap_or_else(|| "?".to_string());
                 let color = icon_data
@@ -860,6 +1186,8 @@ impl App {
 
         let mut name_style = if is_dir {
             Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD)
+        } else if Self::is_age_protected_file(&path) {
+            Style::default().fg(Color::Rgb(230, 190, 90))
         } else {
             let file_color = icon_data
                 .as_ref()
@@ -1165,6 +1493,55 @@ impl App {
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("pdf"))
             .unwrap_or(false)
+    }
+
+    fn is_cast_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cast"))
+            .unwrap_or(false)
+    }
+
+    fn is_age_protected_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("age"))
+            .unwrap_or(false)
+    }
+
+    fn age_protected_output_path(path: &PathBuf) -> PathBuf {
+        PathBuf::from(format!("{}.age", path.to_string_lossy()))
+    }
+
+    fn age_plain_output_path(path: &PathBuf) -> PathBuf {
+        let mut out = path.clone();
+        out.set_extension("");
+        if out == *path {
+            path.with_extension("decrypted")
+        } else {
+            out
+        }
+    }
+
+    fn age_temp_decrypt_paths(path: &PathBuf, purpose: &str) -> io::Result<(PathBuf, PathBuf)> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = env::temp_dir().join(format!(
+            "sbrs_age_{}_{}_{}",
+            purpose,
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(&tmp_dir)?;
+
+        let plain_name = Self::age_plain_output_path(path)
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| "decrypted.bin".into());
+        let tmp_path = tmp_dir.join(plain_name);
+        Ok((tmp_dir, tmp_path))
     }
 
     fn is_delimited_text_file(path: &PathBuf) -> bool {
@@ -3111,6 +3488,8 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "bat", description: "syntax-highlighted view on Enter", category: "viewer", required: false },
             IntegrationSpec { key: "glow", description: "Markdown preview on Enter", category: "viewer", required: false },
             IntegrationSpec { key: "pdftotext", description: "PDF text preview on Enter", category: "preview", required: false },
+            IntegrationSpec { key: "asciinema", description: "terminal recording playback (.cast) on Enter (q/Esc to stop)", category: "preview", required: false },
+            IntegrationSpec { key: "age", description: "password-protect/decrypt files (.age) with p/Enter/e", category: "security", required: false },
             IntegrationSpec { key: "jnv", description: "interactive JSON preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "csvlens", description: "interactive delimited preview (.csv/.tsv/.tab/.psv/.dsv/.ssv)", category: "preview", required: false },
             IntegrationSpec { key: "delta", description: "side-by-side colored compare (C: marked file vs cursor)", category: "diff", required: false },
@@ -3142,12 +3521,24 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn integration_probe(cmd: &str) -> (bool, String) {
-        match Command::new("which").arg(cmd).output() {
-            Ok(out) if out.status.success() => {
+        if let Ok(out) = Command::new("which").arg(cmd).output() {
+            if out.status.success() {
                 let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                (true, path)
+                if !path.is_empty() {
+                    return (true, path);
+                }
             }
-            _ => (false, String::new()),
+        }
+
+        // Fallback for environments where `which` is unavailable or shell setup differs.
+        match Command::new(cmd)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(_) => (true, cmd.to_string()),
+            Err(_) => (false, String::new()),
         }
     }
 
@@ -3158,6 +3549,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 let editor_cmd = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
                 let (ok, path) = Self::integration_probe(&editor_cmd);
                 if ok { (true, path) } else { (false, format!("$EDITOR={}", editor_var)) }
+            }
+            "age" => {
+                let (age_ok, age_path) = Self::integration_probe("age");
+                (age_ok, age_path)
             }
             "zip" => {
                 let (zip_ok, zip_path) = Self::integration_probe("zip");
@@ -3483,6 +3878,8 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
                 } else {
                     ("\u{F07B}".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
                 }
+            } else if App::is_age_protected_file(&path) {
+                ("".to_string(), CtColor::Rgb { r: 230, g: 190, b: 90 })
             } else {
                 let icon = icon_data
                     .as_ref()
@@ -3504,6 +3901,8 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let mut name_color = if is_dir {
             CtColor::Rgb { r: 100, g: 160, b: 240 }
+        } else if App::is_age_protected_file(&path) {
+            CtColor::Rgb { r: 230, g: 190, b: 90 }
         } else {
             icon_data
                 .as_ref()
@@ -3926,7 +4325,7 @@ fn main() -> io::Result<()> {
                             ("N", "Create new folder"),
                             ("F2 / r", "Rename or bulk rename"),
                             ("d", "Delete selected/marked item(s)"),
-                            ("x", "Toggle executable bit"),
+                            ("x / p", "Toggle executable bit / protect/unprotect file"),
                             ("Z", "Create or extract archive"),
                             ("o", "Open with default GUI app"),
                         ],
@@ -4019,7 +4418,8 @@ fn main() -> io::Result<()> {
                     AppMode::ArchiveCreate => " Create Archive (Enter=Confirm, Esc=Cancel) ",
                     _ => " New Name ",
                 };
-                f.render_widget(Paragraph::new(app.input_buffer.as_str()).block(Block::default().borders(Borders::ALL).title(title)), rename_area);
+                let prompt_value = app.input_buffer.clone();
+                f.render_widget(Paragraph::new(prompt_value).block(Block::default().borders(Borders::ALL).title(title)), rename_area);
                 app.clamp_input_cursor();
                 let cursor_x = rename_area.x + 1 + app.input_cursor as u16;
                 let cursor_y = rename_area.y + 1;
@@ -4619,6 +5019,21 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('x') => {
                         app.toggle_executable_permissions();
                     }
+                    KeyCode::Char('p') => {
+                        if let Some(selected_path) = app.entries.get(app.selected_index).map(|e| e.path()) {
+                            if selected_path.is_dir() {
+                                app.set_status("age protection works on files only");
+                            } else if !app.integration_active("age") {
+                                app.set_status("age not found in PATH");
+                            } else if App::is_age_protected_file(&selected_path) {
+                                app.unprotect_file_with_age(&selected_path)?;
+                                terminal.clear()?;
+                            } else {
+                                app.protect_file_with_age(&selected_path)?;
+                                terminal.clear()?;
+                            }
+                        }
+                    }
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.begin_sort_menu();
                     }
@@ -4773,6 +5188,13 @@ fn main() -> io::Result<()> {
                     KeyCode::Enter | KeyCode::Right => {
                         if let Some(selected_path) = app.entries.get(app.selected_index).map(|e| e.path()) {
                             if selected_path.is_dir() { app.try_enter_dir(selected_path); }
+                            else if App::is_age_protected_file(&selected_path) {
+                                if !app.integration_active("age") {
+                                    app.set_status("age not found in PATH");
+                                } else if app.preview_age_file(&selected_path)? {
+                                    terminal.clear()?;
+                                }
+                            }
                             else if App::is_fuse_zip_archive(&selected_path) && app.integration_active("fuse-zip") {
                                 let _ = app.try_mount_archive(selected_path);
                             }
@@ -4900,6 +5322,16 @@ fn main() -> io::Result<()> {
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
+                            else if App::is_cast_file(&selected_path) && app.integration_active("asciinema") {
+                                disable_raw_mode()?;
+                                execute!(io::stdout(), LeaveAlternateScreen)?;
+
+                                let _ = App::preview_cast_with_asciinema(&selected_path)?;
+
+                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?;
+                                terminal.clear()?;
+                            }
                             else { 
                                 disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
                                 if App::is_binary_file(&selected_path) && app.integration_active("hexyl") {
@@ -4994,15 +5426,23 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('e') | KeyCode::F(4) => {
                         if let Some(e) = app.entries.get(app.selected_index) {
                             let path = e.path();
-                            disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
-                            if !path.is_dir() && App::is_binary_file(&path) && app.integration_active("hexedit") {
-                                let _ = Command::new("hexedit").arg(&path).status();
+                            if App::is_age_protected_file(&path) {
+                                if !app.integration_active("age") {
+                                    app.set_status("age not found in PATH");
+                                } else if app.edit_age_file(&path)? {
+                                    terminal.clear()?;
+                                }
                             } else {
-                                let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string())).arg(&path).status();
+                                disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                                if !path.is_dir() && App::is_binary_file(&path) && app.integration_active("hexedit") {
+                                    let _ = Command::new("hexedit").arg(&path).status();
+                                } else {
+                                    let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string())).arg(&path).status();
+                                }
+                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                                terminal.clear()?;
+                                app.refresh_entries_or_status();
                             }
-                            enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
-                            terminal.clear()?;
-                            app.refresh_entries_or_status();
                         }
                     }
                     _ => {}
