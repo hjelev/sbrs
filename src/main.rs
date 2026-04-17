@@ -88,6 +88,15 @@ enum ArchiveProgressMsg {
     Finished(Result<String, String>),
 }
 
+enum FolderSizeMsg {
+    EntrySize(u64, PathBuf, u64),
+    Finished(u64),
+}
+
+enum SelectedTotalSizeMsg {
+    Finished(u64, u64),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchiveKind {
     Zip,
@@ -164,6 +173,14 @@ struct App {
     help_max_offset: u16,
     git_info_cache: Option<GitInfoCache>,
     git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool)>)>>,
+    folder_size_enabled: bool,
+    folder_size_rx: Option<Receiver<FolderSizeMsg>>,
+    folder_size_scan_id: u64,
+    selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
+    selected_total_size_scan_id: u64,
+    selected_total_size_pending: bool,
+    selected_total_size_bytes: Option<u64>,
+    selected_total_size_items: usize,
 }
 
 #[derive(Clone)]
@@ -265,10 +282,214 @@ impl App {
             help_max_offset: 0,
             git_info_cache: None,
             git_info_rx: None,
+            folder_size_enabled: false,
+            folder_size_rx: None,
+            folder_size_scan_id: 0,
+            selected_total_size_rx: None,
+            selected_total_size_scan_id: 0,
+            selected_total_size_pending: false,
+            selected_total_size_bytes: None,
+            selected_total_size_items: 0,
         };
         app.refresh_entries()?;
         app.request_git_info_for_current_dir_once();
         Ok(app)
+    }
+
+    fn clear_selected_total_size_state(&mut self) {
+        self.selected_total_size_scan_id = self.selected_total_size_scan_id.wrapping_add(1);
+        self.selected_total_size_rx = None;
+        self.selected_total_size_pending = false;
+        self.selected_total_size_bytes = None;
+        self.selected_total_size_items = 0;
+    }
+
+    fn start_selected_total_size_scan(&mut self) {
+        if !self.folder_size_enabled || self.marked_indices.len() < 2 {
+            self.clear_selected_total_size_state();
+            return;
+        }
+
+        let targets: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.marked_indices.contains(i))
+            .map(|(_, e)| e.path())
+            .collect();
+
+        if targets.len() < 2 {
+            self.clear_selected_total_size_state();
+            return;
+        }
+
+        self.selected_total_size_scan_id = self.selected_total_size_scan_id.wrapping_add(1);
+        let scan_id = self.selected_total_size_scan_id;
+        self.selected_total_size_items = targets.len();
+        self.selected_total_size_pending = true;
+        self.selected_total_size_bytes = None;
+
+        let (tx, rx) = mpsc::channel();
+        self.selected_total_size_rx = Some(rx);
+        thread::spawn(move || {
+            let total = targets
+                .iter()
+                .filter_map(|p| App::compute_total_bytes(p).ok())
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            let _ = tx.send(SelectedTotalSizeMsg::Finished(scan_id, total));
+        });
+    }
+
+    fn pump_selected_total_size_progress(&mut self) {
+        let Some(rx) = self.selected_total_size_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(SelectedTotalSizeMsg::Finished(scan_id, bytes)) => {
+                    if scan_id == self.selected_total_size_scan_id {
+                        self.selected_total_size_bytes = Some(bytes);
+                        self.selected_total_size_pending = false;
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx && self.folder_size_enabled {
+            self.selected_total_size_rx = Some(rx);
+        }
+    }
+
+    fn selected_total_size_status(&self) -> Option<String> {
+        let selected_count = self.marked_indices.len();
+        if selected_count == 0 {
+            return None;
+        }
+
+        let noun = if selected_count == 1 { "item" } else { "items" };
+        if !self.folder_size_enabled || selected_count < 2 {
+            return Some(format!("selected: {} {}", selected_count, noun));
+        }
+
+        if self.selected_total_size_pending {
+            return Some(format!(
+                "selected: {} {} | total size: scanning...",
+                self.selected_total_size_items.max(selected_count),
+                noun
+            ));
+        }
+
+        Some(match self.selected_total_size_bytes {
+            Some(bytes) => format!(
+                "selected: {} {} | total size: {}",
+                self.selected_total_size_items.max(selected_count),
+                noun,
+                Self::format_size(bytes)
+            ),
+            None => format!("selected: {} {}", selected_count, noun),
+        })
+    }
+
+    fn start_folder_size_scan(&mut self) {
+        if !self.folder_size_enabled {
+            return;
+        }
+
+        self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
+        let scan_id = self.folder_size_scan_id;
+
+        let dir_paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+
+        if dir_paths.is_empty() {
+            self.folder_size_rx = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.folder_size_rx = Some(rx);
+        thread::spawn(move || {
+            for dir in dir_paths {
+                let size = App::compute_total_bytes(&dir).unwrap_or(0);
+                let _ = tx.send(FolderSizeMsg::EntrySize(scan_id, dir, size));
+            }
+            let _ = tx.send(FolderSizeMsg::Finished(scan_id));
+        });
+    }
+
+    fn reset_folder_size_columns(&mut self) {
+        let size_width = 8usize;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.path().is_dir() {
+                self.entry_render_cache[idx].size_col = format!("{:>width$}", "-", width = size_width);
+            }
+        }
+    }
+
+    fn set_folder_size_enabled(&mut self, enabled: bool) {
+        if enabled == self.folder_size_enabled {
+            return;
+        }
+
+        self.folder_size_enabled = enabled;
+        self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
+        self.folder_size_rx = None;
+        self.reset_folder_size_columns();
+
+        if enabled {
+            self.set_status("folder size calc: on");
+            self.start_folder_size_scan();
+            self.start_selected_total_size_scan();
+        } else {
+            self.set_status("folder size calc: off");
+            self.clear_selected_total_size_state();
+        }
+    }
+
+    fn pump_folder_size_progress(&mut self) {
+        let Some(rx) = self.folder_size_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(FolderSizeMsg::EntrySize(scan_id, dir_path, size)) => {
+                    if !self.folder_size_enabled || scan_id != self.folder_size_scan_id {
+                        continue;
+                    }
+                    if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
+                        self.entry_render_cache[idx].size_col = format!("{:>width$}", Self::format_size(size), width = 8);
+                    }
+                }
+                Ok(FolderSizeMsg::Finished(scan_id)) => {
+                    if scan_id == self.folder_size_scan_id {
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx && self.folder_size_enabled {
+            self.folder_size_rx = Some(rx);
+        }
     }
 
     fn pump_git_info(&mut self) {
@@ -1517,6 +1738,9 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .iter()
             .map(|entry| self.build_entry_render_cache(entry))
             .collect();
+        self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
+        self.folder_size_rx = None;
+        self.clear_selected_total_size_state();
         self.marked_indices.clear();
         
         if self.entries.is_empty() {
@@ -1525,6 +1749,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         } else {
             self.selected_index = self.selected_index.min(self.entries.len() - 1);
             self.table_state.select(Some(self.selected_index));
+        }
+
+        if self.folder_size_enabled {
+            self.start_folder_size_scan();
         }
         Ok(())
     }
@@ -2482,7 +2710,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.copy_current_src = None;
         self.refresh_entries_or_status();
         if self.paste_failed_items == 0 && self.paste_ok_items > 0 {
-            self.set_status(format!("transfer complete: {} item(s)", self.paste_ok_items));
+            self.set_status(format!("transfer complete: {} item", self.paste_ok_items));
         } else if self.paste_failed_items == 0 {
             self.set_status("nothing to transfer");
         } else {
@@ -3116,6 +3344,8 @@ fn main() -> io::Result<()> {
         app.pump_archive_progress();
         app.pump_copy_total_prescan();
         app.pump_copy_progress();
+        app.pump_folder_size_progress();
+        app.pump_selected_total_size_progress();
         app.pump_git_info();
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -3355,13 +3585,13 @@ fn main() -> io::Result<()> {
                     (
                         "Search And Integrations",
                         [
+                            ("s", "Toggle recursive folder size calc"),
                             ("f", "Fuzzy search with fzf"),
                             ("g", "Content search with ripgrep"),
                             ("C", "Delta compare (marked vs cursor)"),
                             ("S", "Open SSH/rclone mount picker"),
                             ("i", "Open integrations panel"),
-                            ("b", "Open bookmarks"),
-                            ("0-9", "Jump to bookmark"),
+                            ("b / 0-9", "Open bookmarks / jump to bookmark"),
                         ],
                     ),
                     (
@@ -3755,14 +3985,11 @@ fn main() -> io::Result<()> {
 
             // --- Footer ---
             let mut left_status_parts = vec![format!("Total:{}", app.entries.len())];
-            if !app.marked_indices.is_empty() {
-                left_status_parts.push(format!("Selected:{}", app.marked_indices.len()));
-            }
             if !app.clipboard.is_empty() {
                 left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
             }
             let left_status = left_status_parts.join(" │ ");
-            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit o:Open-GUI ~:home h:Help q:Quit";
+            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit s:Size o:Open-GUI ~:home h:Help q:Quit";
             let width = chunks[1].width as usize;
             let left_len = left_status.chars().count();
             let right_len = right_status.chars().count();
@@ -3887,21 +4114,38 @@ fn main() -> io::Result<()> {
             status_spans.extend(right_spans);
             let status = Line::from(status_spans);
             f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
-            if !app.status_message.is_empty() {
+            let selected_total_status = if app.copy_rx.is_none() && app.archive_rx.is_none() {
+                app.selected_total_size_status()
+            } else {
+                None
+            };
+
+            let selected_total_is_shown = selected_total_status.is_some();
+            let status_line_message = selected_total_status.or_else(|| {
+                if app.status_message.is_empty() {
+                    None
+                } else {
+                    Some(app.status_message.clone())
+                }
+            });
+
+            if let Some(status_text) = status_line_message {
                 let msg_area = Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, 1);
-                let lower_msg = app.status_message.to_ascii_lowercase();
+                let lower_msg = status_text.to_ascii_lowercase();
                 let is_error = lower_msg.contains("error")
                     || lower_msg.contains("failed")
                     || lower_msg.contains("not found")
                     || lower_msg.contains("refresh failed");
-                let msg_style = if app.copy_rx.is_some() || app.archive_rx.is_some() {
+                let msg_style = if selected_total_is_shown {
+                    Style::default().fg(Color::Rgb(150, 220, 150))
+                } else if app.copy_rx.is_some() || app.archive_rx.is_some() {
                     Style::default().fg(Color::Rgb(120, 200, 255))
                 } else if is_error {
                     Style::default().fg(Color::Rgb(255, 120, 120))
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let message = app.status_message.as_str();
+                let message = status_text.as_str();
                 let core = format!("─── {} ", message);
                 let core_len = core.chars().count();
                 let width = msg_area.width as usize;
@@ -3944,6 +4188,7 @@ fn main() -> io::Result<()> {
                             } else {
                                 app.marked_indices.insert(app.selected_index);
                             }
+                            app.start_selected_total_size_scan();
                             if app.selected_index < app.entries.len() - 1 {
                                 app.selected_index += 1;
                                 app.table_state.select(Some(app.selected_index));
@@ -3957,6 +4202,7 @@ fn main() -> io::Result<()> {
                             } else {
                                 app.marked_indices = (0..app.entries.len()).collect();
                             }
+                            app.start_selected_total_size_scan();
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3987,6 +4233,10 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('x') => {
                         app.toggle_executable_permissions();
+                    }
+                    KeyCode::Char('s') => {
+                        let enabled = !app.folder_size_enabled;
+                        app.set_folder_size_enabled(enabled);
                     }
                     KeyCode::Char('C') => {
                         app.run_delta_compare()?;
