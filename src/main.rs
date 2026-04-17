@@ -6000,6 +6000,39 @@ fn main() -> io::Result<()> {
                         app.open_selected_with_default_app()?;
                         terminal.clear()?;
                     }
+                    KeyCode::Char('l') => {
+                        if let Some(entry) = app.entries.get(app.selected_index) {
+                            let selected_path = entry.path();
+                            if !selected_path.is_dir() {
+                                disable_raw_mode()?;
+                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                if App::is_binary_file(&selected_path) && app.integration_active("hexyl") {
+                                    use std::process::Stdio;
+                                    let hexyl = Command::new("hexyl")
+                                        .arg(&selected_path)
+                                        .stdout(Stdio::piped())
+                                        .spawn();
+                                    if let Ok(child) = hexyl {
+                                        let _ = Command::new("less")
+                                            .args(["-R"])
+                                            .stdin(child.stdout.unwrap())
+                                            .status();
+                                    } else {
+                                        let _ = Command::new("less")
+                                            .args(["-R", selected_path.to_str().unwrap_or_default()])
+                                            .status();
+                                    }
+                                } else {
+                                    let _ = Command::new("less")
+                                        .args(["-R", selected_path.to_str().unwrap_or_default()])
+                                        .status();
+                                }
+                                enable_raw_mode()?;
+                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                terminal.clear()?;
+                            }
+                        }
+                    }
                     KeyCode::Char('n') => {
                         app.begin_input_edit(AppMode::NewFile, String::new());
                     }
