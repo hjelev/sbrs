@@ -66,6 +66,17 @@ struct GitInfoCache {
     updated_at: Instant,
 }
 
+#[derive(Clone)]
+struct EntryRenderCache {
+    raw_name: String,
+    icon_glyph: String,
+    icon_style: Style,
+    name_style: Style,
+    meta_col: String,
+    size_col: String,
+    date_col: String,
+}
+
 enum CopyProgressMsg {
     TotalBytes(u64),
     CopiedBytes(u64),
@@ -73,6 +84,7 @@ enum CopyProgressMsg {
 }
 
 enum ArchiveProgressMsg {
+    TotalBytes(u64),
     Progress(u64),
     Finished(Result<String, String>),
 }
@@ -105,6 +117,7 @@ enum AppMode {
 struct App {
     current_dir: PathBuf,
     entries: Vec<fs::DirEntry>,
+    entry_render_cache: Vec<EntryRenderCache>,
     selected_index: usize,
     marked_indices: HashSet<usize>,
     directory_selection: HashMap<PathBuf, usize>,
@@ -124,6 +137,7 @@ struct App {
     remote_entries: Vec<RemoteEntry>,
     ssh_picker_selection: usize,
     copy_rx: Option<Receiver<CopyProgressMsg>>,
+    copy_total_rx: Option<Receiver<u64>>,
     copy_total_bytes: u64,
     copy_done_bytes: u64,
     copy_job_total_bytes: u64,
@@ -204,6 +218,7 @@ impl App {
         let mut app = Self {
             current_dir,
             entries: Vec::new(),
+            entry_render_cache: Vec::new(),
             selected_index: 0,
             marked_indices: HashSet::new(),
             directory_selection: HashMap::new(),
@@ -223,6 +238,7 @@ impl App {
             remote_entries: Vec::new(),
             ssh_picker_selection: 0,
             copy_rx: None,
+            copy_total_rx: None,
             copy_total_bytes: 0,
             copy_done_bytes: 0,
             copy_job_total_bytes: 0,
@@ -343,6 +359,110 @@ impl App {
         let next = ((self.selected_index as isize) + delta).clamp(0, max_idx) as usize;
         self.selected_index = next;
         self.table_state.select(Some(next));
+    }
+
+    fn build_entry_render_cache(&self, entry: &fs::DirEntry) -> EntryRenderCache {
+        let path = entry.path();
+        let meta = entry.metadata().ok();
+        let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
+        let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
+        let is_dir = path.is_dir();
+        let icon_data = if self.nerd_font_active {
+            Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
+        } else {
+            None
+        };
+
+        let (icon_glyph, icon_style) = if !self.show_icons {
+            (String::new(), Style::default())
+        } else if self.nerd_font_active {
+            if is_symlink {
+                ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
+            } else if is_dir {
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let dir_style = Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD);
+                if let Some((glyph, _)) = named_dir_icon(dir_name) {
+                    (glyph.to_string(), dir_style)
+                } else {
+                    ("\u{F07B}".to_string(), dir_style)
+                }
+            } else {
+                let icon = icon_data.as_ref().map(|i| i.icon.to_string()).unwrap_or_else(|| "?".to_string());
+                let color = icon_data
+                    .as_ref()
+                    .and_then(|i| Color::from_str(i.color).ok())
+                    .unwrap_or(Color::White);
+                (icon, Style::default().fg(color))
+            }
+        } else if is_dir {
+            ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
+        } else {
+            ("📄".to_string(), Style::default().fg(Color::White))
+        };
+
+        let mut name_style = if is_dir {
+            Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD)
+        } else {
+            let file_color = icon_data
+                .as_ref()
+                .and_then(|i| Color::from_str(i.color).ok())
+                .unwrap_or(Color::White);
+            Style::default().fg(file_color)
+        };
+
+        if is_symlink {
+            name_style = Style::default().fg(Color::Rgb(100, 220, 220));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !is_dir && meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
+                name_style = Style::default().fg(Color::Rgb(120, 220, 120));
+            }
+        }
+
+        if is_hidden {
+            name_style = name_style.add_modifier(Modifier::DIM);
+        }
+
+        let meta_width = 18usize;
+        let size_width = 8usize;
+        let date_width = 16usize;
+        let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
+        let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
+        let meta_raw = format!("{} {}", perms, owner);
+        let meta_trimmed = if meta_raw.chars().count() > meta_width {
+            meta_raw
+                .chars()
+                .rev()
+                .take(meta_width)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>()
+        } else {
+            meta_raw
+        };
+        let meta_col = format!("{:>width$}", meta_trimmed, width = meta_width);
+        let size = meta.as_ref().map(|m| if m.is_dir() { "-".into() } else { App::format_size(m.len()) }).unwrap_or_default();
+        let size_col = format!("{:>width$}", size, width = size_width);
+        let date = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let date_col = format!("{:>width$}", date, width = date_width);
+
+        EntryRenderCache {
+            raw_name: entry.file_name().to_string_lossy().into_owned(),
+            icon_glyph,
+            icon_style,
+            name_style,
+            meta_col,
+            size_col,
+            date_col,
+        }
     }
 
     fn byte_index_for_char(s: &str, char_index: usize) -> usize {
@@ -1365,6 +1485,11 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
         self.entries = entries;
+        self.entry_render_cache = self
+            .entries
+            .iter()
+            .map(|entry| self.build_entry_render_cache(entry))
+            .collect();
         self.marked_indices.clear();
         
         if self.entries.is_empty() {
@@ -1771,6 +1896,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         let total = self.archive_total_bytes;
         let done = self.archive_done_bytes;
+        let scanning = total == 0 && done == 0;
         let display_total = total.max(done).max(1);
         let percent = if total == 0 {
             0.0
@@ -1801,16 +1927,23 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         } else {
             "-".to_string()
         };
+        let total_label = if scanning {
+            "?".to_string()
+        } else {
+            Self::format_size(display_total)
+        };
+        let scan_suffix = if scanning { " scanning size..." } else { "" };
 
         self.set_status(format!(
-            "archive [{}] {:>3.0}% {}/{} {} eta {} {}",
+            "archive [{}] {:>3.0}% {}/{} {} eta {} {}{}",
             bar,
             percent,
             Self::format_size(done),
-            Self::format_size(display_total),
+            total_label,
             speed_str,
             eta,
-            self.archive_name
+            self.archive_name,
+            scan_suffix
         ));
     }
 
@@ -1826,22 +1959,23 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             return;
         }
 
-        let total_bytes = targets
-            .iter()
-            .filter_map(|p| Self::compute_total_bytes(p).ok())
-            .fold(0u64, |acc, v| acc.saturating_add(v));
-
         let cwd = self.current_dir.clone();
         let archive_path = cwd.join(&archive_name);
         let (tx, rx) = mpsc::channel();
         self.archive_rx = Some(rx);
-        self.archive_total_bytes = total_bytes;
+        self.archive_total_bytes = 0;
         self.archive_done_bytes = 0;
         self.archive_started_at = Some(Instant::now());
         self.archive_name = archive_name.clone();
         self.update_archive_status();
 
         thread::spawn(move || {
+            let total_bytes = targets
+                .iter()
+                .filter_map(|p| Self::compute_total_bytes(p).ok())
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            let _ = tx.send(ArchiveProgressMsg::TotalBytes(total_bytes));
+
             let mut cmd = Command::new("zip");
             cmd.arg("-r")
                 .arg(&archive_name)
@@ -1888,6 +2022,9 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let mut finished: Option<Result<String, String>> = None;
         loop {
             match rx.try_recv() {
+                Ok(ArchiveProgressMsg::TotalBytes(total)) => {
+                    self.archive_total_bytes = total;
+                }
                 Ok(ArchiveProgressMsg::Progress(done)) => {
                     self.archive_done_bytes = done;
                 }
@@ -1949,17 +2086,40 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.paste_total_items = self.clipboard.len();
         self.paste_ok_items = 0;
         self.paste_failed_items = 0;
-        self.copy_total_bytes = self
-            .clipboard
-            .iter()
-            .filter_map(|src| Self::compute_total_bytes(src).ok())
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let sources = self.clipboard.clone();
+        let (tx_total, rx_total) = mpsc::channel();
+        self.copy_total_rx = Some(rx_total);
+        thread::spawn(move || {
+            let total = sources
+                .iter()
+                .filter_map(|src| App::compute_total_bytes(src).ok())
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            let _ = tx_total.send(total);
+        });
+        self.copy_total_bytes = 0;
         self.copy_done_bytes = 0;
         self.copy_done_before_job = 0;
         self.copy_job_total_bytes = 0;
         self.copy_started_at = Some(Instant::now());
         self.copy_current_src = None;
         self.advance_paste_queue();
+    }
+
+    fn pump_copy_total_prescan(&mut self) {
+        let Some(rx) = self.copy_total_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(total) => {
+                self.copy_total_bytes = total;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.copy_total_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.copy_total_rx = None;
+            }
+        }
     }
 
     fn begin_paste(&mut self) {
@@ -2091,10 +2251,21 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             return;
         }
         let total = self.copy_total_bytes;
-        let done = self.copy_done_bytes.min(total);
-        let effective_total = total.max(1);
+        let scanning = total == 0 && self.copy_total_rx.is_some();
+        let done = if total == 0 {
+            self.copy_done_bytes
+        } else {
+            self.copy_done_bytes.min(total)
+        };
+        let effective_total = if total == 0 {
+            done
+                .saturating_add(self.copy_job_total_bytes)
+                .max(1)
+        } else {
+            total.max(1)
+        };
         let percent = if total == 0 {
-            100.0
+            if self.copy_total_rx.is_some() { 0.0 } else { 100.0 }
         } else {
             (done as f64 * 100.0) / effective_total as f64
         };
@@ -2104,7 +2275,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .unwrap_or(0.0)
             .max(0.001);
         let bytes_per_sec = done as f64 / elapsed_secs;
-        let remaining = total.saturating_sub(done);
+        let remaining = if total == 0 { 0 } else { total.saturating_sub(done) };
         let eta_secs = if bytes_per_sec > 0.0 {
             (remaining as f64 / bytes_per_sec) as u64
         } else {
@@ -2117,20 +2288,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             "#".repeat(filled.min(bar_width)),
             "-".repeat(bar_width.saturating_sub(filled.min(bar_width)))
         );
+        let total_label = if total == 0 && self.copy_total_rx.is_some() {
+            "?".to_string()
+        } else {
+            Self::format_size(effective_total)
+        };
+        let eta_label = if total == 0 { "-".to_string() } else { Self::format_eta(eta_secs) };
+        let scan_suffix = if scanning { " scanning size..." } else { "" };
         let current_idx = (self.paste_ok_items + self.paste_failed_items + 1).min(self.paste_total_items.max(1));
         let scope = if self.copy_from_remote { "remote " } else { "" };
         self.set_status(format!(
-            "{}copy [{}] {:>3.0}% {}/{} {}/s eta {} ({}/{}) {}",
+            "{}copy [{}] {:>3.0}% {}/{} {}/s eta {} ({}/{}) {}{}",
             scope,
             bar,
             percent,
             Self::format_size(done),
-            Self::format_size(total),
+            total_label,
             Self::format_size(bytes_per_sec as u64),
-            Self::format_eta(eta_secs),
+            eta_label,
             current_idx,
             self.paste_total_items,
-            self.copy_item_name
+            self.copy_item_name,
+            scan_suffix
         ));
     }
 
@@ -2272,6 +2451,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.clear_input_edit();
         self.mode = AppMode::Browsing;
         self.copy_started_at = None;
+        self.copy_total_rx = None;
         self.copy_current_src = None;
         self.refresh_entries_or_status();
         if self.paste_failed_items == 0 && self.paste_ok_items > 0 {
@@ -2763,7 +2943,7 @@ fn list_current_directory(include_hidden: bool) -> io::Result<()> {
                     styled_name,
                     style(meta_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
                     style(size_col).with(CtColor::Green),
-                    style(date_col).with(CtColor::Blue)
+                    style(date_col).with(CtColor::Rgb { r: 120, g: 190, b: 210 })
                 );
             } else if show_meta && show_size {
                 println!(
@@ -2871,6 +3051,7 @@ fn main() -> io::Result<()> {
 
     loop {
         app.pump_archive_progress();
+        app.pump_copy_total_prescan();
         app.pump_copy_progress();
         app.pump_git_info();
         app.ensure_git_info_refresh();
@@ -2949,83 +3130,18 @@ fn main() -> io::Result<()> {
                 Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White)
             };
 
-            let rows: Vec<Row> = app.entries.iter().enumerate().map(|(idx, e)| {
-                let path = e.path();
-                let meta = e.metadata().ok();
-                let icon_data = if app.nerd_font_active {
-                    Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
-                } else {
-                    None
-                };
+            let rows: Vec<Row> = app.entry_render_cache.iter().enumerate().map(|(idx, entry_cache)| {
                 let is_marked = app.marked_indices.contains(&idx);
-                let is_hidden = e.file_name().to_string_lossy().starts_with('.');
-                let is_symlink = e.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-                let is_dir = path.is_dir();
-
                 let no_color_selected = app.no_color && idx == app.selected_index;
-
-                let (icon_glyph, mut icon_style) = if !app.show_icons {
-                    (String::new(), Style::default())
-                } else if app.nerd_font_active {
-                    if is_symlink {
-                        ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
-                    } else if is_dir {
-                        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let dir_style = Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD);
-                        if let Some((glyph, _)) = named_dir_icon(dir_name) {
-                            (glyph.to_string(), dir_style)
-                        } else {
-                            ("\u{F07B}".to_string(), dir_style)
-                        }
-                    } else {
-                        let icon = icon_data.as_ref().map(|i| i.icon.to_string()).unwrap_or_else(|| "?".to_string());
-                        let color = icon_data
-                            .as_ref()
-                            .and_then(|i| Color::from_str(i.color).ok())
-                            .unwrap_or(Color::White);
-                        (icon, Style::default().fg(color))
-                    }
-                } else if is_dir {
-                    ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
-                } else {
-                    ("📄".to_string(), Style::default().fg(Color::White))
-                };
-
-                let mut name_style = if is_dir {
-                    Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD)
-                } else {
-                    let file_color = icon_data
-                        .as_ref()
-                        .and_then(|i| Color::from_str(i.color).ok())
-                        .unwrap_or(Color::White);
-                    Style::default().fg(file_color)
-                };
-
-                if is_symlink {
-                    name_style = Style::default().fg(Color::Rgb(100, 220, 220));
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if !is_dir && meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
-                        name_style = Style::default().fg(Color::Rgb(120, 220, 120));
-                    }
-                }
-
-                if is_hidden {
-                    name_style = name_style.add_modifier(Modifier::DIM);
-                }
+                let mut icon_style = entry_cache.icon_style;
+                let mut name_style = entry_cache.name_style;
                 if app.no_color {
                     if no_color_selected {
                         name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
                         icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
                     } else {
-                        name_style = Style::default().add_modifier(if is_dir { Modifier::BOLD } else { Modifier::empty() });
-                        if is_hidden {
-                            name_style = name_style.add_modifier(Modifier::DIM);
-                        }
-                        icon_style = Style::default();
+                        name_style.fg = None;
+                        icon_style.fg = None;
                     }
                 }
 
@@ -3054,42 +3170,21 @@ fn main() -> io::Result<()> {
                         Style::default()
                     }
                 } else {
-                    Style::default().fg(Color::Blue)
+                    Style::default().fg(Color::Rgb(120, 190, 210))
                 };
-                let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
-                let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
-                let meta_raw = format!("{} {}", perms, owner);
-                let meta_trimmed = if meta_raw.chars().count() > meta_width {
-                    meta_raw
-                        .chars()
-                        .rev()
-                        .take(meta_width)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<String>()
-                } else {
-                    meta_raw
-                };
-                let meta_col = format!("{:>width$}", meta_trimmed, width = meta_width);
-                let size = meta.as_ref().map(|m| if m.is_dir() { "-".into() } else { App::format_size(m.len()) }).unwrap_or_default();
-                let size_col = format!("{:>width$}", size, width = size_width);
-                let date = meta.as_ref().and_then(|m| m.modified().ok()).map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-                let date_col = format!("{:>width$}", date, width = date_width);
-                let raw_name = e.file_name().to_string_lossy().into_owned();
-                let rendered_name = truncate_with_ellipsis(&raw_name, file_name_width);
+                let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, file_name_width);
 
                 let mut cells = vec![Cell::from(Line::from({
                     let mut spans = vec![];
                     if app.show_icons {
-                        spans.push(Span::styled(format!("{} ", icon_glyph), icon_style));
+                        spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                     }
                     spans.push(Span::styled(rendered_name, name_style));
                     spans
                 }))];
-                if show_meta { cells.push(Cell::from(Span::styled(meta_col, meta_style))); }
-                if show_size { cells.push(Cell::from(Span::styled(size_col, size_style))); }
-                if show_date { cells.push(Cell::from(Span::styled(date_col, date_style))); }
+                if show_meta { cells.push(Cell::from(Span::styled(entry_cache.meta_col.as_str(), meta_style))); }
+                if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
+                if show_date { cells.push(Cell::from(Span::styled(entry_cache.date_col.as_str(), date_style))); }
                 Row::new(cells).style(if !no_color_selected && is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
 
@@ -3108,8 +3203,8 @@ fn main() -> io::Result<()> {
             // If the selected item is truncated, temporarily hide its metadata and
             // render its full name across the whole row width.
             if let Some(selected_idx) = app.table_state.selected() {
-                if let Some(entry) = app.entries.get(selected_idx) {
-                    let full_name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(entry_cache) = app.entry_render_cache.get(selected_idx) {
+                    let full_name = entry_cache.raw_name.as_str();
                     if full_name.chars().count() > file_name_width {
                         let offset = app.table_state.offset();
                         if selected_idx >= offset {
@@ -3121,71 +3216,8 @@ fn main() -> io::Result<()> {
                                     table_area.width,
                                     1,
                                 );
-
-                                let path = entry.path();
-                                let meta = entry.metadata().ok();
-                                let is_dir = path.is_dir();
-                                let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
-                                let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-
-                                let icon_data = if app.nerd_font_active {
-                                    Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
-                                } else {
-                                    None
-                                };
-
-                                let (icon, mut icon_style) = if !app.show_icons {
-                                    (String::new(), Style::default())
-                                } else if app.nerd_font_active {
-                                    if is_symlink {
-                                        ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
-                                    } else if is_dir {
-                                        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                                        let dir_style = Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD);
-                                        if let Some((glyph, _)) = named_dir_icon(dir_name) {
-                                            (glyph.to_string(), dir_style)
-                                        } else {
-                                            ("\u{F07B}".to_string(), dir_style)
-                                        }
-                                    } else {
-                                        let icon = icon_data.as_ref().map(|i| i.icon.to_string()).unwrap_or_else(|| "?".to_string());
-                                        let color = icon_data
-                                            .as_ref()
-                                            .and_then(|i| Color::from_str(i.color).ok())
-                                            .unwrap_or(Color::White);
-                                        (icon, Style::default().fg(color))
-                                    }
-                                } else if is_dir {
-                                    ("📁".to_string(), Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD))
-                                } else {
-                                    ("📄".to_string(), Style::default().fg(Color::White))
-                                };
-
-                                let mut name_style = if is_dir {
-                                    Style::default().fg(Color::Rgb(100, 160, 240)).add_modifier(Modifier::BOLD)
-                                } else {
-                                    let file_color = icon_data
-                                        .as_ref()
-                                        .and_then(|i| Color::from_str(i.color).ok())
-                                        .unwrap_or(Color::White);
-                                    Style::default().fg(file_color)
-                                };
-
-                                if is_symlink {
-                                    name_style = Style::default().fg(Color::Rgb(100, 220, 220));
-                                }
-
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    if !is_dir && meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
-                                        name_style = Style::default().fg(Color::Rgb(120, 220, 120));
-                                    }
-                                }
-
-                                if is_hidden {
-                                    name_style = name_style.add_modifier(Modifier::DIM);
-                                }
+                                let mut icon_style = entry_cache.icon_style;
+                                let mut name_style = entry_cache.name_style;
                                 if app.no_color {
                                     icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
                                     name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
@@ -3202,7 +3234,7 @@ fn main() -> io::Result<()> {
                                     Paragraph::new(Line::from({
                                         let mut spans = vec![];
                                         if app.show_icons {
-                                            spans.push(Span::styled(format!("{} ", icon), icon_style));
+                                            spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                                         }
                                         spans.push(Span::styled(full_name, name_style));
                                         spans
