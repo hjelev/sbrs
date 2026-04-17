@@ -109,6 +109,31 @@ enum ArchiveKind {
     Rar,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    NameAsc,
+    NameDesc,
+    ExtensionAsc,
+    SizeAsc,
+    SizeDesc,
+    ModifiedNewest,
+    ModifiedOldest,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "Name (A-Z)",
+            SortMode::NameDesc => "Name (Z-A)",
+            SortMode::ExtensionAsc => "Extension (A-Z)",
+            SortMode::SizeAsc => "Size (Small-Large)",
+            SortMode::SizeDesc => "Size (Large-Small)",
+            SortMode::ModifiedNewest => "Modified (Newest)",
+            SortMode::ModifiedOldest => "Modified (Oldest)",
+        }
+    }
+}
+
 #[derive(PartialEq)]
 enum AppMode {
     Browsing,
@@ -123,6 +148,7 @@ enum AppMode {
     ConfirmDelete,
     Bookmarks,
     Integrations,
+    SortMenu,
     SshPicker,
 }
 
@@ -190,6 +216,8 @@ struct App {
     selected_total_size_pending: bool,
     selected_total_size_bytes: Option<u64>,
     selected_total_size_items: usize,
+    sort_mode: SortMode,
+    sort_menu_selected: usize,
 }
 
 #[derive(Clone)]
@@ -304,10 +332,137 @@ impl App {
             selected_total_size_pending: false,
             selected_total_size_bytes: None,
             selected_total_size_items: 0,
+            sort_mode: SortMode::NameAsc,
+            sort_menu_selected: 0,
         };
         app.refresh_entries()?;
         app.request_git_info_for_current_dir_once();
         Ok(app)
+    }
+
+    fn sort_mode_options() -> [SortMode; 7] {
+        [
+            SortMode::NameAsc,
+            SortMode::NameDesc,
+            SortMode::ExtensionAsc,
+            SortMode::SizeAsc,
+            SortMode::SizeDesc,
+            SortMode::ModifiedNewest,
+            SortMode::ModifiedOldest,
+        ]
+    }
+
+    fn sort_mode_index(mode: SortMode) -> usize {
+        Self::sort_mode_options()
+            .iter()
+            .position(|m| *m == mode)
+            .unwrap_or(0)
+    }
+
+    fn entry_name_key(entry: &fs::DirEntry) -> String {
+        entry.file_name().to_string_lossy().to_ascii_lowercase()
+    }
+
+    fn entry_size_key(entry: &fs::DirEntry) -> u64 {
+        fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn entry_extension_key(entry: &fs::DirEntry) -> String {
+        entry.path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+
+    fn entry_modified_key(entry: &fs::DirEntry) -> u64 {
+        fs::metadata(entry.path())
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn sort_entries_by_mode(entries: &mut [fs::DirEntry], mode: SortMode) {
+        entries.sort_by(|a, b| {
+            let a_is_file = a.path().is_file();
+            let b_is_file = b.path().is_file();
+            if a_is_file != b_is_file {
+                return a_is_file.cmp(&b_is_file);
+            }
+
+            match mode {
+                SortMode::NameAsc => Self::entry_name_key(a).cmp(&Self::entry_name_key(b)),
+                SortMode::NameDesc => Self::entry_name_key(b).cmp(&Self::entry_name_key(a)),
+                SortMode::ExtensionAsc => Self::entry_extension_key(a)
+                    .cmp(&Self::entry_extension_key(b))
+                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+                SortMode::SizeAsc => Self::entry_size_key(a)
+                    .cmp(&Self::entry_size_key(b))
+                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+                SortMode::SizeDesc => Self::entry_size_key(b)
+                    .cmp(&Self::entry_size_key(a))
+                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+                SortMode::ModifiedNewest => Self::entry_modified_key(b)
+                    .cmp(&Self::entry_modified_key(a))
+                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+                SortMode::ModifiedOldest => Self::entry_modified_key(a)
+                    .cmp(&Self::entry_modified_key(b))
+                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+            }
+        });
+    }
+
+    fn apply_sort_to_current_entries(&mut self) {
+        let selected_path = self.entries.get(self.selected_index).map(|e| e.path());
+        let marked_paths: HashSet<PathBuf> = self
+            .marked_indices
+            .iter()
+            .filter_map(|idx| self.entries.get(*idx).map(|e| e.path()))
+            .collect();
+
+        Self::sort_entries_by_mode(&mut self.entries, self.sort_mode);
+
+        self.entry_render_cache = self
+            .entries
+            .iter()
+            .map(|entry| self.build_entry_render_cache(entry))
+            .collect();
+
+        self.marked_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| marked_paths.contains(&entry.path()))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if self.entries.is_empty() {
+            self.selected_index = 0;
+            self.table_state.select(None);
+            return;
+        }
+
+        self.selected_index = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path() == p))
+            .unwrap_or_else(|| self.selected_index.min(self.entries.len() - 1));
+        self.table_state.select(Some(self.selected_index));
+    }
+
+    fn begin_sort_menu(&mut self) {
+        self.sort_menu_selected = Self::sort_mode_index(self.sort_mode);
+        self.mode = AppMode::SortMenu;
+    }
+
+    fn commit_sort_menu_choice(&mut self) {
+        let options = Self::sort_mode_options();
+        if let Some(mode) = options.get(self.sort_menu_selected).copied() {
+            self.sort_mode = mode;
+            self.apply_sort_to_current_entries();
+            self.set_status(format!("sort: {}", mode.label()));
+        }
+        self.mode = AppMode::Browsing;
     }
 
     fn clear_selected_total_size_state(&mut self) {
@@ -1821,7 +1976,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .filter(|e| self.show_hidden || !e.file_name().to_string_lossy().starts_with('.'))
             .collect();
 
-        entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
+        Self::sort_entries_by_mode(&mut entries, self.sort_mode);
         self.entries = entries;
         self.entry_render_cache = self
             .entries
@@ -3785,7 +3940,7 @@ fn main() -> io::Result<()> {
                     (
                         "Search And Integrations",
                         [
-                            ("s", "Toggle recursive folder size calc"),
+                            ("s / Ctrl+s", "Toggle size calc / open sorting menu"),
                             ("f", "Fuzzy search with fzf"),
                             ("g", "Content search with ripgrep"),
                             ("C", "Delta compare (marked vs cursor)"),
@@ -3984,6 +4139,42 @@ fn main() -> io::Result<()> {
                         .block(Block::default().borders(Borders::ALL).title(" Integrations ")
                             .border_style(Style::default().fg(Color::Rgb(180, 130, 255)))),
                     int_area,
+                );
+            } else if app.mode == AppMode::SortMenu {
+                let area = f.size();
+                let options = App::sort_mode_options();
+                let mut lines: Vec<Line> = vec![
+                    Line::from(Span::styled("↑↓ pick  Enter/→ apply  Esc/q/← close", Style::default().fg(Color::DarkGray))),
+                    Line::from(""),
+                ];
+                for (idx, mode) in options.iter().enumerate() {
+                    let is_selected = idx == app.sort_menu_selected;
+                    let is_current = *mode == app.sort_mode;
+                    let row_text = format!("{}", mode.label());
+                    let style = if is_selected {
+                        Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White)
+                    } else if is_current {
+                        Style::default().fg(Color::Rgb(255, 220, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(190, 190, 190))
+                    };
+                    lines.push(Line::from(Span::styled(row_text, style)));
+                }
+
+                let sort_h = (lines.len() as u16 + 2).max(10).min(area.height);
+                let sort_w = 52u16.min(area.width);
+                let sort_area = Rect::new(
+                    (area.width.saturating_sub(sort_w)) / 2,
+                    (area.height.saturating_sub(sort_h)) / 2,
+                    sort_w,
+                    sort_h,
+                );
+                f.render_widget(Clear, sort_area);
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL).title(" Sorting ")
+                            .border_style(Style::default().fg(Color::Rgb(120, 190, 255)))),
+                    sort_area,
                 );
             } else if app.mode == AppMode::SshPicker {
                 let area = f.size();
@@ -4433,6 +4624,9 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('x') => {
                         app.toggle_executable_permissions();
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.begin_sort_menu();
                     }
                     KeyCode::Char('s') => {
                         let enabled = !app.folder_size_enabled;
@@ -4982,6 +5176,24 @@ fn main() -> io::Result<()> {
                                 }
                             }
                             app.refresh_integration_rows_cache();
+                        }
+                        _ => {}
+                    }
+                }
+                AppMode::SortMenu => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                            app.mode = AppMode::Browsing;
+                        }
+                        KeyCode::Up => {
+                            app.sort_menu_selected = app.sort_menu_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            let max_idx = App::sort_mode_options().len().saturating_sub(1);
+                            app.sort_menu_selected = (app.sort_menu_selected + 1).min(max_idx);
+                        }
+                        KeyCode::Enter | KeyCode::Right => {
+                            app.commit_sort_menu_choice();
                         }
                         _ => {}
                     }
