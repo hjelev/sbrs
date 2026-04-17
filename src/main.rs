@@ -97,6 +97,10 @@ enum SelectedTotalSizeMsg {
     Finished(u64, u64),
 }
 
+enum CurrentDirTotalSizeMsg {
+    Finished(u64, u64),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchiveKind {
     Zip,
@@ -177,6 +181,10 @@ struct App {
     folder_size_enabled: bool,
     folder_size_rx: Option<Receiver<FolderSizeMsg>>,
     folder_size_scan_id: u64,
+    current_dir_total_size_rx: Option<Receiver<CurrentDirTotalSizeMsg>>,
+    current_dir_total_size_scan_id: u64,
+    current_dir_total_size_pending: bool,
+    current_dir_total_size_bytes: Option<u64>,
     selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
     selected_total_size_scan_id: u64,
     selected_total_size_pending: bool,
@@ -287,6 +295,10 @@ impl App {
             folder_size_enabled: false,
             folder_size_rx: None,
             folder_size_scan_id: 0,
+            current_dir_total_size_rx: None,
+            current_dir_total_size_scan_id: 0,
+            current_dir_total_size_pending: false,
+            current_dir_total_size_bytes: None,
             selected_total_size_rx: None,
             selected_total_size_scan_id: 0,
             selected_total_size_pending: false,
@@ -336,7 +348,7 @@ impl App {
         thread::spawn(move || {
             let total = targets
                 .iter()
-                .filter_map(|p| App::compute_total_bytes(p).ok())
+                .filter_map(|p| App::compute_total_display_bytes(p).ok())
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let _ = tx.send(SelectedTotalSizeMsg::Finished(scan_id, total));
         });
@@ -424,11 +436,78 @@ impl App {
         self.folder_size_rx = Some(rx);
         thread::spawn(move || {
             for dir in dir_paths {
-                let size = App::compute_total_bytes(&dir).unwrap_or(0);
+                let size = App::compute_total_display_bytes(&dir).unwrap_or(0);
                 let _ = tx.send(FolderSizeMsg::EntrySize(scan_id, dir, size));
             }
             let _ = tx.send(FolderSizeMsg::Finished(scan_id));
         });
+    }
+
+    fn clear_current_dir_total_size_state(&mut self) {
+        self.current_dir_total_size_scan_id = self.current_dir_total_size_scan_id.wrapping_add(1);
+        self.current_dir_total_size_rx = None;
+        self.current_dir_total_size_pending = false;
+        self.current_dir_total_size_bytes = None;
+    }
+
+    fn start_current_dir_total_size_scan(&mut self) {
+        if !self.folder_size_enabled {
+            return;
+        }
+
+        self.current_dir_total_size_scan_id = self.current_dir_total_size_scan_id.wrapping_add(1);
+        let scan_id = self.current_dir_total_size_scan_id;
+        let current_dir = self.current_dir.clone();
+        self.current_dir_total_size_pending = true;
+        self.current_dir_total_size_bytes = None;
+
+        let (tx, rx) = mpsc::channel();
+        self.current_dir_total_size_rx = Some(rx);
+        thread::spawn(move || {
+            let total = App::compute_total_display_bytes(&current_dir).unwrap_or(0);
+            let _ = tx.send(CurrentDirTotalSizeMsg::Finished(scan_id, total));
+        });
+    }
+
+    fn pump_current_dir_total_size_progress(&mut self) {
+        let Some(rx) = self.current_dir_total_size_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(CurrentDirTotalSizeMsg::Finished(scan_id, bytes)) => {
+                    if scan_id == self.current_dir_total_size_scan_id {
+                        self.current_dir_total_size_bytes = Some(bytes);
+                        self.current_dir_total_size_pending = false;
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx && self.folder_size_enabled {
+            self.current_dir_total_size_rx = Some(rx);
+        }
+    }
+
+    fn current_dir_total_size_header_suffix(&self) -> Option<String> {
+        if !self.folder_size_enabled {
+            return None;
+        }
+
+        if self.current_dir_total_size_pending {
+            return Some(" scanning...".to_string());
+        }
+
+        self.current_dir_total_size_bytes
+            .map(|bytes| format!(" {}", Self::format_size(bytes)))
     }
 
     fn reset_folder_size_columns(&mut self) {
@@ -453,9 +532,11 @@ impl App {
         if enabled {
             self.set_status("folder size calc: on");
             self.start_folder_size_scan();
+            self.start_current_dir_total_size_scan();
             self.start_selected_total_size_scan();
         } else {
             self.set_status("folder size calc: off");
+            self.clear_current_dir_total_size_state();
             self.clear_selected_total_size_state();
         }
     }
@@ -927,6 +1008,13 @@ impl App {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| MARKDOWN_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+            .unwrap_or(false)
+    }
+
+    fn is_pdf_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("pdf"))
             .unwrap_or(false)
     }
 
@@ -1742,6 +1830,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .collect();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
         self.folder_size_rx = None;
+        self.clear_current_dir_total_size_state();
         self.clear_selected_total_size_state();
         self.marked_indices.clear();
         
@@ -1755,6 +1844,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         if self.folder_size_enabled {
             self.start_folder_size_scan();
+            self.start_current_dir_total_size_scan();
         }
         Ok(())
     }
@@ -2456,15 +2546,111 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn compute_total_bytes(src: &PathBuf) -> io::Result<u64> {
-        if src.is_dir() {
-            let mut total = 0u64;
-            for child in fs::read_dir(src)? {
-                let child = child?;
-                total = total.saturating_add(Self::compute_total_bytes(&child.path())?);
+        Self::compute_total_bytes_inner(src, true)
+    }
+
+    fn compute_total_display_bytes(src: &PathBuf) -> io::Result<u64> {
+        Self::compute_total_display_bytes_inner(src, true)
+    }
+
+    fn compute_total_bytes_inner(src: &PathBuf, follow_symlink_dir: bool) -> io::Result<u64> {
+        // Best-effort size walk: skip unreadable nodes instead of failing the whole tree.
+        let metadata = match fs::symlink_metadata(src) {
+            Ok(m) => m,
+            Err(_) => return Ok(0),
+        };
+
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            if follow_symlink_dir {
+                if let Ok(target_meta) = fs::metadata(src) {
+                    if target_meta.is_dir() {
+                        return Self::compute_dir_total_bytes(src);
+                    }
+                }
             }
-            Ok(total)
-        } else {
-            Ok(fs::metadata(src)?.len())
+            return Ok(metadata.len());
+        }
+
+        if file_type.is_dir() {
+            return Self::compute_dir_total_bytes(src);
+        }
+
+        Ok(metadata.len())
+    }
+
+    fn compute_total_display_bytes_inner(src: &PathBuf, follow_symlink_dir: bool) -> io::Result<u64> {
+        // Best-effort size walk for display: uses disk-usage bytes on Unix to avoid
+        // huge apparent sizes from virtual files (for example /proc/kcore).
+        let metadata = match fs::symlink_metadata(src) {
+            Ok(m) => m,
+            Err(_) => return Ok(0),
+        };
+
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            if follow_symlink_dir {
+                if let Ok(target_meta) = fs::metadata(src) {
+                    if target_meta.is_dir() {
+                        return Self::compute_dir_total_display_bytes(src);
+                    }
+                }
+            }
+            return Ok(Self::display_leaf_size(&metadata));
+        }
+
+        if file_type.is_dir() {
+            return Self::compute_dir_total_display_bytes(src);
+        }
+
+        Ok(Self::display_leaf_size(&metadata))
+    }
+
+    fn compute_dir_total_bytes(dir: &PathBuf) -> io::Result<u64> {
+        let mut total = 0u64;
+        let children = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return Ok(0),
+        };
+
+        for child in children {
+            let child_path = match child {
+                Ok(entry) => entry.path(),
+                Err(_) => continue,
+            };
+            total = total.saturating_add(Self::compute_total_bytes_inner(&child_path, false)?);
+        }
+
+        Ok(total)
+    }
+
+    fn compute_dir_total_display_bytes(dir: &PathBuf) -> io::Result<u64> {
+        let mut total = 0u64;
+        let children = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return Ok(0),
+        };
+
+        for child in children {
+            let child_path = match child {
+                Ok(entry) => entry.path(),
+                Err(_) => continue,
+            };
+            total = total.saturating_add(Self::compute_total_display_bytes_inner(&child_path, false)?);
+        }
+
+        Ok(total)
+    }
+
+    fn display_leaf_size(metadata: &fs::Metadata) -> u64 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.blocks().saturating_mul(512)
+        }
+        #[cfg(not(unix))]
+        {
+            metadata.len()
         }
     }
 
@@ -2775,6 +2961,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "$EDITOR", description: "edit files (e / F4)", category: "editor", required: true },
             IntegrationSpec { key: "bat", description: "syntax-highlighted view on Enter", category: "viewer", required: false },
             IntegrationSpec { key: "glow", description: "Markdown preview on Enter", category: "viewer", required: false },
+            IntegrationSpec { key: "pdftotext", description: "PDF text preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "jnv", description: "interactive JSON preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "csvlens", description: "interactive delimited preview (.csv/.tsv/.tab/.psv/.dsv/.ssv)", category: "preview", required: false },
             IntegrationSpec { key: "delta", description: "side-by-side colored compare (C: marked file vs cursor)", category: "diff", required: false },
@@ -3351,6 +3538,7 @@ fn main() -> io::Result<()> {
         app.pump_copy_total_prescan();
         app.pump_copy_progress();
         app.pump_folder_size_progress();
+        app.pump_current_dir_total_size_progress();
         app.pump_selected_total_size_progress();
         app.pump_git_info();
         terminal.draw(|f| {
@@ -3378,6 +3566,12 @@ fn main() -> io::Result<()> {
                     }
                     path_spans.push(Span::styled(")", branch_style));
                 }
+            }
+            if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
+                path_spans.push(Span::styled(
+                    total_suffix,
+                    Style::default().fg(Color::Rgb(150, 220, 150)),
+                ));
             }
             f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             if app.mode == AppMode::PathEditing {
@@ -4479,6 +4673,39 @@ fn main() -> io::Result<()> {
                                         }
                                     }
                                     disable_raw_mode()?;
+                                }
+
+                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?;
+                                terminal.clear()?;
+                            }
+                            else if App::is_pdf_file(&selected_path) && app.integration_active("pdftotext") {
+                                disable_raw_mode()?;
+                                execute!(io::stdout(), LeaveAlternateScreen)?;
+
+                                let mut shown = false;
+                                if let Ok(mut child) = Command::new("pdftotext")
+                                    .args(["-layout", "-nopgbrk"])
+                                    .arg(&selected_path)
+                                    .arg("-")
+                                    .stdout(Stdio::piped())
+                                    .spawn()
+                                {
+                                    if let Some(pdf_text) = child.stdout.take() {
+                                        shown = Command::new("less")
+                                            .args(["-R"])
+                                            .stdin(pdf_text)
+                                            .status()
+                                            .map(|s| s.success())
+                                            .unwrap_or(false);
+                                    }
+                                    let _ = child.wait();
+                                }
+
+                                if !shown {
+                                    let _ = Command::new("less")
+                                        .args(["-R", selected_path.to_str().unwrap_or_default()])
+                                        .status();
                                 }
 
                                 execute!(io::stdout(), EnterAlternateScreen)?;
