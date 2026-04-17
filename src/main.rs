@@ -492,12 +492,14 @@ impl App {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
-            } else if Self::is_json_file(&tmp_path) && self.integration_active("jnv") {
-                shown = Command::new("jnv")
+            } else if Self::is_html_file(&tmp_path) && self.integration_active("links") {
+                shown = Command::new("links")
                     .arg(&tmp_path)
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
+            } else if Self::is_json_file(&tmp_path) && self.integration_active("jnv") {
+                shown = Self::preview_json_with_jnv(&tmp_path)?;
             } else if Self::is_delimited_text_file(&tmp_path) && self.integration_active("csvlens") {
                 shown = Command::new("csvlens")
                     .arg(&tmp_path)
@@ -606,6 +608,33 @@ impl App {
             return Ok(false);
         }
         Ok(shown)
+    }
+
+    fn preview_json_with_jnv(path: &PathBuf) -> io::Result<bool> {
+        let mut child = Command::new("jnv").arg(path).spawn();
+        if let Ok(ref mut proc) = child {
+            println!("Viewing JSON: {}", path.display());
+            println!("Press q, Esc, or Left to close preview.");
+            enable_raw_mode()?;
+            loop {
+                if proc.try_wait()?.is_some() {
+                    break;
+                }
+                if event::poll(Duration::from_millis(120))? {
+                    if let Event::Key(k) = event::read()? {
+                        if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left) {
+                            let _ = proc.kill();
+                            let _ = proc.wait();
+                            break;
+                        }
+                    }
+                }
+            }
+            disable_raw_mode()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn preview_single_image_with_tool(path: &PathBuf, tool: &str) -> bool {
@@ -1820,6 +1849,14 @@ IFS= read -rsn1 _
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| MARKDOWN_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+            .unwrap_or(false)
+    }
+
+    fn is_html_file(path: &PathBuf) -> bool {
+        const HTML_EXTENSIONS: &[&str] = &["html", "htm", "xhtml"];
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| HTML_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
             .unwrap_or(false)
     }
 
@@ -4198,6 +4235,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "$EDITOR", description: "edit files (e / F4)", category: "editor", required: true },
             IntegrationSpec { key: "bat", description: "syntax-highlighted view on Enter", category: "viewer", required: false },
             IntegrationSpec { key: "glow", description: "Markdown preview on Enter", category: "viewer", required: false },
+            IntegrationSpec { key: "links", description: "HTML preview on Enter", category: "viewer", required: false },
             IntegrationSpec { key: "pdftotext", description: "PDF text preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "asciinema", description: "terminal recording playback (.cast) on Enter (q/Esc to stop)", category: "preview", required: false },
             IntegrationSpec { key: "age", description: "password-protect/decrypt files (.age) with p/Enter/e", category: "security", required: false },
@@ -6134,11 +6172,19 @@ fn main() -> io::Result<()> {
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
+                            else if App::is_html_file(&selected_path) && app.integration_active("links") {
+                                disable_raw_mode()?;
+                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                let _ = Command::new("links").arg(&selected_path).status();
+                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?;
+                                terminal.clear()?;
+                            }
                             else if App::is_json_file(&selected_path) && app.integration_active("jnv") {
                                 disable_raw_mode()?;
                                 execute!(io::stdout(), LeaveAlternateScreen)?;
                                 execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
-                                let _ = Command::new("jnv").arg(&selected_path).status();
+                                let _ = App::preview_json_with_jnv(&selected_path);
                                 execute!(io::stdout(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
@@ -6691,7 +6737,13 @@ fn main() -> io::Result<()> {
                                     if already_mounted {
                                         app.mount_rclone_remote(&name, &rtype)?;
                                     } else {
+                                        disable_raw_mode()?;
+                                        execute!(io::stdout(), LeaveAlternateScreen)?;
+                                        println!("Connecting to rclone remote: {}…", name);
                                         let result = app.mount_rclone_remote(&name, &rtype);
+                                        enable_raw_mode()?;
+                                        execute!(io::stdout(), EnterAlternateScreen)?;
+                                        terminal.clear()?;
                                         if result.is_err() {
                                             app.set_status(format!("Failed to mount rclone remote {}", name));
                                             app.mode = AppMode::Browsing;
