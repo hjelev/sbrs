@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use crossterm::{
     cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{style, Attribute, Color as CtColor, Stylize},
     terminal::{disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     str::FromStr,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +58,12 @@ struct SshMount {
     _host_alias: String,
     mount_path: PathBuf,
     return_dir: PathBuf,
+}
+
+struct GitInfoCache {
+    path: PathBuf,
+    info: Option<(String, bool)>,
+    updated_at: Instant,
 }
 
 enum CopyProgressMsg {
@@ -143,6 +149,8 @@ struct App {
     integration_overrides: HashMap<String, bool>,
     help_scroll_offset: u16,
     help_max_offset: u16,
+    git_info_cache: Option<GitInfoCache>,
+    git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool)>)>>,
 }
 
 #[derive(Clone)]
@@ -240,9 +248,71 @@ impl App {
             integration_overrides: HashMap::new(),
             help_scroll_offset: 0,
             help_max_offset: 0,
+            git_info_cache: None,
+            git_info_rx: None,
         };
         app.refresh_entries()?;
         Ok(app)
+    }
+
+    fn pump_git_info(&mut self) {
+        let Some(rx) = self.git_info_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((path, info)) => {
+                self.git_info_cache = Some(GitInfoCache {
+                    path,
+                    info,
+                    updated_at: Instant::now(),
+                });
+                self.git_info_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.git_info_rx = None;
+            }
+        }
+    }
+
+    fn ensure_git_info_refresh(&mut self) {
+        if !self.integration_enabled("git") {
+            self.git_info_rx = None;
+            return;
+        }
+        if self.git_info_rx.is_some() {
+            return;
+        }
+
+        let stale = match self.git_info_cache.as_ref() {
+            Some(cache) if cache.path == self.current_dir => {
+                cache.updated_at.elapsed() >= Duration::from_millis(1200)
+            }
+            _ => true,
+        };
+
+        if !stale {
+            return;
+        }
+
+        let path = self.current_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.git_info_rx = Some(rx);
+        thread::spawn(move || {
+            let info = App::get_git_info(&path);
+            let _ = tx.send((path, info));
+        });
+    }
+
+    fn cached_git_info_for_current_dir(&self) -> Option<(&str, bool)> {
+        let cache = self.git_info_cache.as_ref()?;
+        if cache.path != self.current_dir {
+            return None;
+        }
+        cache
+            .info
+            .as_ref()
+            .map(|(branch, dirty)| (branch.as_str(), *dirty))
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -263,6 +333,16 @@ impl App {
     fn clamp_input_cursor(&mut self) {
         let len = self.input_buffer.chars().count();
         self.input_cursor = self.input_cursor.min(len);
+    }
+
+    fn move_selection_delta(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let max_idx = (self.entries.len() - 1) as isize;
+        let next = ((self.selected_index as isize) + delta).clamp(0, max_idx) as usize;
+        self.selected_index = next;
+        self.table_state.select(Some(next));
     }
 
     fn byte_index_for_char(s: &str, char_index: usize) -> usize {
@@ -2785,12 +2865,15 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new()?;
+    let mut deferred_key: Option<KeyEvent> = None;
     let hostname = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "host".to_string());
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
 
     loop {
         app.pump_archive_progress();
         app.pump_copy_progress();
+        app.pump_git_info();
+        app.ensure_git_info_refresh();
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -2807,7 +2890,7 @@ fn main() -> io::Result<()> {
                 },
             ];
             if app.integration_enabled("git") {
-                if let Some((branch, is_dirty)) = App::get_git_info(&app.current_dir) {
+                if let Some((branch, is_dirty)) = app.cached_git_info_for_current_dir() {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
                     path_spans.push(Span::styled(" (", branch_style));
                     path_spans.push(Span::styled(branch, branch_style));
@@ -2858,6 +2941,14 @@ fn main() -> io::Result<()> {
                 out
             };
 
+            let no_color_selected_bg = Color::White;
+            let no_color_selected_fg = Color::Black;
+            let selection_style = if app.no_color {
+                Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
+            } else {
+                Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White)
+            };
+
             let rows: Vec<Row> = app.entries.iter().enumerate().map(|(idx, e)| {
                 let path = e.path();
                 let meta = e.metadata().ok();
@@ -2871,7 +2962,9 @@ fn main() -> io::Result<()> {
                 let is_symlink = e.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
                 let is_dir = path.is_dir();
 
-                let (icon_glyph, icon_style) = if !app.show_icons {
+                let no_color_selected = app.no_color && idx == app.selected_index;
+
+                let (icon_glyph, mut icon_style) = if !app.show_icons {
                     (String::new(), Style::default())
                 } else if app.nerd_font_active {
                     if is_symlink {
@@ -2924,12 +3017,45 @@ fn main() -> io::Result<()> {
                     name_style = name_style.add_modifier(Modifier::DIM);
                 }
                 if app.no_color {
-                    if idx == app.selected_index {
-                        name_style = name_style.fg(Color::White);
+                    if no_color_selected {
+                        name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
+                        icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
                     } else {
-                        name_style.fg = None;
+                        name_style = Style::default().add_modifier(if is_dir { Modifier::BOLD } else { Modifier::empty() });
+                        if is_hidden {
+                            name_style = name_style.add_modifier(Modifier::DIM);
+                        }
+                        icon_style = Style::default();
                     }
                 }
+
+                let meta_style = if app.no_color {
+                    if no_color_selected {
+                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
+                    } else {
+                        Style::default()
+                    }
+                } else {
+                    Style::default().fg(Color::Rgb(180, 150, 100))
+                };
+                let size_style = if app.no_color {
+                    if no_color_selected {
+                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
+                    } else {
+                        Style::default()
+                    }
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                let date_style = if app.no_color {
+                    if no_color_selected {
+                        Style::default().bg(no_color_selected_bg).fg(no_color_selected_fg)
+                    } else {
+                        Style::default()
+                    }
+                } else {
+                    Style::default().fg(Color::Blue)
+                };
                 let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
                 let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
                 let meta_raw = format!("{} {}", perms, owner);
@@ -2961,10 +3087,10 @@ fn main() -> io::Result<()> {
                     spans.push(Span::styled(rendered_name, name_style));
                     spans
                 }))];
-                if show_meta { cells.push(Cell::from(Span::styled(meta_col, Style::default().fg(Color::Rgb(180, 150, 100))))); }
-                if show_size { cells.push(Cell::from(Span::styled(size_col, Style::default().fg(Color::Green)))); }
-                if show_date { cells.push(Cell::from(Span::styled(date_col, Style::default().fg(Color::Blue)))); }
-                Row::new(cells).style(if is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
+                if show_meta { cells.push(Cell::from(Span::styled(meta_col, meta_style))); }
+                if show_size { cells.push(Cell::from(Span::styled(size_col, size_style))); }
+                if show_date { cells.push(Cell::from(Span::styled(date_col, date_style))); }
+                Row::new(cells).style(if !no_color_selected && is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
 
             let mut col_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
@@ -2972,7 +3098,7 @@ fn main() -> io::Result<()> {
             if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
             if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
             let table = Table::new(rows, col_constraints)
-                .highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White))
+                .highlight_style(if app.no_color { Style::default() } else { selection_style })
                 .highlight_symbol(""); 
 
             let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
@@ -3008,7 +3134,7 @@ fn main() -> io::Result<()> {
                                     None
                                 };
 
-                                let (icon, icon_style) = if !app.show_icons {
+                                let (icon, mut icon_style) = if !app.show_icons {
                                     (String::new(), Style::default())
                                 } else if app.nerd_font_active {
                                     if is_symlink {
@@ -3060,11 +3186,16 @@ fn main() -> io::Result<()> {
                                 if is_hidden {
                                     name_style = name_style.add_modifier(Modifier::DIM);
                                 }
-                                name_style = name_style.fg(Color::White);
+                                if app.no_color {
+                                    icon_style = icon_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
+                                    name_style = name_style.bg(no_color_selected_bg).fg(no_color_selected_fg);
+                                } else {
+                                    name_style = name_style.fg(Color::White);
+                                }
 
                                 f.render_widget(Clear, row_area);
                                 f.render_widget(
-                                    Block::default().style(Style::default().bg(Color::Rgb(50, 50, 50))),
+                                    Block::default().style(if app.no_color { Style::default().bg(no_color_selected_bg) } else { selection_style }),
                                     row_area,
                                 );
                                 f.render_widget(
@@ -3705,8 +3836,14 @@ fn main() -> io::Result<()> {
             }
         })?;
 
-        if event::poll(Duration::from_millis(80))? {
+        let mut next_key: Option<KeyEvent> = deferred_key.take();
+        if next_key.is_none() && event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
+                next_key = Some(key);
+            }
+        }
+
+        if let Some(key) = next_key {
             match app.mode {
                 AppMode::Browsing => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
@@ -3877,8 +4014,32 @@ fn main() -> io::Result<()> {
                             }
                         }
                     }
-                    KeyCode::Up => { app.selected_index = app.selected_index.saturating_sub(1); app.table_state.select(Some(app.selected_index)); }
-                    KeyCode::Down => { if !app.entries.is_empty() { app.selected_index = (app.selected_index + 1).min(app.entries.len() - 1); app.table_state.select(Some(app.selected_index)); } }
+                    KeyCode::Up | KeyCode::Down => {
+                        let mut steps: usize = 1;
+                        while steps < 32 && event::poll(Duration::from_millis(0))? {
+                            match event::read()? {
+                                Event::Key(next)
+                                    if next.code == key.code
+                                        && next.modifiers == key.modifiers
+                                        && next.kind == key.kind =>
+                                {
+                                    steps += 1;
+                                }
+                                Event::Key(next) => {
+                                    deferred_key = Some(next);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let delta = if key.code == KeyCode::Up {
+                            -(steps as isize)
+                        } else {
+                            steps as isize
+                        };
+                        app.move_selection_delta(delta);
+                    }
                     KeyCode::PageUp => { app.selected_index = app.selected_index.saturating_sub(app.page_size); app.table_state.select(Some(app.selected_index)); }
                     KeyCode::PageDown => { if !app.entries.is_empty() { app.selected_index = (app.selected_index + app.page_size).min(app.entries.len() - 1); app.table_state.select(Some(app.selected_index)); } }
                     KeyCode::Home => { app.selected_index = 0; app.table_state.select(Some(0)); }
@@ -4409,7 +4570,6 @@ fn main() -> io::Result<()> {
                     _ => {}
                 },
             }
-        }
         }
     }
     app.cleanup_archive_mounts();
