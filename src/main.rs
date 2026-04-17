@@ -169,6 +169,7 @@ struct App {
     show_icons: bool,
     integration_selected: usize,
     integration_overrides: HashMap<String, bool>,
+    integration_rows_cache: Vec<IntegrationRow>,
     help_scroll_offset: u16,
     help_max_offset: u16,
     git_info_cache: Option<GitInfoCache>,
@@ -278,6 +279,7 @@ impl App {
             show_icons: env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true),
             integration_selected: 0,
             integration_overrides: HashMap::new(),
+            integration_rows_cache: Vec::new(),
             help_scroll_offset: 0,
             help_max_offset: 0,
             git_info_cache: None,
@@ -2945,6 +2947,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         rows
     }
 
+    fn refresh_integration_rows_cache(&mut self) {
+        self.integration_rows_cache = self.integration_rows();
+    }
+
     fn load_bookmarks() -> Vec<(usize, Option<PathBuf>)> {
         (0..=9).map(|i| {
             let path = env::var(format!("SB_BOOKMARK_{}", i))
@@ -3716,7 +3722,7 @@ fn main() -> io::Result<()> {
                 );
             } else if app.mode == AppMode::Integrations {
                 let area = f.size();
-                let integrations = app.integration_rows();
+                let integrations = app.integration_rows_cache.clone();
                 if !integrations.is_empty() && app.integration_selected >= integrations.len() {
                     app.integration_selected = integrations.len() - 1;
                 }
@@ -4266,6 +4272,7 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('b') => { app.mode = AppMode::Bookmarks; }
                     KeyCode::Char('i') => {
                         app.integration_selected = 0;
+                        app.refresh_integration_rows_cache();
                         app.mode = AppMode::Integrations;
                     }
                     KeyCode::Char('S') => {
@@ -4747,6 +4754,7 @@ fn main() -> io::Result<()> {
                                     app.set_integration_enabled(spec.key, !current);
                                 }
                             }
+                            app.refresh_integration_rows_cache();
                         }
                         _ => {}
                     }
