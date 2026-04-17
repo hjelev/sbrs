@@ -3295,17 +3295,11 @@ fn main() -> io::Result<()> {
 
             // --- Overlays ---
             if app.mode == AppMode::Help {
-                let area = f.size();
-                let help_w = (area.width * 5 / 6).max(72).min(area.width.saturating_sub(2));
-                let help_h = (area.height * 4 / 5).max(18).min(area.height.saturating_sub(2));
-                let help_area = Rect::new(
-                    (area.width.saturating_sub(help_w)) / 2,
-                    (area.height.saturating_sub(help_h)) / 2,
-                    help_w,
-                    help_h,
-                );
-                f.render_widget(Clear, help_area);
-                let inner_w = help_area.width.saturating_sub(4) as usize;
+                let content_area = chunks[0];
+                let help_w = (content_area.width * 5 / 6)
+                    .max(72)
+                    .min(content_area.width.saturating_sub(2));
+                let inner_w = help_w.saturating_sub(4) as usize;
                 let shortcut_w = inner_w.clamp(10, 18);
                 let section_style = Style::default().fg(Color::Rgb(120, 200, 255)).add_modifier(Modifier::BOLD);
                 let shortcut_style = Style::default().fg(Color::Rgb(255, 220, 140)).add_modifier(Modifier::BOLD);
@@ -3400,6 +3394,16 @@ fn main() -> io::Result<()> {
                         ]));
                     }
                 }
+
+                let desired_h = (lines.len() as u16 + 2).max(18);
+                let help_h = desired_h.min(content_area.height);
+                let help_area = Rect::new(
+                    content_area.x + (content_area.width.saturating_sub(help_w)) / 2,
+                    content_area.y + (content_area.height.saturating_sub(help_h)) / 2,
+                    help_w,
+                    help_h,
+                );
+                f.render_widget(Clear, help_area);
 
                 let visible_lines = (help_area.height as usize).saturating_sub(2);
                 let total_lines = lines.len();
