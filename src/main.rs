@@ -63,7 +63,6 @@ struct SshMount {
 struct GitInfoCache {
     path: PathBuf,
     info: Option<(String, bool)>,
-    updated_at: Instant,
 }
 
 #[derive(Clone)]
@@ -268,6 +267,7 @@ impl App {
             git_info_rx: None,
         };
         app.refresh_entries()?;
+        app.request_git_info_for_current_dir_once();
         Ok(app)
     }
 
@@ -280,7 +280,6 @@ impl App {
                 self.git_info_cache = Some(GitInfoCache {
                     path,
                     info,
-                    updated_at: Instant::now(),
                 });
                 self.git_info_rx = None;
             }
@@ -291,26 +290,26 @@ impl App {
         }
     }
 
-    fn ensure_git_info_refresh(&mut self) {
+    fn request_git_info_for_current_dir_once(&mut self) {
         if !self.integration_enabled("git") {
             self.git_info_rx = None;
+            self.git_info_cache = None;
             return;
         }
         if self.git_info_rx.is_some() {
             return;
         }
-
-        let stale = match self.git_info_cache.as_ref() {
-            Some(cache) if cache.path == self.current_dir => {
-                cache.updated_at.elapsed() >= Duration::from_millis(1200)
-            }
-            _ => true,
-        };
-
-        if !stale {
+        if self
+            .git_info_cache
+            .as_ref()
+            .map(|cache| cache.path == self.current_dir)
+            .unwrap_or(false)
+        {
             return;
         }
 
+        // Clear stale data from a previously visited path until the new result arrives.
+        self.git_info_cache = None;
         let path = self.current_dir.clone();
         let (tx, rx) = mpsc::channel();
         self.git_info_rx = Some(rx);
@@ -544,6 +543,7 @@ impl App {
             self.current_dir = previous_dir;
         } else {
             self.restore_selection_for_current_dir();
+            self.request_git_info_for_current_dir_once();
         }
     }
 
@@ -2467,13 +2467,48 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn get_git_info(path: &PathBuf) -> Option<(String, bool)> {
-        let output = Command::new("git")
-            .args(["-C", path.to_str()?, "rev-parse", "--abbrev-ref", "HEAD"])
-            .output().ok()?;
-        if !output.status.success() { return None; }
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let status = Command::new("git").args(["-C", path.to_str()?, "status", "--short"]).output().ok()?;
-        Some((branch, !status.stdout.is_empty()))
+        let path_str = path.to_str()?;
+
+        let branch = Command::new("git")
+            .args(["-C", path_str, "symbolic-ref", "--short", "-q", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if value.is_empty() { None } else { Some(value) }
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                Command::new("git")
+                    .args(["-C", path_str, "rev-parse", "--short", "HEAD"])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        if out.status.success() {
+                            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if value.is_empty() { None } else { Some(value) }
+                        } else {
+                            None
+                        }
+                    })
+            })?;
+
+        // Fast tracked-change dirty check: exit code 1 means dirty, 0 means clean.
+        let dirty_status = Command::new("git")
+            .args(["-C", path_str, "diff-index", "--quiet", "HEAD", "--"])
+            .status()
+            .ok()?;
+
+        let is_dirty = match dirty_status.code() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return None,
+        };
+
+        Some((branch, is_dirty))
     }
 
     fn integration_catalog() -> Vec<IntegrationSpec> {
@@ -3054,7 +3089,6 @@ fn main() -> io::Result<()> {
         app.pump_copy_total_prescan();
         app.pump_copy_progress();
         app.pump_git_info();
-        app.ensure_git_info_refresh();
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
