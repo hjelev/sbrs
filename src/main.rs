@@ -981,9 +981,9 @@ IFS= read -rsn1 _
         self.selected_total_size_rx = Some(rx);
         thread::spawn(move || {
             let total = targets
-                .iter()
-                .filter_map(|p| App::compute_total_display_bytes(p).ok())
-                .fold(0u64, |acc, v| acc.saturating_add(v));
+                .par_iter()
+                .map(|p| App::compute_total_display_bytes(p).unwrap_or(0))
+                .reduce(|| 0u64, |acc, v| acc.saturating_add(v));
             let _ = tx.send(SelectedTotalSizeMsg::Finished(scan_id, total));
         });
     }
@@ -1069,8 +1069,11 @@ IFS= read -rsn1 _
         let (tx, rx) = mpsc::channel();
         self.folder_size_rx = Some(rx);
         thread::spawn(move || {
-            for dir in dir_paths {
-                let size = App::compute_total_display_bytes(&dir).unwrap_or(0);
+            let sized: Vec<(PathBuf, u64)> = dir_paths
+                .par_iter()
+                .map(|dir| (dir.clone(), App::compute_total_display_bytes(dir).unwrap_or(0)))
+                .collect();
+            for (dir, size) in sized {
                 let _ = tx.send(FolderSizeMsg::EntrySize(scan_id, dir, size));
             }
             let _ = tx.send(FolderSizeMsg::Finished(scan_id));
@@ -4457,37 +4460,53 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn compute_dir_total_bytes(dir: &PathBuf) -> io::Result<u64> {
-        let mut total = 0u64;
+        const SIZE_WALK_PAR_THRESHOLD: usize = 32;
         let children = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return Ok(0),
         };
 
-        for child in children {
-            let child_path = match child {
-                Ok(entry) => entry.path(),
-                Err(_) => continue,
-            };
-            total = total.saturating_add(Self::compute_total_bytes_inner(&child_path, false)?);
-        }
+        let child_paths: Vec<PathBuf> = children
+            .filter_map(|child| child.ok().map(|entry| entry.path()))
+            .collect();
+
+        let total = if child_paths.len() >= SIZE_WALK_PAR_THRESHOLD {
+            child_paths
+                .par_iter()
+                .map(|child_path| Self::compute_total_bytes_inner(child_path, false).unwrap_or(0))
+                .reduce(|| 0u64, |acc, v| acc.saturating_add(v))
+        } else {
+            child_paths
+                .iter()
+                .map(|child_path| Self::compute_total_bytes_inner(child_path, false).unwrap_or(0))
+                .fold(0u64, |acc, v| acc.saturating_add(v))
+        };
 
         Ok(total)
     }
 
     fn compute_dir_total_display_bytes(dir: &PathBuf) -> io::Result<u64> {
-        let mut total = 0u64;
+        const SIZE_WALK_PAR_THRESHOLD: usize = 32;
         let children = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return Ok(0),
         };
 
-        for child in children {
-            let child_path = match child {
-                Ok(entry) => entry.path(),
-                Err(_) => continue,
-            };
-            total = total.saturating_add(Self::compute_total_display_bytes_inner(&child_path, false)?);
-        }
+        let child_paths: Vec<PathBuf> = children
+            .filter_map(|child| child.ok().map(|entry| entry.path()))
+            .collect();
+
+        let total = if child_paths.len() >= SIZE_WALK_PAR_THRESHOLD {
+            child_paths
+                .par_iter()
+                .map(|child_path| Self::compute_total_display_bytes_inner(child_path, false).unwrap_or(0))
+                .reduce(|| 0u64, |acc, v| acc.saturating_add(v))
+        } else {
+            child_paths
+                .iter()
+                .map(|child_path| Self::compute_total_display_bytes_inner(child_path, false).unwrap_or(0))
+                .fold(0u64, |acc, v| acc.saturating_add(v))
+        };
 
         Ok(total)
     }
