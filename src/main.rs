@@ -840,6 +840,7 @@ IFS= read -rsn1 _
     }
 
     fn begin_sort_menu(&mut self) {
+        self.panel_tab = 4;
         self.sort_menu_selected = Self::sort_mode_index(self.sort_mode);
         self.mode = AppMode::SortMenu;
     }
@@ -4409,7 +4410,8 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             (" File Search ", 1),
             (" Bookmarks ", 2),
             (" Remote Mounts ", 3),
-            (" Integrations ", 4),
+            (" Sorting ", 4),
+            (" Integrations ", 5),
         ];
         let active_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
         let inactive_style = Style::default().fg(Color::Rgb(100, 100, 100));
@@ -4418,6 +4420,29 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         for (i, (label, idx)) in tabs.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled("│", sep_style));
+            }
+            let style = if *idx == active { active_style } else { inactive_style };
+            spans.push(Span::styled(*label, style));
+        }
+        Line::from(spans)
+    }
+
+    fn panel_tab_bar_line_compact(active: u8) -> Line<'static> {
+        let tabs: &[(&str, u8)] = &[
+            ("Help", 0),
+            ("File Search", 1),
+            ("Bookmarks", 2),
+            ("Remote Mounts", 3),
+            ("Sorting", 4),
+            ("Integrations", 5),
+        ];
+        let active_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let inactive_style = Style::default().fg(Color::Rgb(100, 100, 100));
+        let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, (label, idx)) in tabs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("|", sep_style));
             }
             let style = if *idx == active { active_style } else { inactive_style };
             spans.push(Span::styled(*label, style));
@@ -5507,10 +5532,9 @@ fn main() -> io::Result<()> {
                     int_area,
                 );
             } else if app.mode == AppMode::SortMenu {
-                let area = f.size();
                 let options = App::sort_mode_options();
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ pick  Enter/→ apply  Esc/q/← close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("↑↓ pick  Enter/→ apply  Shift+Tab/Tab switch tabs  Esc/q/← close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (idx, mode) in options.iter().enumerate() {
@@ -5527,18 +5551,18 @@ fn main() -> io::Result<()> {
                     lines.push(Line::from(Span::styled(row_text, style)));
                 }
 
-                let sort_h = (lines.len() as u16 + 2).max(10).min(area.height);
-                let sort_w = 52u16.min(area.width);
+                let sort_h = (lines.len() as u16 + 2).max(10).min(tab_overlay_anchor.height);
+                let sort_w = tab_overlay_anchor.width;
                 let sort_area = Rect::new(
-                    (area.width.saturating_sub(sort_w)) / 2,
-                    (area.height.saturating_sub(sort_h)) / 2,
+                    tab_overlay_anchor.x,
+                    tab_overlay_anchor.y,
                     sort_w,
                     sort_h,
                 );
                 f.render_widget(Clear, sort_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(" Sorting ")
+                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line_compact(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(120, 190, 255)))),
                     sort_area,
                 );
@@ -6084,7 +6108,7 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('i') => {
                         app.integration_selected = 0;
                         app.refresh_integration_rows_cache();
-                        app.panel_tab = 4;
+                        app.panel_tab = 5;
                         app.mode = AppMode::Integrations;
                     }
                     KeyCode::Char('S') => {
@@ -6667,7 +6691,7 @@ fn main() -> io::Result<()> {
                         app.mode = AppMode::Browsing;
                     }
                     KeyCode::BackTab => {
-                        app.panel_tab = 4;
+                        app.panel_tab = 5;
                         app.integration_selected = 0;
                         app.refresh_integration_rows_cache();
                         app.mode = AppMode::Integrations;
@@ -6702,10 +6726,8 @@ fn main() -> io::Result<()> {
                             app.mode = AppMode::Browsing;
                         }
                         KeyCode::BackTab => {
-                            app.panel_tab = 3;
-                        app.refresh_remote_entries();
-                        app.mode = AppMode::SshPicker;
-                    }
+                            app.begin_sort_menu();
+                        }
                         KeyCode::Up => {
                             app.integration_selected = app.integration_selected.saturating_sub(1);
                         }
@@ -6736,6 +6758,17 @@ fn main() -> io::Result<()> {
                 }
                 AppMode::SortMenu => {
                     match key.code {
+                        KeyCode::BackTab => {
+                            app.panel_tab = 3;
+                            app.refresh_remote_entries();
+                            app.mode = AppMode::SshPicker;
+                        }
+                        KeyCode::Tab => {
+                            app.panel_tab = 5;
+                            app.integration_selected = 0;
+                            app.refresh_integration_rows_cache();
+                            app.mode = AppMode::Integrations;
+                        }
                         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                             app.mode = AppMode::Browsing;
                         }
@@ -6759,10 +6792,7 @@ fn main() -> io::Result<()> {
                         app.mode = AppMode::Bookmarks;
                     }
                     KeyCode::Tab => {
-                        app.panel_tab = 4;
-                        app.integration_selected = 0;
-                        app.refresh_integration_rows_cache();
-                        app.mode = AppMode::Integrations;
+                        app.begin_sort_menu();
                     }
                     KeyCode::Up => {
                         if app.ssh_picker_selection > 0 {
