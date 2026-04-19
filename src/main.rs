@@ -9,6 +9,7 @@ use crossterm::{
 use devicons::{icon_for_file, File as DevFile, Theme};
 use regex::{Regex, RegexBuilder};
 use ratatui::{prelude::*, widgets::*};
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -79,6 +80,12 @@ struct EntryRenderCache {
     meta_col: String,
     size_col: String,
     date_col: String,
+}
+
+#[derive(Clone, Copy)]
+struct EntryRenderConfig {
+    nerd_font_active: bool,
+    show_icons: bool,
 }
 
 enum CopyProgressMsg {
@@ -754,10 +761,6 @@ IFS= read -rsn1 _
         entry.file_name().to_string_lossy().to_ascii_lowercase()
     }
 
-    fn entry_size_key(entry: &fs::DirEntry) -> u64 {
-        fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0)
-    }
-
     fn entry_extension_key(entry: &fs::DirEntry) -> String {
         entry.path()
             .extension()
@@ -766,43 +769,50 @@ IFS= read -rsn1 _
             .to_ascii_lowercase()
     }
 
-    fn entry_modified_key(entry: &fs::DirEntry) -> u64 {
-        fs::metadata(entry.path())
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
+    fn sort_entries_by_mode(entries: &mut Vec<fs::DirEntry>, mode: SortMode) {
+        if entries.len() < 2 {
+            return;
+        }
+        // Pre-collect all sort keys in O(n) — eliminates O(n log n) stat() calls that
+        // the previous sort_by comparator incurred by calling is_file()/metadata() per pair.
+        let metas: Vec<Option<fs::Metadata>> = entries.iter().map(|e| e.metadata().ok()).collect();
+        let is_dirs: Vec<bool> = metas.iter()
+            .map(|m| m.as_ref().map(|m| m.is_dir()).unwrap_or(false))
+            .collect();
+        let names: Vec<String> = entries.iter().map(|e| Self::entry_name_key(e)).collect();
+        let sizes: Vec<u64>    = metas.iter()
+            .map(|m| m.as_ref().map(|m| m.len()).unwrap_or(0))
+            .collect();
+        let times: Vec<u64>    = metas.iter().map(|m| {
+            m.as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }).collect();
+        let exts: Vec<String>  = entries.iter().map(|e| Self::entry_extension_key(e)).collect();
 
-    fn sort_entries_by_mode(entries: &mut [fs::DirEntry], mode: SortMode) {
-        entries.sort_by(|a, b| {
-            let a_is_file = a.path().is_file();
-            let b_is_file = b.path().is_file();
-            if a_is_file != b_is_file {
-                return a_is_file.cmp(&b_is_file);
+        let mut indices: Vec<usize> = (0..entries.len()).collect();
+        indices.sort_by(|&a, &b| {
+            // Directories always sort before files.
+            let type_ord = is_dirs[b].cmp(&is_dirs[a]);
+            if type_ord != std::cmp::Ordering::Equal {
+                return type_ord;
             }
-
             match mode {
-                SortMode::NameAsc => Self::entry_name_key(a).cmp(&Self::entry_name_key(b)),
-                SortMode::NameDesc => Self::entry_name_key(b).cmp(&Self::entry_name_key(a)),
-                SortMode::ExtensionAsc => Self::entry_extension_key(a)
-                    .cmp(&Self::entry_extension_key(b))
-                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
-                SortMode::SizeAsc => Self::entry_size_key(a)
-                    .cmp(&Self::entry_size_key(b))
-                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
-                SortMode::SizeDesc => Self::entry_size_key(b)
-                    .cmp(&Self::entry_size_key(a))
-                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
-                SortMode::ModifiedNewest => Self::entry_modified_key(b)
-                    .cmp(&Self::entry_modified_key(a))
-                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
-                SortMode::ModifiedOldest => Self::entry_modified_key(a)
-                    .cmp(&Self::entry_modified_key(b))
-                    .then_with(|| Self::entry_name_key(a).cmp(&Self::entry_name_key(b))),
+                SortMode::NameAsc        => names[a].cmp(&names[b]),
+                SortMode::NameDesc       => names[b].cmp(&names[a]),
+                SortMode::ExtensionAsc   => exts[a].cmp(&exts[b]).then_with(|| names[a].cmp(&names[b])),
+                SortMode::SizeAsc        => sizes[a].cmp(&sizes[b]).then_with(|| names[a].cmp(&names[b])),
+                SortMode::SizeDesc       => sizes[b].cmp(&sizes[a]).then_with(|| names[a].cmp(&names[b])),
+                SortMode::ModifiedNewest => times[b].cmp(&times[a]).then_with(|| names[a].cmp(&names[b])),
+                SortMode::ModifiedOldest => times[a].cmp(&times[b]).then_with(|| names[a].cmp(&names[b])),
             }
         });
+
+        // Rearrange entries in-place to match the sorted index permutation.
+        let mut tmp: Vec<Option<fs::DirEntry>> = entries.drain(..).map(Some).collect();
+        *entries = indices.into_iter().map(|i| tmp[i].take().unwrap()).collect();
     }
 
     fn apply_sort_to_current_entries(&mut self) {
@@ -815,10 +825,10 @@ IFS= read -rsn1 _
 
         Self::sort_entries_by_mode(&mut self.entries, self.sort_mode);
 
-        self.entry_render_cache = self
-            .entries
-            .iter()
-            .map(|entry| self.build_entry_render_cache(entry))
+        let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
+        let uid_cache = App::build_uid_cache(&self.entries);
+        self.entry_render_cache = self.entries.par_iter()
+            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
             .collect();
 
         self.marked_indices = self
@@ -1211,21 +1221,22 @@ IFS= read -rsn1 _
         self.table_state.select(Some(next));
     }
 
-    fn build_entry_render_cache(&self, entry: &fs::DirEntry) -> EntryRenderCache {
+    fn build_entry_render_cache(entry: &fs::DirEntry, config: EntryRenderConfig, uid_cache: &HashMap<u32, String>) -> EntryRenderCache {
         let path = entry.path();
         let meta = entry.metadata().ok();
         let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
         let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-        let is_dir = path.is_dir();
-        let icon_data = if self.nerd_font_active {
+        // Reuse already-fetched metadata to determine is_dir — avoids a redundant stat().
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let icon_data = if config.nerd_font_active {
             Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
         } else {
             None
         };
 
-        let (icon_glyph, icon_style) = if !self.show_icons {
+        let (icon_glyph, icon_style) = if !config.show_icons {
             (String::new(), Style::default())
-        } else if self.nerd_font_active {
+        } else if config.nerd_font_active {
             if is_symlink {
                 ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
             } else if is_dir {
@@ -1284,7 +1295,15 @@ IFS= read -rsn1 _
         let size_width = 8usize;
         let date_width = 16usize;
         let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
-        let owner = meta.as_ref().map(App::parse_owner).unwrap_or_else(|| "-".to_string());
+        // Look up owner name from pre-built per-refresh cache — one NSS lookup per unique UID.
+        let owner = meta.as_ref().map(|m| {
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                let uid = m.uid();
+                uid_cache.get(&uid).cloned().unwrap_or_else(|| uid.to_string())
+            }
+            #[cfg(not(unix))] { "-".to_string() }
+        }).unwrap_or_else(|| "-".to_string());
         let perms_len = perms.chars().count();
         let owner_width = meta_width.saturating_sub(perms_len + 1);
         let owner_trimmed = if owner.chars().count() > owner_width {
@@ -2846,10 +2865,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         Self::sort_entries_by_mode(&mut entries, self.sort_mode);
         self.entries = entries;
-        self.entry_render_cache = self
-            .entries
-            .iter()
-            .map(|entry| self.build_entry_render_cache(entry))
+        let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
+        let uid_cache = App::build_uid_cache(&self.entries);
+        self.entry_render_cache = self.entries.par_iter()
+            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
             .collect();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
         self.folder_size_rx = None;
@@ -4538,6 +4557,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         #[cfg(not(unix))] {
             "-".to_string()
         }
+    }
+
+    /// Build a UID → username map for all entries in the current directory.
+    /// Performs at most one NSS lookup per unique UID, so large directories owned
+    /// by the same user pay exactly one lookup regardless of file count.
+    fn build_uid_cache(entries: &[fs::DirEntry]) -> HashMap<u32, String> {
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            let mut map: HashMap<u32, String> = HashMap::new();
+            for entry in entries {
+                if let Ok(meta) = entry.metadata() {
+                    let uid = meta.uid();
+                    map.entry(uid).or_insert_with(|| {
+                        users::get_user_by_uid(uid)
+                            .map(|u| u.name().to_string_lossy().into_owned())
+                            .unwrap_or_else(|| uid.to_string())
+                    });
+                }
+            }
+            map
+        }
+        #[cfg(not(unix))] { HashMap::new() }
     }
 
     fn format_size(bytes: u64) -> String {

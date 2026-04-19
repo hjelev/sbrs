@@ -1,6 +1,6 @@
 [package]
 name = "sbrs"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2024"
 description = "Shell Buddy (sb)"
 repository = "https://github.com/hjelev/sbrs"
@@ -14,6 +14,7 @@ devicons = "0.1"
 hostname = "0.4"
 users = "0.11"
 regex = "1"
+rayon = "1"
 
 
 [profile.release]
