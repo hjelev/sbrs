@@ -6416,33 +6416,43 @@ fn main() -> io::Result<()> {
                         let has_rg  = app.integration_active("rg");
                         let has_fzf = app.integration_active("fzf");
                         if has_rg {
-                            disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
-                                let cmd = if has_fzf {
-                                  // exact mode in fzf + literal fixed-string matching in rg
-                                  "rg --color=always --line-number --no-heading --smart-case --fixed-strings --colors=match:fg:214 '' \
-                                   | fzf --ansi --exact --height=100% --layout=reverse --border \
-                                       --delimiter=: \
-                                   | awk -F: '{print $1}'"
+                            let tmp = env::temp_dir().join("sbrs_fzf_rg_selection.txt");
+                            let cmd = if has_fzf {
+                                // rg pipes into fzf; fzf writes its selection to temp file.
+                                // Using inherited stdio so fzf owns the real TTY on all platforms.
+                                format!(
+                                    "rg --color=always --line-number --no-heading --smart-case \
+                                     --fixed-strings --colors=match:fg:214 '' \
+                                     | fzf --ansi --exact --layout=reverse --delimiter=: \
+                                     | awk -F: '{{print $1}}' > {}",
+                                    tmp.display()
+                                )
                             } else {
-                                // no fzf: just list unique files with matches, pick first
-                                "rg --files-with-matches ''"
+                                // no fzf: pick first file with a match
+                                format!(
+                                    "rg --files-with-matches '' | head -1 > {}",
+                                    tmp.display()
+                                )
                             };
-                            let result = Command::new("sh")
-                                .args(["-c", cmd])
+                            disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                            let _ = Command::new("sh")
+                                .args(["-c", &cmd])
                                 .current_dir(&app.current_dir)
-                                .output();
+                                .stdin(Stdio::inherit())
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::inherit())
+                                .status();
                             enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
                             terminal.clear()?;
-                            if let Ok(out) = result {
-                                let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                let first_line = selected.lines().next().unwrap_or("").trim().to_string();
-                                if !first_line.is_empty() {
-                                    let selected_path = app.current_dir.join(&first_line);
-                                    if let Some(parent) = selected_path.parent() {
-                                        app.try_enter_dir(parent.to_path_buf());
-                                        if let Some(name) = selected_path.file_name() {
-                                            app.select_entry_named(&name.to_string_lossy());
-                                        }
+                            let selected = fs::read_to_string(&tmp).unwrap_or_default();
+                            let _ = fs::remove_file(&tmp);
+                            let first_line = selected.lines().next().unwrap_or("").trim().to_string();
+                            if !first_line.is_empty() {
+                                let selected_path = app.current_dir.join(&first_line);
+                                if let Some(parent) = selected_path.parent() {
+                                    app.try_enter_dir(parent.to_path_buf());
+                                    if let Some(name) = selected_path.file_name() {
+                                        app.select_entry_named(&name.to_string_lossy());
                                     }
                                 }
                             }
@@ -6452,22 +6462,30 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('f') => {
                         if app.integration_active("fzf") {
+                            let tmp = env::temp_dir().join("sbrs_fzf_selection.txt");
+                            let cmd = format!(
+                                "find . -not -path '*/.*' | fzf --layout=reverse > {}",
+                                tmp.display()
+                            );
                             disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
-                            let result = Command::new("sh")
-                                .args(["-c", "find . -not -path '*/.*' | fzf --height=100% --layout=reverse --border"])
+                            let _ = Command::new("sh")
+                                .args(["-c", &cmd])
                                 .current_dir(&app.current_dir)
-                                .output();
+                                .stdin(Stdio::inherit())
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::inherit())
+                                .status();
                             enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
                             terminal.clear()?;
-                            if let Ok(out) = result {
-                                let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                if !selected.is_empty() {
-                                    let selected_path = app.current_dir.join(&selected);
-                                    if let Some(parent) = selected_path.parent() {
-                                        app.try_enter_dir(parent.to_path_buf());
-                                        if let Some(name) = selected_path.file_name() {
-                                            app.select_entry_named(&name.to_string_lossy());
-                                        }
+                            let selected = fs::read_to_string(&tmp).unwrap_or_default();
+                            let _ = fs::remove_file(&tmp);
+                            let selected = selected.trim().to_string();
+                            if !selected.is_empty() {
+                                let selected_path = app.current_dir.join(&selected);
+                                if let Some(parent) = selected_path.parent() {
+                                    app.try_enter_dir(parent.to_path_buf());
+                                    if let Some(name) = selected_path.file_name() {
+                                        app.select_entry_named(&name.to_string_lossy());
                                     }
                                 }
                             }
