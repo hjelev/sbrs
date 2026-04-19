@@ -178,6 +178,7 @@ struct App {
     paste_queue: VecDeque<PathBuf>,
     paste_current_src: Option<PathBuf>,
     paste_move_mode: bool,
+    paste_target_dir: Option<PathBuf>,
     input_buffer: String,
     input_cursor: usize,
     status_message: String,
@@ -306,6 +307,7 @@ impl App {
             paste_queue: VecDeque::new(),
             paste_current_src: None,
             paste_move_mode: false,
+            paste_target_dir: None,
             input_buffer: String::new(),
             input_cursor: 0,
             status_message: String::new(),
@@ -3720,6 +3722,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.paste_queue = self.clipboard.iter().cloned().collect();
         self.paste_current_src = None;
         self.paste_move_mode = move_mode;
+        self.paste_target_dir = Some(self.current_dir.clone());
         self.paste_total_items = self.clipboard.len();
         self.paste_ok_items = 0;
         self.paste_failed_items = 0;
@@ -4159,7 +4162,12 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "pasted_item".to_string());
-            let dest = self.current_dir.join(&name);
+            let target_dir = self
+                .paste_target_dir
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.current_dir.clone());
+            let dest = target_dir.join(&name);
             if dest.exists() {
                 self.paste_current_src = Some(src);
                 self.begin_input_edit(AppMode::PasteRenaming, name);
@@ -4181,6 +4189,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         self.paste_current_src = None;
         self.paste_move_mode = false;
+        self.paste_target_dir = None;
         self.clear_input_edit();
         self.mode = AppMode::Browsing;
         self.copy_started_at = None;
@@ -6613,7 +6622,12 @@ fn main() -> io::Result<()> {
                         if new_name.is_empty() {
                             app.set_status("name cannot be empty");
                         } else if let Some(src) = app.paste_current_src.clone() {
-                            let dest = app.current_dir.join(&new_name);
+                            let target_dir = app
+                                .paste_target_dir
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| app.current_dir.clone());
+                            let dest = target_dir.join(&new_name);
                             if dest.exists() {
                                 app.set_status("target still exists: choose another name");
                             } else {
@@ -6635,6 +6649,8 @@ fn main() -> io::Result<()> {
                     KeyCode::Esc => {
                         app.paste_queue.clear();
                         app.paste_current_src = None;
+                        app.paste_move_mode = false;
+                        app.paste_target_dir = None;
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("paste cancelled");
