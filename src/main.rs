@@ -154,6 +154,7 @@ impl SortMode {
 enum AppMode {
     Browsing,
     PathEditing,
+    CommandInput,
     InternalSearch,
     NoteEditing,
     Renaming,
@@ -168,6 +169,48 @@ enum AppMode {
     Integrations,
     SortMenu,
     SshPicker,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InternalSearchScope {
+    Filename,
+    Content,
+}
+
+enum InternalSearchResult {
+    Filename {
+        rel_path: PathBuf,
+        match_ranges: Vec<(usize, usize)>,
+    },
+    Content {
+        rel_path: PathBuf,
+        line_number: usize,
+        line_text: String,
+        match_ranges: Vec<(usize, usize)>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct InternalSearchContentLimits {
+    max_files: usize,
+    max_hits: usize,
+    max_file_bytes: usize,
+}
+
+enum InternalSearchPattern {
+    Regex {
+        pattern: String,
+        case_insensitive: bool,
+    },
+    Literal(String),
+}
+
+enum InternalSearchContentMsg {
+    Finished {
+        request_id: u64,
+        results: Vec<InternalSearchResult>,
+        limit_note: Option<String>,
+    },
 }
 
 struct App {
@@ -239,8 +282,16 @@ struct App {
     sort_menu_selected: usize,
     panel_tab: u8,
     internal_search_candidates: Vec<PathBuf>,
-    internal_search_results: Vec<usize>,
+    internal_search_results: Vec<InternalSearchResult>,
     internal_search_selected: usize,
+    internal_search_scope: InternalSearchScope,
+    internal_search_content_rx: Option<Receiver<InternalSearchContentMsg>>,
+    internal_search_content_request_id: u64,
+    internal_search_content_pending: bool,
+    internal_search_content_limit_note: Option<String>,
+    internal_search_content_limits: InternalSearchContentLimits,
+    internal_search_limits_menu_open: bool,
+    internal_search_limits_selected: usize,
     internal_search_regex_mode: bool,
     internal_search_regex: Option<Regex>,
     internal_search_regex_error: Option<String>,
@@ -299,6 +350,7 @@ fn env_flag_true(names: &[&str]) -> bool {
 impl App {
     fn new() -> io::Result<Self> {
         let current_dir = env::current_dir()?;
+        let internal_search_content_limits = Self::internal_search_content_limits();
         let mut app = Self {
             current_dir,
             entries: Vec::new(),
@@ -370,6 +422,14 @@ impl App {
             internal_search_candidates: Vec::new(),
             internal_search_results: Vec::new(),
             internal_search_selected: 0,
+            internal_search_scope: InternalSearchScope::Filename,
+            internal_search_content_rx: None,
+            internal_search_content_request_id: 0,
+            internal_search_content_pending: false,
+            internal_search_content_limit_note: None,
+            internal_search_content_limits,
+            internal_search_limits_menu_open: false,
+            internal_search_limits_selected: 0,
             internal_search_regex_mode: false,
             internal_search_regex: None,
             internal_search_regex_error: None,
@@ -1426,44 +1486,6 @@ IFS= read -rsn1 _
         out
     }
 
-    fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
-        if query.is_empty() {
-            return Some(0);
-        }
-
-        let cand_chars: Vec<char> = candidate.chars().collect();
-        let query_chars: Vec<char> = query.chars().collect();
-        let mut q_idx = 0usize;
-        let mut last_match: Option<usize> = None;
-        let mut score = 0i64;
-
-        for (c_idx, ch) in cand_chars.iter().enumerate() {
-            if q_idx >= query_chars.len() {
-                break;
-            }
-
-            if ch.eq_ignore_ascii_case(&query_chars[q_idx]) {
-                score += 5;
-                if c_idx == 0 || matches!(cand_chars[c_idx - 1], '/' | '_' | '-' | ' ') {
-                    score += 8;
-                }
-                if let Some(prev) = last_match {
-                    if c_idx == prev + 1 {
-                        score += 12;
-                    }
-                }
-                last_match = Some(c_idx);
-                q_idx += 1;
-            }
-        }
-
-        if q_idx == query_chars.len() {
-            Some(score - candidate.chars().count() as i64)
-        } else {
-            None
-        }
-    }
-
     fn fuzzy_score_and_ranges(candidate: &str, query: &str) -> Option<(i64, Vec<(usize, usize)>)> {
         if query.is_empty() {
             return Some((0, Vec::new()));
@@ -1589,68 +1611,428 @@ IFS= read -rsn1 _
         None
     }
 
-    fn refresh_internal_search_results(&mut self) {
-        let query = self.input_buffer.trim();
-        self.internal_search_regex_mode = false;
-        self.internal_search_regex = None;
-        self.internal_search_regex_error = None;
+    fn literal_match_ranges_ascii(text: &str, needle: &str) -> Vec<(usize, usize)> {
+        let query_chars: Vec<char> = needle.chars().collect();
+        if query_chars.is_empty() {
+            return Vec::new();
+        }
 
-        if let Some((pattern, case_insensitive)) = Self::parse_regex_query(query) {
-            self.internal_search_regex_mode = true;
+        let text_chars: Vec<(usize, char)> = text.char_indices().collect();
+        if query_chars.len() > text_chars.len() {
+            return Vec::new();
+        }
 
-            let regex = RegexBuilder::new(&pattern)
-                .case_insensitive(case_insensitive)
-                .build();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i + query_chars.len() <= text_chars.len() {
+            let mut matched = true;
+            for (j, qch) in query_chars.iter().enumerate() {
+                let tch = text_chars[i + j].1;
+                if !tch.eq_ignore_ascii_case(qch) {
+                    matched = false;
+                    break;
+                }
+            }
 
-            let Ok(regex) = regex else {
-                self.internal_search_results.clear();
-                self.internal_search_selected = 0;
-                self.internal_search_regex_error = Some("invalid regex".to_string());
-                return;
-            };
+            if matched {
+                let start = text_chars[i].0;
+                let end_idx = i + query_chars.len();
+                let end = if end_idx < text_chars.len() {
+                    text_chars[end_idx].0
+                } else {
+                    text.len()
+                };
+                out.push((start, end));
+                i += query_chars.len();
+            } else {
+                i += 1;
+            }
+        }
 
-            let mut matched: Vec<(usize, usize, usize, String)> = Vec::new();
-            for (idx, rel) in self.internal_search_candidates.iter().enumerate() {
+        out
+    }
+
+    fn refresh_internal_search_filename_results(&mut self, query: &str) {
+        if let Some(regex) = self.internal_search_regex.as_ref() {
+            let mut matched: Vec<(usize, usize, usize, String, InternalSearchResult)> = Vec::new();
+            for rel in &self.internal_search_candidates {
                 let rel_str = rel.to_string_lossy().into_owned();
-                if let Some(m) = regex.find(&rel_str) {
-                    matched.push((idx, m.start(), rel_str.chars().count(), rel_str));
+                let ranges = Self::merge_byte_ranges(
+                    regex
+                        .find_iter(&rel_str)
+                        .map(|m| (m.start(), m.end()))
+                        .collect(),
+                );
+                if let Some((first_start, _)) = ranges.first() {
+                    matched.push((
+                        *first_start,
+                        rel_str.chars().count(),
+                        rel_str.len(),
+                        rel_str,
+                        InternalSearchResult::Filename {
+                            rel_path: rel.clone(),
+                            match_ranges: ranges,
+                        },
+                    ));
                 }
             }
 
             matched.sort_by(|a, b| {
-                a.1.cmp(&b.1)
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
                     .then_with(|| a.2.cmp(&b.2))
                     .then_with(|| a.3.cmp(&b.3))
             });
 
-            self.internal_search_results = matched.into_iter().map(|(idx, _, _, _)| idx).collect();
-            self.internal_search_regex = Some(regex);
-            if self.internal_search_results.is_empty() {
-                self.internal_search_selected = 0;
-            } else {
-                self.internal_search_selected = self
-                    .internal_search_selected
-                    .min(self.internal_search_results.len() - 1);
-            }
+            self.internal_search_results = matched.into_iter().map(|(_, _, _, _, item)| item).collect();
             return;
         }
 
-        let mut scored: Vec<(usize, i64, String)> = Vec::new();
-
-        for (idx, rel) in self.internal_search_candidates.iter().enumerate() {
+        let mut scored: Vec<(i64, usize, String, InternalSearchResult)> = Vec::new();
+        for rel in &self.internal_search_candidates {
             let rel_str = rel.to_string_lossy().into_owned();
-            if let Some(score) = Self::fuzzy_score(&rel_str, query) {
-                scored.push((idx, score, rel_str));
+            if let Some((score, ranges)) = Self::fuzzy_score_and_ranges(&rel_str, query) {
+                scored.push((
+                    score,
+                    rel_str.chars().count(),
+                    rel_str,
+                    InternalSearchResult::Filename {
+                        rel_path: rel.clone(),
+                        match_ranges: ranges,
+                    },
+                ));
             }
         }
 
         scored.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.2.chars().count().cmp(&b.2.chars().count()))
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
 
-        self.internal_search_results = scored.into_iter().map(|(idx, _, _)| idx).collect();
+        self.internal_search_results = scored.into_iter().map(|(_, _, _, item)| item).collect();
+    }
+
+    fn internal_search_content_limits() -> InternalSearchContentLimits {
+        let parse_env_usize = |key: &str, default: usize| {
+            env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+
+        InternalSearchContentLimits {
+            max_files: parse_env_usize("SB_SEARCH_CONTENT_MAX_FILES", 20_000),
+            max_hits: parse_env_usize("SB_SEARCH_CONTENT_MAX_HITS", 2_000),
+            max_file_bytes: parse_env_usize("SB_SEARCH_CONTENT_MAX_FILE_BYTES", 2 * 1024 * 1024),
+        }
+    }
+
+    fn adjust_internal_search_content_limit(&mut self, increase: bool, fast: bool) {
+        let factor = if fast { 10usize } else { 1usize };
+
+        let (current, step, min_value) = match self.internal_search_limits_selected {
+            0 => (
+                self.internal_search_content_limits.max_files,
+                500usize.saturating_mul(factor),
+                100usize,
+            ),
+            1 => (
+                self.internal_search_content_limits.max_hits,
+                100usize.saturating_mul(factor),
+                50usize,
+            ),
+            _ => (
+                self.internal_search_content_limits.max_file_bytes,
+                (256usize * 1024).saturating_mul(factor),
+                64usize * 1024,
+            ),
+        };
+
+        let new_value = if increase {
+            current.saturating_add(step)
+        } else {
+            current.saturating_sub(step).max(min_value)
+        };
+
+        match self.internal_search_limits_selected {
+            0 => self.internal_search_content_limits.max_files = new_value,
+            1 => self.internal_search_content_limits.max_hits = new_value,
+            _ => self.internal_search_content_limits.max_file_bytes = new_value,
+        }
+
+        if self.internal_search_scope == InternalSearchScope::Content {
+            self.refresh_internal_search_results();
+        }
+    }
+
+    fn reset_internal_search_content_limits_to_defaults(&mut self) {
+        self.internal_search_content_limits = Self::internal_search_content_limits();
+        if self.internal_search_scope == InternalSearchScope::Content {
+            self.refresh_internal_search_results();
+        }
+    }
+
+    fn build_internal_search_limit_note(
+        limits: InternalSearchContentLimits,
+        scanned_candidates: usize,
+        files_limit_hit: bool,
+        large_files_skipped: usize,
+        hits_limit_hit: bool,
+    ) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if files_limit_hit {
+            parts.push(format!("scanned first {} files", limits.max_files));
+        }
+        if hits_limit_hit {
+            parts.push(format!("capped at {} matches", limits.max_hits));
+        }
+        if large_files_skipped > 0 {
+            parts.push(format!(
+                "skipped {} file(s) > {}",
+                large_files_skipped,
+                Self::format_size(limits.max_file_bytes as u64)
+            ));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "Limits: {} (candidates: {})",
+            parts.join("; "),
+            scanned_candidates
+        ))
+    }
+
+    fn run_internal_search_content_query(
+        current_dir: PathBuf,
+        candidates: Vec<PathBuf>,
+        pattern: InternalSearchPattern,
+        limits: InternalSearchContentLimits,
+    ) -> (Vec<InternalSearchResult>, Option<String>) {
+        let regex = match &pattern {
+            InternalSearchPattern::Regex {
+                pattern,
+                case_insensitive,
+            } => RegexBuilder::new(pattern)
+                .case_insensitive(*case_insensitive)
+                .build()
+                .ok(),
+            InternalSearchPattern::Literal(_) => None,
+        };
+
+        let mut out: Vec<InternalSearchResult> = Vec::new();
+        let mut large_files_skipped = 0usize;
+        let mut files_limit_hit = false;
+        let mut hits_limit_hit = false;
+
+        for (idx, rel) in candidates.iter().enumerate() {
+            if idx >= limits.max_files {
+                files_limit_hit = true;
+                break;
+            }
+
+            let abs = current_dir.join(rel);
+            if !abs.is_file() || Self::is_binary_file(&abs) {
+                continue;
+            }
+
+            let Ok(meta) = fs::metadata(&abs) else {
+                continue;
+            };
+            if meta.len() as usize > limits.max_file_bytes {
+                large_files_skipped += 1;
+                continue;
+            }
+
+            let Ok(bytes) = fs::read(&abs) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+
+            for (line_idx, line) in text.lines().enumerate() {
+                let ranges = match (&pattern, regex.as_ref()) {
+                    (InternalSearchPattern::Regex { .. }, Some(re)) => Self::merge_byte_ranges(
+                        re.find_iter(line).map(|m| (m.start(), m.end())).collect(),
+                    ),
+                    (InternalSearchPattern::Literal(query), _) => {
+                        Self::literal_match_ranges_ascii(line, query)
+                    }
+                    _ => Vec::new(),
+                };
+
+                if ranges.is_empty() {
+                    continue;
+                }
+
+                out.push(InternalSearchResult::Content {
+                    rel_path: rel.clone(),
+                    line_number: line_idx + 1,
+                    line_text: line.to_string(),
+                    match_ranges: ranges,
+                });
+
+                if out.len() >= limits.max_hits {
+                    hits_limit_hit = true;
+                    break;
+                }
+            }
+
+            if hits_limit_hit {
+                break;
+            }
+        }
+
+        let note = Self::build_internal_search_limit_note(
+            limits,
+            candidates.len(),
+            files_limit_hit,
+            large_files_skipped,
+            hits_limit_hit,
+        );
+
+        (out, note)
+    }
+
+    fn cancel_internal_search_content_request(&mut self) {
+        self.internal_search_content_request_id = self.internal_search_content_request_id.wrapping_add(1);
+        self.internal_search_content_rx = None;
+        self.internal_search_content_pending = false;
+    }
+
+    fn refresh_internal_search_content_results_async(
+        &mut self,
+        query: &str,
+        regex_pattern: Option<(String, bool)>,
+    ) {
+        if query.is_empty() {
+            self.cancel_internal_search_content_request();
+            self.internal_search_results.clear();
+            self.internal_search_content_limit_note = None;
+            return;
+        }
+
+        let limits = self.internal_search_content_limits;
+        let request_id = self.internal_search_content_request_id.wrapping_add(1);
+        self.internal_search_content_request_id = request_id;
+        self.internal_search_content_pending = true;
+        self.internal_search_content_limit_note = Some(format!(
+            "Limits: files <= {}, hits <= {}, file <= {}",
+            limits.max_files,
+            limits.max_hits,
+            Self::format_size(limits.max_file_bytes as u64),
+        ));
+
+        let current_dir = self.current_dir.clone();
+        let candidates = self.internal_search_candidates.clone();
+        let pattern = if let Some((pattern, case_insensitive)) = regex_pattern {
+            InternalSearchPattern::Regex {
+                pattern,
+                case_insensitive,
+            }
+        } else {
+            InternalSearchPattern::Literal(query.to_string())
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.internal_search_content_rx = Some(rx);
+        thread::spawn(move || {
+            let (results, limit_note) =
+                App::run_internal_search_content_query(current_dir, candidates, pattern, limits);
+            let _ = tx.send(InternalSearchContentMsg::Finished {
+                request_id,
+                results,
+                limit_note,
+            });
+        });
+    }
+
+    fn pump_internal_search_content_progress(&mut self) {
+        let Some(rx) = self.internal_search_content_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(InternalSearchContentMsg::Finished {
+                    request_id,
+                    results,
+                    limit_note,
+                }) => {
+                    if request_id == self.internal_search_content_request_id {
+                        self.internal_search_results = results;
+                        self.internal_search_content_limit_note = limit_note;
+                        self.internal_search_content_pending = false;
+                        if self.internal_search_results.is_empty() {
+                            self.internal_search_selected = 0;
+                        } else {
+                            self.internal_search_selected = self
+                                .internal_search_selected
+                                .min(self.internal_search_results.len() - 1);
+                        }
+                        keep_rx = false;
+                    } else {
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.internal_search_content_pending = false;
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx {
+            self.internal_search_content_rx = Some(rx);
+        }
+    }
+
+    fn refresh_internal_search_results(&mut self) {
+        let query = self.input_buffer.trim().to_string();
+        self.internal_search_regex_mode = false;
+        self.internal_search_regex = None;
+        self.internal_search_regex_error = None;
+
+        let mut compiled_regex: Option<Regex> = None;
+
+        let parsed_regex = Self::parse_regex_query(&query);
+
+        if let Some((pattern, case_insensitive)) = parsed_regex.as_ref() {
+            self.internal_search_regex_mode = true;
+
+            let regex = RegexBuilder::new(&pattern)
+            .case_insensitive(*case_insensitive)
+                .build();
+
+            let Ok(regex) = regex else {
+                self.cancel_internal_search_content_request();
+                self.internal_search_results.clear();
+                self.internal_search_selected = 0;
+                self.internal_search_content_limit_note = None;
+                self.internal_search_regex_error = Some("invalid regex".to_string());
+                return;
+            };
+            compiled_regex = Some(regex);
+        }
+
+        self.internal_search_regex = compiled_regex;
+
+        match self.internal_search_scope {
+            InternalSearchScope::Filename => {
+                self.cancel_internal_search_content_request();
+                self.internal_search_content_limit_note = None;
+                self.refresh_internal_search_filename_results(&query);
+            }
+            InternalSearchScope::Content => {
+                self.refresh_internal_search_content_results_async(&query, parsed_regex);
+            }
+        }
+
         if self.internal_search_results.is_empty() {
             self.internal_search_selected = 0;
         } else {
@@ -1661,29 +2043,50 @@ IFS= read -rsn1 _
     }
 
     fn start_internal_search(&mut self) {
+        self.start_internal_search_with_scope(InternalSearchScope::Filename);
+    }
+
+    fn start_internal_search_with_scope(&mut self, scope: InternalSearchScope) {
         const INTERNAL_SEARCH_MAX_ITEMS: usize = 20_000;
         self.internal_search_candidates =
             Self::collect_internal_search_candidates(&self.current_dir, INTERNAL_SEARCH_MAX_ITEMS);
         self.internal_search_selected = 0;
+        self.internal_search_scope = scope;
+        self.internal_search_content_limit_note = None;
+        self.internal_search_limits_menu_open = false;
+        self.internal_search_limits_selected = 0;
         self.panel_tab = 1;
         self.begin_input_edit(AppMode::InternalSearch, String::new());
         self.refresh_internal_search_results();
 
         if self.internal_search_candidates.is_empty() {
-            self.set_status("internal search: no files found");
+            self.set_status("search: no files found");
         } else if self.internal_search_candidates.len() >= INTERNAL_SEARCH_MAX_ITEMS {
             self.set_status(format!(
-                "internal search indexed first {} files",
+                "search indexed first {} files",
                 INTERNAL_SEARCH_MAX_ITEMS
             ));
         }
     }
 
+    fn toggle_internal_search_scope(&mut self) {
+        self.internal_search_scope = match self.internal_search_scope {
+            InternalSearchScope::Filename => InternalSearchScope::Content,
+            InternalSearchScope::Content => InternalSearchScope::Filename,
+        };
+        if self.internal_search_scope == InternalSearchScope::Filename {
+            self.internal_search_limits_menu_open = false;
+        }
+        self.internal_search_selected = 0;
+        self.refresh_internal_search_results();
+    }
+
     fn selected_internal_search_path(&self) -> Option<PathBuf> {
-        let idx = *self
-            .internal_search_results
-            .get(self.internal_search_selected)?;
-        let rel = self.internal_search_candidates.get(idx)?;
+        let result = self.internal_search_results.get(self.internal_search_selected)?;
+        let rel = match result {
+            InternalSearchResult::Filename { rel_path, .. } => rel_path,
+            InternalSearchResult::Content { rel_path, .. } => rel_path,
+        };
         Some(self.current_dir.join(rel))
     }
 
@@ -3251,6 +3654,58 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Ok(())
     }
 
+    fn run_shell_command_and_wait_key(&mut self, command: &str) -> io::Result<()> {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            self.set_status("command cancelled");
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        println!("$ {}", trimmed);
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell_name = shell.rsplit('/').next().unwrap_or("sh");
+        let mut cmd = Command::new(&shell);
+        // Interactive mode loads shell startup files (e.g. .zshrc/.bashrc) so
+        // user-defined environment variables are available to executed commands.
+        if matches!(shell_name, "zsh" | "bash" | "fish") {
+            cmd.args(["-i", "-c", trimmed]);
+        } else {
+            cmd.args(["-c", trimmed]);
+        }
+
+        let status = cmd.current_dir(&self.current_dir).status();
+
+        match status {
+            Ok(s) => {
+                if let Some(code) = s.code() {
+                    println!("\n[exit code: {}]", code);
+                } else {
+                    println!("\n[process terminated by signal]");
+                }
+            }
+            Err(e) => {
+                println!("\n[failed to execute command: {}]", e);
+            }
+        }
+
+        println!("\nPress any key to return to sbrs...");
+        let _ = io::stdout().flush();
+        enable_raw_mode()?;
+        let _ = event::read();
+        disable_raw_mode()?;
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        self.set_status(format!("ran command: {}", trimmed));
+        self.refresh_entries_or_status();
+        Ok(())
+    }
+
     fn run_zip_action(&mut self) {
         if self.archive_rx.is_some() {
             self.set_status("archive creation already in progress");
@@ -4435,7 +4890,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     fn panel_tab_bar_line(active: u8) -> Line<'static> {
         let tabs: &[(&str, u8)] = &[
             (" Help ", 0),
-            (" File Search ", 1),
+            (" Search ", 1),
             (" Bookmarks ", 2),
             (" Remote Mounts ", 3),
             (" Sorting ", 4),
@@ -4934,6 +5389,7 @@ fn main() -> io::Result<()> {
         app.pump_selected_total_size_progress();
         app.pump_git_info();
         app.pump_notes_progress();
+        app.pump_internal_search_content_progress();
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -5177,31 +5633,96 @@ fn main() -> io::Result<()> {
                     tab_overlay_anchor.height,
                 );
 
-                let max_rows = popup_area.height.saturating_sub(4) as usize;
-                let selected = app.internal_search_selected;
-                let offset = if selected >= max_rows {
-                    selected + 1 - max_rows
-                } else {
-                    0
+                let scope_label = match app.internal_search_scope {
+                    InternalSearchScope::Filename => "Filename",
+                    InternalSearchScope::Content => "Content",
                 };
-
                 let mut lines: Vec<Line> = vec![
+                    Line::from(vec![
+                        Span::styled("Scope: ", Style::default().fg(Color::Rgb(170, 170, 170))),
+                        Span::styled(scope_label, Style::default().fg(Color::Rgb(120, 220, 180)).add_modifier(Modifier::BOLD)),
+                        Span::styled("  (Ctrl+T to toggle)", Style::default().fg(Color::DarkGray)),
+                    ]),
                     Line::from(vec![
                         Span::styled("Query: ", Style::default().fg(Color::Rgb(170, 170, 170))),
                         Span::styled(app.input_buffer.as_str(), Style::default().fg(Color::Rgb(255, 220, 120))),
                     ]),
                     Line::from(Span::styled(
-                        "Up/Down navigate  Enter open  Tab/Shift+Tab switch tabs  Esc cancel  Regex: re:pattern or /pattern/i",
+                        "Up/Down navigate  Enter open  Ctrl+T toggle scope  Tab/Shift+Tab switch tabs  Esc cancel  Regex: re:pattern or /pattern/i",
                         Style::default().fg(Color::DarkGray),
                     )),
                 ];
 
                 let mode_line = if app.internal_search_regex_mode {
                     Span::styled("Mode: regex", Style::default().fg(Color::Rgb(120, 220, 180)))
+                } else if app.internal_search_scope == InternalSearchScope::Content {
+                    Span::styled("Mode: literal", Style::default().fg(Color::Rgb(120, 170, 255)))
                 } else {
                     Span::styled("Mode: fuzzy", Style::default().fg(Color::Rgb(120, 170, 255)))
                 };
                 lines.push(Line::from(mode_line));
+
+                if app.internal_search_scope == InternalSearchScope::Content {
+                    let limits = app.internal_search_content_limits;
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "Limits: files={}  hits={}  max-file={}",
+                            limits.max_files,
+                            limits.max_hits,
+                            App::format_size(limits.max_file_bytes as u64)
+                        ),
+                        Style::default().fg(Color::Rgb(160, 160, 160)),
+                    )));
+
+                    if app.internal_search_limits_menu_open {
+                        let selected_style = Style::default().fg(Color::Rgb(255, 220, 120)).add_modifier(Modifier::BOLD);
+                        let normal_style = Style::default().fg(Color::Rgb(180, 180, 180));
+                        let item_line = |idx: usize, label: &str, value: String| {
+                            let marker = if idx == app.internal_search_limits_selected { ">" } else { " " };
+                            let style = if idx == app.internal_search_limits_selected {
+                                selected_style
+                            } else {
+                                normal_style
+                            };
+                            Line::from(Span::styled(format!("{} {}: {}", marker, label, value), style))
+                        };
+                        lines.push(item_line(0, "Max files", limits.max_files.to_string()));
+                        lines.push(item_line(1, "Max hits", limits.max_hits.to_string()));
+                        lines.push(item_line(2, "Max file size", App::format_size(limits.max_file_bytes as u64)));
+                        lines.push(Line::from(Span::styled(
+                            "Editor: Up/Down select  Left/Right or +/- adjust  Shift=10x  r reset  Ctrl+L close",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            "Ctrl+L open limits editor (live, no restart)",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+
+                    if app.internal_search_content_pending {
+                        lines.push(Line::from(Span::styled(
+                            "Scanning content asynchronously...",
+                            Style::default().fg(Color::Rgb(120, 200, 255)),
+                        )));
+                    }
+                    if let Some(note) = &app.internal_search_content_limit_note {
+                        lines.push(Line::from(Span::styled(
+                            note.clone(),
+                            Style::default().fg(Color::Rgb(160, 160, 160)),
+                        )));
+                    }
+                }
+
+                let selected = app.internal_search_selected;
+                let visible_rows = popup_area.height.saturating_sub(2) as usize;
+                let header_rows = lines.len();
+                let max_rows = visible_rows.saturating_sub(header_rows).max(1);
+                let offset = if selected >= max_rows {
+                    selected + 1 - max_rows
+                } else {
+                    0
+                };
 
                 if let Some(err) = &app.internal_search_regex_error {
                     lines.push(Line::from(Span::styled(
@@ -5226,52 +5747,57 @@ fn main() -> io::Result<()> {
                     {
                         let absolute_idx = offset + display_idx;
                         let is_selected = absolute_idx == selected;
-                        if let Some(rel) = app.internal_search_candidates.get(*result_idx) {
-                            let rel_str = rel.to_string_lossy().into_owned();
-                            let base_style = if is_selected {
-                                Style::default()
-                                    .fg(Color::White)
-                                    .bg(Color::Rgb(60, 60, 60))
-                            } else {
-                                Style::default().fg(Color::Rgb(200, 200, 200))
-                            };
-                            let match_style = if is_selected {
-                                Style::default()
-                                    .fg(Color::Rgb(255, 240, 170))
-                                    .bg(Color::Rgb(60, 60, 60))
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default()
-                                    .fg(Color::Rgb(255, 220, 120))
-                                    .add_modifier(Modifier::BOLD)
-                            };
-                            let marker = if is_selected { "> " } else { "  " };
-                            let mut spans: Vec<Span> = vec![Span::styled(marker, base_style)];
+                        let base_style = if is_selected {
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(60, 60, 60))
+                        } else {
+                            Style::default().fg(Color::Rgb(200, 200, 200))
+                        };
+                        let match_style = if is_selected {
+                            Style::default()
+                                .fg(Color::Rgb(255, 240, 170))
+                                .bg(Color::Rgb(60, 60, 60))
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                                .fg(Color::Rgb(255, 220, 120))
+                                .add_modifier(Modifier::BOLD)
+                        };
+                        let marker = if is_selected { "> " } else { "  " };
+                        let mut spans: Vec<Span> = vec![Span::styled(marker, base_style)];
 
-                            let ranges = if app.internal_search_regex_mode {
-                                app.internal_search_regex
-                                    .as_ref()
-                                    .map(|re| {
-                                        let ranges: Vec<(usize, usize)> = re
-                                            .find_iter(&rel_str)
-                                            .map(|m| (m.start(), m.end()))
-                                            .collect();
-                                        App::merge_byte_ranges(ranges)
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                App::fuzzy_score_and_ranges(&rel_str, app.input_buffer.trim())
-                                    .map(|(_, ranges)| ranges)
-                                    .unwrap_or_default()
-                            };
-                            spans.extend(App::search_spans_with_ranges(
-                                &rel_str,
-                                &ranges,
-                                base_style,
-                                match_style,
-                            ));
-                            lines.push(Line::from(spans));
+                        match result_idx {
+                            InternalSearchResult::Filename { rel_path, match_ranges } => {
+                                let rel_str = rel_path.to_string_lossy().into_owned();
+                                spans.extend(App::search_spans_with_ranges(
+                                    &rel_str,
+                                    match_ranges,
+                                    base_style,
+                                    match_style,
+                                ));
+                            }
+                            InternalSearchResult::Content {
+                                rel_path,
+                                line_number,
+                                line_text,
+                                match_ranges,
+                            } => {
+                                let prefix = format!("{}:{}: ", rel_path.display(), line_number);
+                                spans.push(Span::styled(
+                                    prefix,
+                                    base_style.fg(Color::Rgb(150, 190, 255)),
+                                ));
+                                spans.extend(App::search_spans_with_ranges(
+                                    line_text,
+                                    match_ranges,
+                                    base_style,
+                                    match_style,
+                                ));
+                            }
                         }
+
+                        lines.push(Line::from(spans));
                     }
                 }
 
@@ -5289,7 +5815,7 @@ fn main() -> io::Result<()> {
                 app.clamp_input_cursor();
                 let query_prefix = "Query: ".chars().count() as u16;
                 let cursor_x = popup_area.x + 1 + query_prefix + app.input_cursor as u16;
-                let cursor_y = popup_area.y + 1;
+                let cursor_y = popup_area.y + 2;
                 f.set_cursor(
                     cursor_x.min(popup_area.x + popup_area.width.saturating_sub(1)),
                     cursor_y,
@@ -5430,7 +5956,7 @@ fn main() -> io::Result<()> {
                         ),
                     help_area,
                 );
-            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing) {
+            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput) {
                 let area = f.size();
                 let rename_area = Rect::new(area.width/4, area.height/2 - 1, area.width/2, 3);
                 f.render_widget(Clear, rename_area);
@@ -5440,6 +5966,7 @@ fn main() -> io::Result<()> {
                     AppMode::NewFolder => " New Folder Name ",
                     AppMode::ArchiveCreate => " Create Archive (Enter=Confirm, Esc=Cancel) ",
                     AppMode::NoteEditing => " Note (Enter=Save, Esc=Cancel) ",
+                    AppMode::CommandInput => " Command (; Enter=Run, Esc=Cancel) ",
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
@@ -5982,6 +6509,9 @@ fn main() -> io::Result<()> {
             match app.mode {
                 AppMode::Browsing => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char(';') => {
+                        app.begin_input_edit(AppMode::CommandInput, String::new());
+                    }
                     KeyCode::Char('h') => {
                         app.help_scroll_offset = 0;
                         app.panel_tab = 0;
@@ -6475,7 +7005,8 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         } else {
-                            app.set_status("rg (ripgrep) not found in PATH".to_string());
+                            app.start_internal_search_with_scope(InternalSearchScope::Content);
+                            app.set_status("rg not found; opened Search in content mode");
                         }
                     }
                     KeyCode::Char('f') => {
@@ -6552,6 +7083,33 @@ fn main() -> io::Result<()> {
                     KeyCode::Char(c) => app.input_insert_char(c),
                     _ => {}
                 },
+                AppMode::CommandInput => match key.code {
+                    KeyCode::Enter => {
+                        let command = app.input_buffer.clone();
+                        app.clear_input_edit();
+                        app.mode = AppMode::Browsing;
+                        app.run_shell_command_and_wait_key(&command)?;
+                        terminal.clear()?;
+                    }
+                    KeyCode::Esc => {
+                        app.clear_input_edit();
+                        app.mode = AppMode::Browsing;
+                        app.set_status("command cancelled");
+                    }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.input_insert_char(c)
+                    }
+                    _ => {}
+                },
                 AppMode::NoteEditing => match key.code {
                     KeyCode::Enter => {
                         app.commit_note_edit();
@@ -6571,21 +7129,70 @@ fn main() -> io::Result<()> {
                     _ => {}
                 },
                 AppMode::InternalSearch => match key.code {
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.internal_search_scope == InternalSearchScope::Content {
+                            app.internal_search_limits_menu_open = !app.internal_search_limits_menu_open;
+                        }
+                    }
+                    KeyCode::Esc if app.internal_search_limits_menu_open => {
+                        app.internal_search_limits_menu_open = false;
+                    }
+                    KeyCode::Enter if app.internal_search_limits_menu_open => {
+                        app.internal_search_limits_menu_open = false;
+                    }
+                    KeyCode::Up if app.internal_search_limits_menu_open => {
+                        app.internal_search_limits_selected = app.internal_search_limits_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down if app.internal_search_limits_menu_open => {
+                        app.internal_search_limits_selected = (app.internal_search_limits_selected + 1).min(2);
+                    }
+                    KeyCode::Left if app.internal_search_limits_menu_open => {
+                        app.adjust_internal_search_content_limit(false, key.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                    KeyCode::Right if app.internal_search_limits_menu_open => {
+                        app.adjust_internal_search_content_limit(true, key.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                    KeyCode::Char('-') if app.internal_search_limits_menu_open => {
+                        app.adjust_internal_search_content_limit(false, key.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                    KeyCode::Char('+') if app.internal_search_limits_menu_open => {
+                        app.adjust_internal_search_content_limit(true, key.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                    KeyCode::Char('=') if app.internal_search_limits_menu_open => {
+                        app.adjust_internal_search_content_limit(true, key.modifiers.contains(KeyModifiers::SHIFT));
+                    }
+                    KeyCode::Char('r') if app.internal_search_limits_menu_open => {
+                        app.reset_internal_search_content_limits_to_defaults();
+                    }
+                    KeyCode::Backspace | KeyCode::Delete | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+                        if app.internal_search_limits_menu_open =>
+                    {
+                    }
+                    KeyCode::Char(_)
+                        if app.internal_search_limits_menu_open
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                    }
                     KeyCode::Esc => {
+                        app.cancel_internal_search_content_request();
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }
                     KeyCode::BackTab => {
+                        app.cancel_internal_search_content_request();
                         app.panel_tab = 0;
                         app.help_scroll_offset = 0;
                         app.mode = AppMode::Help;
                     }
                     KeyCode::Tab => {
+                        app.cancel_internal_search_content_request();
                         app.panel_tab = 2;
                         app.mode = AppMode::Bookmarks;
                     }
                     KeyCode::Enter => {
                         let selected_path = app.selected_internal_search_path();
+                        app.cancel_internal_search_content_request();
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         if let Some(path) = selected_path {
@@ -6627,7 +7234,13 @@ fn main() -> io::Result<()> {
                     KeyCode::End => {
                         app.input_move_end();
                     }
-                    KeyCode::Char(c) => {
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.toggle_internal_search_scope();
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
                         app.input_insert_char(c);
                         app.refresh_internal_search_results();
                     }
