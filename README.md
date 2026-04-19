@@ -19,7 +19,9 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 - Age file protection/decryption (`.age`) with `p`
 - Clipboard full-path copy via `Ctrl+c` (`wl-copy`/`xclip`/`xsel`/`pbcopy`)
 - Integration manager (`i`) to enable/disable optional integrations
-- Tabbed Help/Bookmarks/Remote Mounts/Integrations overlays (`Tab` / `Shift+Tab`)
+- Tabbed Help/Search/Bookmarks/Remote Mounts/Sorting/Integrations overlays (`Tab` / `Shift+Tab`)
+- Built-in async Search overlay with filename/content scope, regex support, and highlighted matches
+- In-app command runner (`;`) with "press any key to return" pause
 - Writes last directory to `/tmp/sb_path` on exit for shell integration
 
 ## Build and Run
@@ -73,22 +75,46 @@ Use the installer there if you want the fastest setup without building from sour
 - `e` or `F4`: open in `$EDITOR` (or `hexedit` for binary if available)
 - `n`: new file
 - `N`: new folder
+- `Ctrl+n`: add/edit note for selected item(s)
 - `Z`: archive create/extract flow
 - `C`: compare marked file vs cursor file with `delta`
 - `o`: open with system GUI opener (`xdg-open`/`gio open`)
-- `g`: content search (`rg`, optional `fzf` handoff)
-- `f`: fuzzy file search (`fzf`)
+- `f`: open Search overlay (filename search; uses built-in search if `fzf` is missing)
+- `g`: content search (`rg`, optional `fzf` handoff; falls back to built-in Search content mode when `rg` is missing)
+- `;`: open command prompt, run shell command, then wait for keypress before returning to TUI
 - `S`: SSH/rclone remote picker
 - `i`: integrations panel
 - `b`: bookmarks panel
+- `Ctrl+z`: drop to interactive shell in current directory
 - `Tab` (in browsing): edit current path inline
-- `Tab` / `Shift+Tab` in Help/Bookmarks/Remote Mounts/Integrations: cycle tabs forward/backward
+- `Tab` / `Shift+Tab` in Help/Search/Bookmarks/Remote Mounts/Sorting/Integrations: cycle tabs forward/backward
 - `s`: toggle folder size calculation in listing
 - `Ctrl+s`: open sort mode menu
 - `0-9`: jump to bookmark (`SB_BOOKMARK_0..9`)
 - `.`: toggle hidden files
 - `~`: jump to home
 - `h`: help overlay
+
+## Search Overlay Functions
+
+When Search is open (`f` or fallback from `g`):
+
+- `Up` / `Down`: move result selection
+- `Enter`: open selected match
+- `Esc`: close Search
+- `Ctrl+t`: toggle scope between `Filename` and `Content`
+- Query supports regex forms: `re:pattern` or `/pattern/i`
+- Content-mode results render as `path:line` with highlighted matching snippets
+- Content-mode scanning runs asynchronously (UI remains responsive)
+
+Content limits editor (content scope):
+
+- `Ctrl+l`: open/close limits editor
+- `Up` / `Down`: select which limit to edit
+- `Left` / `Right` or `-` / `+`: decrease/increase selected limit
+- `Shift` + adjust: 10x step
+- `r`: reset limits from environment/default values
+- `Enter` / `Esc`: close limits editor
 
 ## Integrations
 
@@ -124,6 +150,9 @@ If an optional tool is not available, the feature is skipped or falls back grace
 - `TERMINAL_ICONS=0`: hide all file icons (Nerd Font glyphs and emoji)
 - `EDITOR`: editor command used by `e`/`F4`
 - `SB_BOOKMARK_0` ... `SB_BOOKMARK_9`: bookmark directories
+- `SB_SEARCH_CONTENT_MAX_FILES`: built-in Search content-mode max files scanned (default: `20000`)
+- `SB_SEARCH_CONTENT_MAX_HITS`: built-in Search content-mode max matches returned (default: `2000`)
+- `SB_SEARCH_CONTENT_MAX_FILE_BYTES`: built-in Search content-mode per-file byte cap (default: `2097152` / 2 MiB)
 
 ## Shell Integration
 
@@ -164,3 +193,6 @@ From `Cargo.toml`:
 - `hostname` (header prompt)
 - `users` (owner metadata)
 - `clap` (present as dependency)
+- `regex` (search regex mode)
+- `rayon` (parallel entry render-cache build)
+- `unicode-width` (display-width-aware list-mode alignment)

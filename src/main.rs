@@ -214,6 +214,14 @@ enum InternalSearchContentMsg {
     },
 }
 
+enum InternalSearchCandidatesMsg {
+    Finished {
+        scan_id: u64,
+        candidates: Vec<PathBuf>,
+        truncated: bool,
+    },
+}
+
 struct App {
     current_dir: PathBuf,
     entries: Vec<fs::DirEntry>,
@@ -286,6 +294,10 @@ struct App {
     internal_search_results: Vec<InternalSearchResult>,
     internal_search_selected: usize,
     internal_search_scope: InternalSearchScope,
+    internal_search_candidates_rx: Option<Receiver<InternalSearchCandidatesMsg>>,
+    internal_search_candidates_scan_id: u64,
+    internal_search_candidates_pending: bool,
+    internal_search_candidates_truncated: bool,
     internal_search_content_rx: Option<Receiver<InternalSearchContentMsg>>,
     internal_search_content_request_id: u64,
     internal_search_content_pending: bool,
@@ -424,6 +436,10 @@ impl App {
             internal_search_results: Vec::new(),
             internal_search_selected: 0,
             internal_search_scope: InternalSearchScope::Filename,
+            internal_search_candidates_rx: None,
+            internal_search_candidates_scan_id: 0,
+            internal_search_candidates_pending: false,
+            internal_search_candidates_truncated: false,
             internal_search_content_rx: None,
             internal_search_content_request_id: 0,
             internal_search_content_pending: false,
@@ -2043,14 +2059,87 @@ IFS= read -rsn1 _
         }
     }
 
+    fn cancel_internal_search_candidate_scan(&mut self) {
+        self.internal_search_candidates_scan_id = self.internal_search_candidates_scan_id.wrapping_add(1);
+        self.internal_search_candidates_rx = None;
+        self.internal_search_candidates_pending = false;
+    }
+
+    fn start_internal_search_candidate_scan(&mut self) {
+        const INTERNAL_SEARCH_MAX_ITEMS: usize = 20_000;
+
+        self.cancel_internal_search_candidate_scan();
+        self.internal_search_candidates_truncated = false;
+        self.internal_search_candidates.clear();
+        self.internal_search_results.clear();
+        self.internal_search_selected = 0;
+
+        self.internal_search_candidates_scan_id = self.internal_search_candidates_scan_id.wrapping_add(1);
+        let scan_id = self.internal_search_candidates_scan_id;
+        self.internal_search_candidates_pending = true;
+
+        let root = self.current_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.internal_search_candidates_rx = Some(rx);
+        thread::spawn(move || {
+            let candidates = App::collect_internal_search_candidates(&root, INTERNAL_SEARCH_MAX_ITEMS);
+            let truncated = candidates.len() >= INTERNAL_SEARCH_MAX_ITEMS;
+            let _ = tx.send(InternalSearchCandidatesMsg::Finished {
+                scan_id,
+                candidates,
+                truncated,
+            });
+        });
+    }
+
+    fn pump_internal_search_candidates_progress(&mut self) {
+        let Some(rx) = self.internal_search_candidates_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(InternalSearchCandidatesMsg::Finished {
+                    scan_id,
+                    candidates,
+                    truncated,
+                }) => {
+                    if scan_id == self.internal_search_candidates_scan_id {
+                        self.internal_search_candidates = candidates;
+                        self.internal_search_candidates_truncated = truncated;
+                        self.internal_search_candidates_pending = false;
+                        self.refresh_internal_search_results();
+
+                        if self.internal_search_candidates.is_empty() {
+                            self.set_status("search: no files found");
+                        } else if self.internal_search_candidates_truncated {
+                            self.set_status("search indexed first 20000 files");
+                        }
+                        keep_rx = false;
+                    } else {
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.internal_search_candidates_pending = false;
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx {
+            self.internal_search_candidates_rx = Some(rx);
+        }
+    }
+
     fn start_internal_search(&mut self) {
         self.start_internal_search_with_scope(InternalSearchScope::Filename);
     }
 
     fn start_internal_search_with_scope(&mut self, scope: InternalSearchScope) {
-        const INTERNAL_SEARCH_MAX_ITEMS: usize = 20_000;
-        self.internal_search_candidates =
-            Self::collect_internal_search_candidates(&self.current_dir, INTERNAL_SEARCH_MAX_ITEMS);
         self.internal_search_selected = 0;
         self.internal_search_scope = scope;
         self.internal_search_content_limit_note = None;
@@ -2058,16 +2147,9 @@ IFS= read -rsn1 _
         self.internal_search_limits_selected = 0;
         self.panel_tab = 1;
         self.begin_input_edit(AppMode::InternalSearch, String::new());
+        self.start_internal_search_candidate_scan();
         self.refresh_internal_search_results();
-
-        if self.internal_search_candidates.is_empty() {
-            self.set_status("search: no files found");
-        } else if self.internal_search_candidates.len() >= INTERNAL_SEARCH_MAX_ITEMS {
-            self.set_status(format!(
-                "search indexed first {} files",
-                INTERNAL_SEARCH_MAX_ITEMS
-            ));
-        }
+        self.set_status("search: indexing files asynchronously...");
     }
 
     fn toggle_internal_search_scope(&mut self) {
@@ -5421,6 +5503,7 @@ fn main() -> io::Result<()> {
         app.pump_selected_total_size_progress();
         app.pump_git_info();
         app.pump_notes_progress();
+        app.pump_internal_search_candidates_progress();
         app.pump_internal_search_content_progress();
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -5693,6 +5776,18 @@ fn main() -> io::Result<()> {
                     Span::styled("Mode: fuzzy", Style::default().fg(Color::Rgb(120, 170, 255)))
                 };
                 lines.push(Line::from(mode_line));
+
+                if app.internal_search_candidates_pending {
+                    lines.push(Line::from(Span::styled(
+                        "Indexing files asynchronously...",
+                        Style::default().fg(Color::Rgb(120, 200, 255)),
+                    )));
+                } else if app.internal_search_candidates_truncated {
+                    lines.push(Line::from(Span::styled(
+                        "Indexed first 20000 files (refine query to narrow results)",
+                        Style::default().fg(Color::Rgb(160, 160, 160)),
+                    )));
+                }
 
                 if app.internal_search_scope == InternalSearchScope::Content {
                     let limits = app.internal_search_content_limits;
@@ -7207,23 +7302,27 @@ fn main() -> io::Result<()> {
                     {
                     }
                     KeyCode::Esc => {
+                        app.cancel_internal_search_candidate_scan();
                         app.cancel_internal_search_content_request();
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }
                     KeyCode::BackTab => {
+                        app.cancel_internal_search_candidate_scan();
                         app.cancel_internal_search_content_request();
                         app.panel_tab = 0;
                         app.help_scroll_offset = 0;
                         app.mode = AppMode::Help;
                     }
                     KeyCode::Tab => {
+                        app.cancel_internal_search_candidate_scan();
                         app.cancel_internal_search_content_request();
                         app.panel_tab = 2;
                         app.mode = AppMode::Bookmarks;
                     }
                     KeyCode::Enter => {
                         let selected_path = app.selected_internal_search_path();
+                        app.cancel_internal_search_candidate_scan();
                         app.cancel_internal_search_content_request();
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
