@@ -22,6 +22,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 struct ArchiveMount {
     archive_path: PathBuf,
@@ -5143,6 +5144,37 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
         out
     }
 
+    fn truncate_to_display_width(s: &str, max: usize) -> String {
+        if UnicodeWidthStr::width(s) <= max {
+            return s.to_string();
+        }
+        if max <= 1 {
+            return "…".to_string();
+        }
+
+        let mut out = String::new();
+        let mut used = 0usize;
+        let target = max - 1;
+        for ch in s.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_width > target {
+                break;
+            }
+            out.push(ch);
+            used += ch_width;
+        }
+        out.push('…');
+        out
+    }
+
+    fn pad_to_display_width(s: &str, width: usize) -> String {
+        let used = UnicodeWidthStr::width(s);
+        if used >= width {
+            return s.to_string();
+        }
+        format!("{}{}", s, " ".repeat(width - used))
+    }
+
     let mut entries: Vec<_> = fs::read_dir(&current_dir)?
         .filter_map(|res| res.ok())
         .filter(|e| include_hidden || !e.file_name().to_string_lossy().starts_with('.'))
@@ -5228,8 +5260,8 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
         } else {
             String::new()
         };
-        let rendered_name = truncate_to(&format!("{}{}", icon_prefix, name), name_width);
-        let rendered_name = format!("{:<width$}", rendered_name, width = name_width);
+        let rendered_name = truncate_to_display_width(&format!("{}{}", icon_prefix, name), name_width);
+        let rendered_name = pad_to_display_width(&rendered_name, name_width);
 
         let mut styled_name = style(rendered_name).with(name_color);
         if is_dir {
