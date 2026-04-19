@@ -5585,7 +5585,9 @@ fn main() -> io::Result<()> {
 
             let note_style = Style::default().fg(Color::Rgb(150, 150, 150));
 
-            let selection_style = Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::White);
+            // Keep selected-row background while preserving per-span foreground colors
+            // (e.g. filename white, note text gray).
+            let selection_style = Style::default().bg(Color::Rgb(50, 50, 50));
             let marker_width = if app.no_color { 3 } else { 0 };
             let name_text_width = file_name_width.saturating_sub(marker_width).max(1);
             let entry_styles = |mut icon_style: Style, mut name_style: Style, is_selected: bool| {
