@@ -4455,29 +4455,6 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Line::from(spans)
     }
 
-    fn panel_tab_bar_line_compact(active: u8) -> Line<'static> {
-        let tabs: &[(&str, u8)] = &[
-            ("Help", 0),
-            ("File Search", 1),
-            ("Bookmarks", 2),
-            ("Remote Mounts", 3),
-            ("Sorting", 4),
-            ("Integrations", 5),
-        ];
-        let active_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-        let inactive_style = Style::default().fg(Color::Rgb(100, 100, 100));
-        let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (i, (label, idx)) in tabs.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled("|", sep_style));
-            }
-            let style = if *idx == active { active_style } else { inactive_style };
-            spans.push(Span::styled(*label, style));
-        }
-        Line::from(spans)
-    }
-
     fn integration_rows(&self) -> Vec<IntegrationRow> {
         let mut rows = Vec::new();
         let all_on = self.all_optional_integrations_enabled();
@@ -5612,7 +5589,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, sort_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line_compact(app.panel_tab))
+                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(120, 190, 255)))),
                     sort_area,
                 );
