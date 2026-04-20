@@ -80,6 +80,7 @@ struct EntryRenderCache {
     name_style: Style,
     meta_col: String,
     size_col: String,
+    size_bytes: Option<u64>,
     date_col: String,
 }
 
@@ -282,6 +283,7 @@ struct App {
     current_dir_total_size_scan_id: u64,
     current_dir_total_size_pending: bool,
     current_dir_total_size_bytes: Option<u64>,
+    current_dir_free_bytes: Option<u64>,
     selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
     selected_total_size_scan_id: u64,
     selected_total_size_pending: bool,
@@ -424,6 +426,7 @@ impl App {
             current_dir_total_size_scan_id: 0,
             current_dir_total_size_pending: false,
             current_dir_total_size_bytes: None,
+            current_dir_free_bytes: None,
             selected_total_size_rx: None,
             selected_total_size_scan_id: 0,
             selected_total_size_pending: false,
@@ -1087,6 +1090,34 @@ IFS= read -rsn1 _
         self.current_dir_total_size_bytes = None;
     }
 
+    fn filesystem_free_space_bytes(path: &PathBuf) -> Option<u64> {
+        let output = Command::new("df")
+            .args(["-kP"])
+            .arg(path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())?;
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            return None;
+        }
+
+        let available_kb = u64::from_str(cols[3]).ok()?;
+        Some(available_kb.saturating_mul(1024))
+    }
+
+    fn refresh_current_dir_free_space(&mut self) {
+        self.current_dir_free_bytes = Self::filesystem_free_space_bytes(&self.current_dir);
+    }
+
     fn start_current_dir_total_size_scan(&mut self) {
         if !self.folder_size_enabled {
             return;
@@ -1139,12 +1170,19 @@ IFS= read -rsn1 _
             return None;
         }
 
+        let free_part = self
+            .current_dir_free_bytes
+            .map(|bytes| format!("free: {}", Self::format_size(bytes)))
+            .unwrap_or_else(|| "free: ?".to_string());
+
         if self.current_dir_total_size_pending {
-            return Some(" scanning...".to_string());
+            return Some(format!("dir size: scanning... | {}", free_part));
         }
 
-        self.current_dir_total_size_bytes
-            .map(|bytes| format!(" {}", Self::format_size(bytes)))
+        Some(match self.current_dir_total_size_bytes {
+            Some(bytes) => format!("dir size: {} | {}", Self::format_size(bytes), free_part),
+            None => format!("dir size: ? | {}", free_part),
+        })
     }
 
     fn reset_folder_size_columns(&mut self) {
@@ -1152,6 +1190,7 @@ IFS= read -rsn1 _
         for (idx, entry) in self.entries.iter().enumerate() {
             if entry.path().is_dir() {
                 self.entry_render_cache[idx].size_col = format!("{:>width$}", "-", width = size_width);
+                self.entry_render_cache[idx].size_bytes = None;
             }
         }
     }
@@ -1192,6 +1231,7 @@ IFS= read -rsn1 _
                     }
                     if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
                         self.entry_render_cache[idx].size_col = format!("{:>width$}", Self::format_size(size), width = 8);
+                        self.entry_render_cache[idx].size_bytes = Some(size);
                     }
                 }
                 Ok(FolderSizeMsg::Finished(scan_id)) => {
@@ -1392,7 +1432,10 @@ IFS= read -rsn1 _
             owner
         };
         let meta_col = format!("{:<width$}", format!("{} {}", perms, owner_trimmed), width = meta_width);
-        let size = meta.as_ref().map(|m| if m.is_dir() { "-".into() } else { App::format_size(m.len()) }).unwrap_or_default();
+        let size_bytes = meta.as_ref().and_then(|m| if m.is_dir() { None } else { Some(Self::display_leaf_size(m)) });
+        let size = size_bytes
+            .map(App::format_size)
+            .unwrap_or_else(|| "-".to_string());
         let size_col = format!("{:>width$}", size, width = size_width);
         let date = meta
             .as_ref()
@@ -1408,6 +1451,7 @@ IFS= read -rsn1 _
             name_style,
             meta_col,
             size_col,
+            size_bytes,
             date_col,
         }
     }
@@ -3367,6 +3411,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
             .collect();
+        self.refresh_current_dir_free_space();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
         self.folder_size_rx = None;
         self.clear_current_dir_total_size_state();
@@ -4411,7 +4456,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn compute_total_display_bytes(src: &PathBuf) -> io::Result<u64> {
-        Self::compute_total_display_bytes_inner(src, true)
+        Self::compute_total_display_bytes_inner(src, false)
     }
 
     fn compute_total_bytes_inner(src: &PathBuf, follow_symlink_dir: bool) -> io::Result<u64> {
@@ -5575,13 +5620,18 @@ fn main() -> io::Result<()> {
 
             // --- Header ---
             let header_identity = app.current_header_identity(&user, &hostname);
+            let current_display_path = if app.mode == AppMode::PathEditing {
+                app.input_buffer.clone()
+            } else {
+                app.current_dir_display_path()
+            };
             let mut path_spans = vec![
                 Span::styled(header_identity.as_str(), Style::default().fg(Color::Cyan)),
                 Span::raw(" » "),
                 if app.mode == AppMode::PathEditing {
-                    Span::styled(app.input_buffer.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
+                    Span::styled(current_display_path.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
                 } else {
-                    Span::raw(app.current_dir_display_path())
+                    Span::raw(current_display_path.as_str())
                 },
             ];
             if app.integration_enabled("git") {
@@ -5596,16 +5646,27 @@ fn main() -> io::Result<()> {
                 }
             }
             if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
-                path_spans.push(Span::styled(
-                    " »",
-                    Style::default().fg(Color::DarkGray),
-                ));
-                path_spans.push(Span::styled(
-                    total_suffix,
-                    Style::default().fg(Color::Rgb(150, 220, 150)),
-                ));
+                let suffix_width = UnicodeWidthStr::width(total_suffix.as_str()) as u16;
+                let right_width = suffix_width.saturating_add(1).min(chunks[0].width.saturating_sub(1));
+                if right_width > 0 {
+                    let header_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(1), Constraint::Length(right_width)])
+                        .split(chunks[0]);
+                    f.render_widget(Paragraph::new(Line::from(path_spans)), header_chunks[0]);
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(total_suffix, Style::default().fg(Color::Rgb(150, 220, 150))),
+                        ]))
+                        .alignment(Alignment::Right),
+                        header_chunks[1],
+                    );
+                } else {
+                    f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
+                }
+            } else {
+                f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             }
-            f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             if app.mode == AppMode::PathEditing {
                 let prefix_len = format!("{} » ", header_identity).chars().count() as u16;
                 app.clamp_input_cursor();
@@ -5621,11 +5682,14 @@ fn main() -> io::Result<()> {
             let show_date = term_w >= 90;
             let show_size = term_w >= 70;
             let show_meta = term_w >= 50;
+            let show_pct = app.folder_size_enabled && show_size;
             let meta_width = 18usize;
             let size_width = 8usize;
+            let pct_width = 6usize;
             let date_width = 16usize;
             let reserved_width = (if show_meta { meta_width } else { 0 })
                 + (if show_size { size_width } else { 0 })
+                + (if show_pct { pct_width } else { 0 })
                 + (if show_date { date_width } else { 0 });
             let name_cell_width = (term_w as usize).saturating_sub(reserved_width);
             // Keep a small safety margin so truncation occurs before the table widget clips.
@@ -5668,6 +5732,7 @@ fn main() -> io::Result<()> {
 
                 let meta_style = Style::default().fg(Color::Rgb(180, 150, 100));
                 let size_style = Style::default().fg(Color::Green);
+                let pct_style = Style::default().fg(Color::Rgb(220, 200, 120));
                 let date_style = Style::default().fg(Color::Rgb(120, 190, 210));
                 let marker = if app.no_color {
                     format!(
@@ -5714,6 +5779,16 @@ fn main() -> io::Result<()> {
                 }))];
                 if show_meta { cells.push(Cell::from(Span::styled(entry_cache.meta_col.as_str(), meta_style))); }
                 if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
+                if show_pct {
+                    let pct_col = match (app.current_dir_total_size_bytes, entry_cache.size_bytes) {
+                        (Some(total), Some(entry_bytes)) if total > 0 => {
+                            let pct = (entry_bytes as f64 * 100.0) / (total as f64);
+                            format!("{:>5.1}%", pct)
+                        }
+                        _ => format!("{:>width$}", "-", width = pct_width),
+                    };
+                    cells.push(Cell::from(Span::styled(pct_col, pct_style)));
+                }
                 if show_date { cells.push(Cell::from(Span::styled(entry_cache.date_col.as_str(), date_style))); }
                 Row::new(cells).style(if is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
@@ -5721,6 +5796,7 @@ fn main() -> io::Result<()> {
             let mut col_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
             if show_meta { col_constraints.push(Constraint::Length(meta_width as u16)); }
             if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
+            if show_pct { col_constraints.push(Constraint::Length(pct_width as u16)); }
             if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
             let table = Table::new(rows, col_constraints)
                 .highlight_style(selection_style)
