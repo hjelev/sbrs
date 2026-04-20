@@ -904,7 +904,7 @@ IFS= read -rsn1 _
 
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
-        self.entry_render_cache = self.entries.par_iter()
+            self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
             .collect();
 
@@ -3356,7 +3356,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.entries = entries;
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
-        self.entry_render_cache = self.entries.par_iter()
+            self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
             .collect();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
