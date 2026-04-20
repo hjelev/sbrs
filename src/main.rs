@@ -2671,6 +2671,14 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         env::temp_dir().join(format!("sbrs_zip_{}_{}", std::process::id(), stamp))
     }
 
+    fn create_temp_selection_path(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!("{}_{}_{}.txt", prefix, std::process::id(), stamp))
+    }
+
     fn try_mount_archive(&mut self, archive_path: PathBuf) -> bool {
         self.try_mount_archive_with(archive_path, "fuse-zip")
     }
@@ -7148,13 +7156,13 @@ fn main() -> io::Result<()> {
                         let has_rg  = app.integration_active("rg");
                         let has_fzf = app.integration_active("fzf");
                         if has_rg {
-                            let tmp = env::temp_dir().join("sbrs_fzf_rg_selection.txt");
+                            let tmp = App::create_temp_selection_path("sbrs_fzf_rg_selection");
                             let cmd = if has_fzf {
                                 // rg pipes into fzf; fzf writes its selection to temp file.
                                 // Using inherited stdio so fzf owns the real TTY on all platforms.
                                 format!(
                                     "rg --color=always --line-number --no-heading --smart-case \
-                                     --fixed-strings --colors=match:fg:214 '' \
+                                     --fixed-strings --colors=match:fg:214 '' 2>/dev/null \
                                      | fzf --ansi --exact --layout=reverse --delimiter=: \
                                      | awk -F: '{{print $1}}' > {}",
                                     tmp.display()
@@ -7162,7 +7170,7 @@ fn main() -> io::Result<()> {
                             } else {
                                 // no fzf: pick first file with a match
                                 format!(
-                                    "rg --files-with-matches '' | head -1 > {}",
+                                    "rg --files-with-matches '' 2>/dev/null | head -1 > {}",
                                     tmp.display()
                                 )
                             };
@@ -7195,9 +7203,9 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('f') => {
                         if app.integration_active("fzf") {
-                            let tmp = env::temp_dir().join("sbrs_fzf_selection.txt");
+                            let tmp = App::create_temp_selection_path("sbrs_fzf_selection");
                             let cmd = format!(
-                                "find . -not -path '*/.*' | fzf --layout=reverse > {}",
+                                "find . -path '*/.*' -prune -o -print 2>/dev/null | fzf --layout=reverse > {}",
                                 tmp.display()
                             );
                             disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
