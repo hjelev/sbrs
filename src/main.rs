@@ -3796,6 +3796,96 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Ok(())
     }
 
+    fn shell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn open_split_shell_with_less(&mut self) -> io::Result<()> {
+        if !self.integration_active("tmux") {
+            self.set_status("tmux not found in PATH");
+            return Ok(());
+        }
+
+        let Some(entry) = self.entries.get(self.selected_index) else {
+            self.set_status("no selected item");
+            return Ok(());
+        };
+
+        let selected_path = entry.path();
+        if selected_path.is_dir() {
+            self.set_status("split shell preview works on files only");
+            return Ok(());
+        }
+
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let current_dir = self.current_dir.to_string_lossy().into_owned();
+        let selected_file = selected_path.to_string_lossy().into_owned();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let session_name = format!("sbrs_i_{}_{}", std::process::id(), stamp % 1_000_000_000);
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Show)?;
+
+        let tmux_result = (|| -> io::Result<()> {
+            let left_cmd = format!(
+                "{} -i; tmux kill-session -t {} >/dev/null 2>&1",
+                Self::shell_single_quote(&shell),
+                Self::shell_single_quote(&session_name)
+            );
+            let right_cmd = format!(
+                "less -R -- {}",
+                Self::shell_single_quote(&selected_file)
+            );
+            let target_window = format!("{}:0", session_name);
+            let target_left = format!("{}:0.0", session_name);
+
+            let create_status = Command::new("tmux")
+                .args(["new-session", "-d", "-s", &session_name, "-c", &current_dir, &left_cmd])
+                .status()?;
+            if !create_status.success() {
+                return Err(io::Error::other("tmux new-session failed"));
+            }
+
+            let split_status = Command::new("tmux")
+                .args(["split-window", "-h", "-p", "30", "-t", &target_window, "-c", &current_dir, &right_cmd])
+                .status()?;
+            if !split_status.success() {
+                let _ = Command::new("tmux").args(["kill-session", "-t", &session_name]).status();
+                return Err(io::Error::other("tmux split-window failed"));
+            }
+
+            let _ = Command::new("tmux")
+                .args(["select-pane", "-t", &target_left])
+                .status();
+
+            let _ = Command::new("tmux")
+                .args(["attach-session", "-t", &session_name])
+                .status();
+
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &session_name])
+                .status();
+
+            Ok(())
+        })();
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+        execute!(io::stdout(), Hide)?;
+
+        match tmux_result {
+            Ok(()) => self.set_status("returned from split shell"),
+            Err(e) => self.set_status(format!("split shell failed: {}", e)),
+        }
+        self.refresh_entries_or_status();
+        Ok(())
+    }
+
     fn run_shell_command_and_wait_key(&mut self, command: &str) -> io::Result<()> {
         let trimmed = command.trim();
         if trimmed.is_empty() {
@@ -4907,6 +4997,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "sshfs", description: "mount SSH hosts via S picker", category: "network", required: false },
             IntegrationSpec { key: "rclone", description: "mount rclone remotes via S picker", category: "network", required: false },
+            IntegrationSpec { key: "tmux", description: "split shell + less preview (I)", category: "terminal", required: false },
             IntegrationSpec { key: "rg", description: "content search, fzf preview if avail (g)", category: "search", required: false },
             IntegrationSpec { key: "fzf", description: "fuzzy file search (f)", category: "search", required: false },
             IntegrationSpec { key: "wl-copy", description: "Wayland clipboard backend used by Ctrl+c full-path copy", category: "clipboard", required: false },
@@ -6154,9 +6245,9 @@ fn main() -> io::Result<()> {
                             ("g", "Content search with ripgrep"),
                             ("C", "Delta compare (marked vs cursor)"),
                             ("S", "Open SSH/rclone mount picker"),
+                            ("I", "Split shell (left) + less preview (right 30%)"),
                             ("i", "Open integrations panel"),
                             ("b / 0-9", "Open bookmarks / jump to bookmark"),
-                            ("", ""),
                             ("", ""),
                         ],
                     ),
@@ -6590,7 +6681,7 @@ fn main() -> io::Result<()> {
                 left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
             }
             let left_status = left_status_parts.join(" │ ");
-            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit s:Size o:Open-GUI ~:home h:Help q:Quit";
+            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit I:Split s:Size o:Open-GUI h:Help q:Quit";
             let width = chunks[1].width as usize;
             let left_len = left_status.chars().count();
             let right_len = right_status.chars().count();
@@ -6874,6 +6965,10 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('o') => {
                         app.open_selected_with_default_app()?;
+                        terminal.clear()?;
+                    }
+                    KeyCode::Char('I') => {
+                        app.open_split_shell_with_less()?;
                         terminal.clear()?;
                     }
                     KeyCode::Char('l') => {
