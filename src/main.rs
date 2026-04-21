@@ -5066,8 +5066,26 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             "hexyl" => Some("hexyl"),
             "hexedit" => Some("hexedit"),
             "vidir" => Some("moreutils"),
-            "fuse-zip" => Some("fuse-zip"),
-            "archivemount" => Some("archivemount"),
+            "fuse-zip" => {
+                #[cfg(target_os = "macos")]
+                {
+                    Some("fuse-zip-mac")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Some("fuse-zip")
+                }
+            }
+            "archivemount" => {
+                #[cfg(target_os = "macos")]
+                {
+                    Some("gromgit/fuse/archivemount")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Some("archivemount")
+                }
+            }
             "sox" => Some("sox"),
             "viu" => Some("viu"),
             "chafa" => Some("chafa"),
@@ -5211,22 +5229,41 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         execute!(io::stdout(), LeaveAlternateScreen)?;
 
         println!("Installing integration '{}' with Homebrew", key);
-        println!("$ {} install {}", brew, package);
-        let status = Command::new(&brew)
-            .arg("install")
-            .arg(&package)
-            .status();
 
-        match &status {
-            Ok(s) => {
-                if let Some(code) = s.code() {
-                    println!("\n[exit code: {}]", code);
-                } else {
-                    println!("\n[process terminated by signal]");
-                }
+        let mut install_steps: Vec<Vec<String>> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            if key == "archivemount" || key == "fuse-zip" {
+                install_steps.push(vec!["install".to_string(), "--cask".to_string(), "macfuse".to_string()]);
             }
-            Err(e) => {
-                println!("\n[failed to execute brew: {}]", e);
+        }
+        install_steps.push(vec!["install".to_string(), package.clone()]);
+
+        let mut failed_step: Option<String> = None;
+        for step in install_steps {
+            let pretty = step.join(" ");
+            println!("$ {} {}", brew, pretty);
+            let status = Command::new(&brew)
+                .args(step.iter().map(|s| s.as_str()))
+                .status();
+
+            match &status {
+                Ok(s) => {
+                    if let Some(code) = s.code() {
+                        println!("\n[exit code: {}]", code);
+                    } else {
+                        println!("\n[process terminated by signal]");
+                    }
+                    if !s.success() {
+                        failed_step = Some(pretty);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    println!("\n[failed to execute brew: {}]", e);
+                    failed_step = Some(pretty);
+                    break;
+                }
             }
         }
 
@@ -5239,16 +5276,13 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
-        match status {
-            Ok(s) if s.success() => {
+        match failed_step {
+            None => {
                 self.set_integration_enabled(&key, true);
                 self.set_status(format!("installed {} with brew", package));
             }
-            Ok(_) => {
-                self.set_status(format!("brew install failed for {}", package));
-            }
-            Err(_) => {
-                self.set_status(format!("failed to run brew for {}", package));
+            Some(step) => {
+                self.set_status(format!("brew install failed: {}", step));
             }
         }
 
