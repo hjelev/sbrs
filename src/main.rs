@@ -79,8 +79,8 @@ struct EntryRenderCache {
     icon_style: Style,
     name_style: Style,
     perms_col: String,
-    group_col: String,
-    owner_col: String,
+    group_name: String,
+    owner_name: String,
     size_col: String,
     size_bytes: Option<u64>,
     date_col: String,
@@ -317,6 +317,8 @@ struct App {
     notes_scan_id: u64,
     notes_loaded_for: Option<PathBuf>,
     note_edit_targets: Vec<String>,
+    meta_group_width: usize,
+    meta_owner_width: usize,
 }
 
 #[derive(Clone)]
@@ -460,6 +462,8 @@ impl App {
             notes_scan_id: 0,
             notes_loaded_for: None,
             note_edit_targets: Vec::new(),
+            meta_group_width: 1,
+            meta_owner_width: 1,
         };
         app.refresh_entries()?;
         app.request_notes_for_current_dir_once();
@@ -916,6 +920,7 @@ IFS= read -rsn1 _
             self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
+        self.refresh_meta_identity_widths();
 
         self.marked_indices = self
             .entries
@@ -1236,7 +1241,7 @@ IFS= read -rsn1 _
                         continue;
                     }
                     if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
-                        self.entry_render_cache[idx].size_col = format!("{:>width$}", Self::format_size(size), width = 8);
+                        self.entry_render_cache[idx].size_col = format!("{:>width$}", Self::format_size(size), width = 6);
                         self.entry_render_cache[idx].size_bytes = Some(size);
                     }
                 }
@@ -1422,9 +1427,7 @@ IFS= read -rsn1 _
             name_style = name_style.add_modifier(Modifier::DIM);
         }
 
-        let perms_width = 10usize;
-        let group_width = 8usize;
-        let owner_width = 10usize;
+        let perms_width = 11usize;
         let size_width = 6usize;
         let date_width = 16usize;
         let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
@@ -1446,18 +1449,6 @@ IFS= read -rsn1 _
             #[cfg(not(unix))] { "-".to_string() }
         }).unwrap_or_else(|| "-".to_string());
         let perms_col = format!("{:<width$}", perms, width = perms_width);
-        let group_trimmed = if group.chars().count() > group_width {
-            group.chars().take(group_width).collect::<String>()
-        } else {
-            group
-        };
-        let owner_trimmed = if owner.chars().count() > owner_width {
-            owner.chars().take(owner_width).collect::<String>()
-        } else {
-            owner
-        };
-        let group_col = format!("{:>width$}", group_trimmed, width = group_width);
-        let owner_col = format!("{:<width$}", owner_trimmed, width = owner_width);
         let size_bytes = meta.as_ref().and_then(|m| if m.is_dir() { None } else { Some(Self::display_leaf_size(m)) });
         let size = size_bytes
             .map(App::format_size)
@@ -1476,12 +1467,23 @@ IFS= read -rsn1 _
             icon_style,
             name_style,
             perms_col,
-            group_col,
-            owner_col,
+            group_name: group,
+            owner_name: owner,
             size_col,
             size_bytes,
             date_col,
         }
+    }
+
+    fn refresh_meta_identity_widths(&mut self) {
+        let mut group_w = 1usize;
+        let mut owner_w = 1usize;
+        for entry in &self.entry_render_cache {
+            group_w = group_w.max(entry.group_name.chars().count());
+            owner_w = owner_w.max(entry.owner_name.chars().count());
+        }
+        self.meta_group_width = group_w.min(16);
+        self.meta_owner_width = owner_w.min(20);
     }
 
     fn byte_index_for_char(s: &str, char_index: usize) -> usize {
@@ -3440,6 +3442,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
+        self.refresh_meta_identity_widths();
         self.refresh_current_dir_free_space();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
         self.folder_size_rx = None;
@@ -5843,9 +5846,9 @@ fn main() -> io::Result<()> {
             let show_size = term_w >= 70;
             let show_meta = term_w >= 50;
             let show_pct = app.folder_size_enabled && show_size;
-            let perms_width = 10usize;
-            let group_width = 8usize;
-            let owner_width = 10usize;
+            let perms_width = 11usize;
+            let group_width = app.meta_group_width.max(1);
+            let owner_width = app.meta_owner_width.max(1);
             let size_width = 6usize;
             let pct_width = 6usize;
             let date_width = 16usize;
@@ -5941,8 +5944,14 @@ fn main() -> io::Result<()> {
                 }))];
                 if show_meta {
                     cells.push(Cell::from(Span::styled(entry_cache.perms_col.as_str(), meta_style)));
-                    cells.push(Cell::from(Span::styled(entry_cache.group_col.as_str(), meta_style)));
-                    cells.push(Cell::from(Span::styled(entry_cache.owner_col.as_str(), meta_style)));
+                    cells.push(Cell::from(Span::styled(
+                        format!("{:>width$}", entry_cache.group_name, width = group_width),
+                        meta_style,
+                    )));
+                    cells.push(Cell::from(Span::styled(
+                        format!("{:<width$}", entry_cache.owner_name, width = owner_width),
+                        meta_style,
+                    )));
                 }
                 if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
                 if show_pct {
