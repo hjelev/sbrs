@@ -167,6 +167,7 @@ enum AppMode {
     NewFolder,
     ArchiveCreate,
     ConfirmExtract,
+    ConfirmIntegrationInstall,
     Help,
     ConfirmDelete,
     Bookmarks,
@@ -274,6 +275,9 @@ struct App {
     integration_selected: usize,
     integration_overrides: HashMap<String, bool>,
     integration_rows_cache: Vec<IntegrationRow>,
+    integration_install_key: Option<String>,
+    integration_install_package: Option<String>,
+    integration_install_brew_path: Option<String>,
     help_scroll_offset: u16,
     help_max_offset: u16,
     git_info_cache: Option<GitInfoCache>,
@@ -419,6 +423,9 @@ impl App {
             integration_selected: 0,
             integration_overrides: HashMap::new(),
             integration_rows_cache: Vec::new(),
+            integration_install_key: None,
+            integration_install_package: None,
+            integration_install_brew_path: None,
             help_scroll_offset: 0,
             help_max_offset: 0,
             git_info_cache: None,
@@ -5040,6 +5047,217 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         1 + Self::integration_catalog().len()
     }
 
+    fn integration_brew_package(key: &str) -> Option<&'static str> {
+        match key {
+            "__all_optional__" | "$EDITOR" | "less" | "pbcopy" => None,
+            "git" => Some("git"),
+            "bat" => Some("bat"),
+            "glow" => Some("glow"),
+            "links" => Some("links"),
+            "7z" => Some("p7zip"),
+            "zip" => Some("zip"),
+            "tar" => Some("gnu-tar"),
+            "rar" => Some("rar"),
+            "asciinema" => Some("asciinema"),
+            "age" => Some("age"),
+            "jnv" => Some("jnv"),
+            "csvlens" => Some("csvlens"),
+            "delta" => Some("git-delta"),
+            "hexyl" => Some("hexyl"),
+            "hexedit" => Some("hexedit"),
+            "vidir" => Some("moreutils"),
+            "fuse-zip" => Some("fuse-zip"),
+            "archivemount" => Some("archivemount"),
+            "sox" => Some("sox"),
+            "viu" => Some("viu"),
+            "chafa" => Some("chafa"),
+            "sshfs" => Some("sshfs"),
+            "rclone" => Some("rclone"),
+            "tmux" => Some("tmux"),
+            "rg" => Some("ripgrep"),
+            "fzf" => Some("fzf"),
+            "wl-copy" => Some("wl-clipboard"),
+            "xclip" => Some("xclip"),
+            "xsel" => Some("xsel"),
+            "pdftotext" => Some("poppler"),
+            _ => None,
+        }
+    }
+
+    fn brew_command_path() -> Option<String> {
+        let (found, path) = Self::integration_probe("brew");
+        if found {
+            return Some(path);
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(PathBuf::from("/opt/homebrew/bin/brew"));
+            candidates.push(PathBuf::from("/usr/local/bin/brew"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            candidates.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"));
+            if let Ok(home) = env::var("HOME") {
+                candidates.push(PathBuf::from(home).join(".linuxbrew/bin/brew"));
+            }
+        }
+
+        for candidate in candidates {
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+
+        None
+    }
+
+    fn clear_integration_install_prompt(&mut self) {
+        self.integration_install_key = None;
+        self.integration_install_package = None;
+        self.integration_install_brew_path = None;
+    }
+
+    fn begin_integration_install_prompt_for_selected(&mut self) {
+        if self.integration_rows_cache.is_empty() {
+            self.set_status("no integration selected");
+            return;
+        }
+
+        let Some(row) = self.integration_rows_cache.get(self.integration_selected).cloned() else {
+            self.set_status("invalid integration selection");
+            return;
+        };
+
+        if row.key == "__all_optional__" {
+            self.set_status("select a specific integration to install");
+            return;
+        }
+
+        if row.required {
+            self.set_status("required integration cannot be installed from here");
+            return;
+        }
+
+        if row.available {
+            self.set_status(format!("{} is already available", row.label));
+            return;
+        }
+
+        let Some(package) = Self::integration_brew_package(&row.key) else {
+            self.set_status(format!("no brew package mapping for {}", row.label));
+            return;
+        };
+
+        self.integration_install_key = Some(row.key);
+        self.integration_install_package = Some(package.to_string());
+        self.integration_install_brew_path = Self::brew_command_path();
+        self.mode = AppMode::ConfirmIntegrationInstall;
+        self.set_status("confirm integration install: y to continue");
+    }
+
+    fn show_brew_setup_guidance(&mut self) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        println!("Homebrew was not found on this system.");
+        println!();
+        println!("Install Homebrew first, then retry from Integrations:");
+        println!("  /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"");
+        println!();
+        println!("After install, verify with: brew --version");
+        println!();
+        println!("Press Enter to return to sbrs...");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+        Ok(())
+    }
+
+    fn confirm_integration_install(&mut self) -> io::Result<()> {
+        let Some(key) = self.integration_install_key.clone() else {
+            self.mode = AppMode::Integrations;
+            self.set_status("no pending integration install");
+            return Ok(());
+        };
+        let Some(package) = self.integration_install_package.clone() else {
+            self.mode = AppMode::Integrations;
+            self.set_status("no pending integration package");
+            return Ok(());
+        };
+
+        let brew_path = self
+            .integration_install_brew_path
+            .clone()
+            .or_else(Self::brew_command_path);
+
+        if brew_path.is_none() {
+            self.show_brew_setup_guidance()?;
+            self.mode = AppMode::Integrations;
+            self.clear_integration_install_prompt();
+            self.refresh_integration_rows_cache();
+            self.set_status("brew not found; setup instructions shown");
+            return Ok(());
+        }
+
+        let brew = brew_path.unwrap_or_default();
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        println!("Installing integration '{}' with Homebrew", key);
+        println!("$ {} install {}", brew, package);
+        let status = Command::new(&brew)
+            .arg("install")
+            .arg(&package)
+            .status();
+
+        match &status {
+            Ok(s) => {
+                if let Some(code) = s.code() {
+                    println!("\n[exit code: {}]", code);
+                } else {
+                    println!("\n[process terminated by signal]");
+                }
+            }
+            Err(e) => {
+                println!("\n[failed to execute brew: {}]", e);
+            }
+        }
+
+        println!("\nPress Enter to return to sbrs...");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        match status {
+            Ok(s) if s.success() => {
+                self.set_integration_enabled(&key, true);
+                self.set_status(format!("installed {} with brew", package));
+            }
+            Ok(_) => {
+                self.set_status(format!("brew install failed for {}", package));
+            }
+            Err(_) => {
+                self.set_status(format!("failed to run brew for {}", package));
+            }
+        }
+
+        self.refresh_integration_rows_cache();
+        self.mode = AppMode::Integrations;
+        self.clear_integration_install_prompt();
+        Ok(())
+    }
+
     fn integration_probe(cmd: &str) -> (bool, String) {
         if let Ok(out) = Command::new("which").arg(cmd).output() {
             if out.status.success() {
@@ -6468,7 +6686,7 @@ fn main() -> io::Result<()> {
                     app.integration_selected = integrations.len() - 1;
                 }
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ navigate  Space toggle  Tab/Shift+Tab switch tabs  Esc/i/q close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("↑↓ navigate  Space toggle  Enter install missing  Tab/Shift+Tab switch tabs  Esc/i/q close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, row) in integrations.iter().enumerate() {
@@ -6711,6 +6929,60 @@ fn main() -> io::Result<()> {
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
                         .block(Block::default().borders(Borders::ALL).title(" Confirm Extract ")),
+                    confirm_area,
+                );
+            } else if app.mode == AppMode::ConfirmIntegrationInstall {
+                let area = f.size();
+                let key = app.integration_install_key.clone().unwrap_or_else(|| "(unknown)".to_string());
+                let package = app.integration_install_package.clone().unwrap_or_else(|| "(unknown)".to_string());
+                let brew_display = app
+                    .integration_install_brew_path
+                    .clone()
+                    .unwrap_or_else(|| "brew (not found)".to_string());
+
+                let mut msg_lines: Vec<String> = vec![
+                    "Install missing integration?".to_string(),
+                    String::new(),
+                    format!(" Integration: {}", key),
+                    format!(" Package:     {}", package),
+                    format!(" Command:     {} install {}", brew_display, package),
+                    String::new(),
+                ];
+
+                if app.integration_install_brew_path.is_none() {
+                    msg_lines.push("Homebrew is not installed; setup guidance will be shown first.".to_string());
+                    msg_lines.push(String::new());
+                }
+
+                msg_lines.push("  y = install    n / Esc = cancel".to_string());
+
+                let msg = msg_lines.join("\n");
+                let content_w = msg_lines
+                    .iter()
+                    .map(|line| line.chars().count() as u16)
+                    .max()
+                    .unwrap_or(36);
+                let content_h = msg_lines.len() as u16;
+                let max_w = area.width.saturating_sub(4).max(1);
+                let max_h = area.height.saturating_sub(4).max(1);
+                let dialog_w = (content_w + 2)
+                    .max(56)
+                    .min(max_w);
+                let dialog_h = (content_h + 2)
+                    .max(8)
+                    .min(max_h);
+                let confirm_area = Rect::new(
+                    (area.width.saturating_sub(dialog_w)) / 2,
+                    (area.height.saturating_sub(dialog_h)) / 2,
+                    dialog_w,
+                    dialog_h,
+                );
+                f.render_widget(Clear, confirm_area);
+                f.render_widget(
+                    Paragraph::new(msg)
+                        .wrap(Wrap { trim: true })
+                        .style(Style::default().fg(Color::Rgb(140, 200, 255)))
+                        .block(Block::default().borders(Borders::ALL).title(" Install Integration ")),
                     confirm_area,
                 );
             } else if app.mode == AppMode::ConfirmDelete {
@@ -7870,6 +8142,9 @@ fn main() -> io::Result<()> {
                             }
                             app.refresh_integration_rows_cache();
                         }
+                        KeyCode::Enter => {
+                            app.begin_integration_install_prompt_for_selected();
+                        }
                         KeyCode::Tab => {
                             app.panel_tab = 0;
                             app.help_scroll_offset = 0;
@@ -8065,6 +8340,18 @@ fn main() -> io::Result<()> {
                         app.archive_extract_targets.clear();
                         app.mode = AppMode::Browsing;
                         app.set_status("extract cancelled");
+                    }
+                    _ => {}
+                },
+                AppMode::ConfirmIntegrationInstall => match key.code {
+                    KeyCode::Char('y') => {
+                        app.confirm_integration_install()?;
+                        terminal.clear()?;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        app.mode = AppMode::Integrations;
+                        app.clear_integration_install_prompt();
+                        app.set_status("integration install cancelled");
                     }
                     _ => {}
                 },
