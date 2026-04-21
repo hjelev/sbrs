@@ -18,10 +18,12 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 - SSH/rclone/local-media mount picker
 - Age file protection/decryption (`.age`) with `p`
 - Clipboard full-path copy via `Ctrl+c` (`wl-copy`/`xclip`/`xsel`/`pbcopy`)
-- Integration manager (`i`) to enable/disable optional integrations
+- Integration manager (`I`) to enable/disable optional integrations
+- Install-missing flow in Integrations (`Enter` on missing item -> confirm -> Homebrew install on macOS/Linux)
 - Tabbed Help/Search/Bookmarks/Remote Mounts/Sorting/Integrations overlays (`Tab` / `Shift+Tab`)
 - Built-in async Search overlay with filename/content scope, regex support, and highlighted matches
 - In-app command runner (`;`) with "press any key to return" pause
+- CLI list mode: `-l`, `-la`, and optional `--total-size` recursive size/% columns
 - Writes last directory to `/tmp/sb_path` on exit for shell integration
 
 ## Build and Run
@@ -42,6 +44,34 @@ Release binary path:
 ```text
 target/release/sbrs
 ```
+
+List mode examples:
+
+```bash
+# Current directory
+sbrs -l
+
+# Include hidden entries
+sbrs -la
+
+# Recursive display size + percent share columns
+sbrs -l --total-size
+
+# Path can appear before or after --total-size
+sbrs -la /var/log --total-size
+sbrs --total-size -l /var/log
+```
+
+## CLI List Mode
+
+- `-l [PATH]`: list directory entries and exit.
+- `-la [PATH]`: same as `-l`, but includes hidden files.
+- `--total-size`: when used with `-l` or `-la`, shows recursive display size for each entry and a `%` column with that entry's share of the listed total.
+
+Notes:
+
+- `PATH` is optional and can be placed after `-l`/`-la` or after `--total-size`.
+- The list output reuses the file manager's auto-calculated owner/group column widths for consistent alignment.
 
 ## Installation
 
@@ -83,7 +113,8 @@ Use the installer there if you want the fastest setup without building from sour
 - `g`: content search (`rg`, optional `fzf` handoff; falls back to built-in Search content mode when `rg` is missing)
 - `;`: open command prompt, run shell command, then wait for keypress before returning to TUI
 - `S`: SSH/rclone remote picker
-- `i`: integrations panel
+- `i`: split shell (left) + `less` preview (right 30%)
+- `I`: integrations panel
 - `b`: bookmarks panel
 - `Ctrl+z`: drop to interactive shell in current directory
 - `Tab` (in browsing): edit current path inline
@@ -123,7 +154,9 @@ Required behavior:
 - `less`: file viewing fallback
 - `$EDITOR`: file editing command (defaults to `nano` if unset)
 
-Optional integrations (auto-detected, toggle in `i` panel):
+Optional integrations (auto-detected, toggle in `I` panel):
+
+- In the Integrations panel, pressing `Enter` on a missing integration asks for confirmation and can install with Homebrew when available (macOS and Linux/Homebrew).
 
 - VCS: `git`
 - Viewers/previews: `bat`, `glow`, `jnv`, `csvlens`, `hexyl`, `chafa`, `viu`, `sox`, `pdftotext`, `asciinema`

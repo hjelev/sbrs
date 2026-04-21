@@ -5033,7 +5033,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
             IntegrationSpec { key: "sshfs", description: "mount SSH hosts via S picker", category: "network", required: false },
             IntegrationSpec { key: "rclone", description: "mount rclone remotes via S picker", category: "network", required: false },
-            IntegrationSpec { key: "tmux", description: "split shell + less preview (I)", category: "terminal", required: false },
+            IntegrationSpec { key: "tmux", description: "split shell + less preview (i)", category: "terminal", required: false },
             IntegrationSpec { key: "rg", description: "content search, fzf preview if avail (g)", category: "search", required: false },
             IntegrationSpec { key: "fzf", description: "fuzzy file search (f)", category: "search", required: false },
             IntegrationSpec { key: "wl-copy", description: "Wayland clipboard backend used by Ctrl+c full-path copy", category: "clipboard", required: false },
@@ -5633,7 +5633,7 @@ fn named_dir_icon(name: &str) -> Option<(&'static str, (u8, u8, u8))> {
     }
 }
 
-fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Result<()> {
+fn list_current_directory(include_hidden: bool, include_total_size: bool, path: Option<&str>) -> io::Result<()> {
     let current_dir = if let Some(p) = path {
         std::path::PathBuf::from(p)
     } else {
@@ -5644,26 +5644,23 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
     let show_icons = env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true);
     let term_w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
     let show_date = term_w >= 90;
-    let show_size = term_w >= 70;
+    let show_size = term_w >= 70 || include_total_size;
+    let show_pct = include_total_size && show_size;
     let show_meta = term_w >= 50;
 
     let date_width = 16usize;
     let size_width = 6usize;
-    let perms_width = 10usize;
-    let group_width = 8usize;
-    let owner_width = 10usize;
+    let pct_width = 6usize;
+    let perms_width = 11usize;
 
-    let mut reserved = 0usize;
-    if show_meta {
-        reserved += perms_width + group_width + owner_width + 3;
+    struct ListRowData {
+        entry: fs::DirEntry,
+        path: PathBuf,
+        meta: Option<fs::Metadata>,
+        owner: String,
+        group: String,
+        total_display_bytes: Option<u64>,
     }
-    if show_size {
-        reserved += size_width + 1;
-    }
-    if show_date {
-        reserved += date_width + 1;
-    }
-    let name_width = term_w.saturating_sub(reserved).max(20);
 
     fn rt_to_ct_color(color: ratatui::style::Color) -> CtColor {
         match color {
@@ -5742,9 +5739,75 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
 
     entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
 
+    let mut rows: Vec<ListRowData> = Vec::with_capacity(entries.len());
+    let mut group_width = 1usize;
+    let mut owner_width = 1usize;
     for entry in entries {
         let path = entry.path();
         let meta = entry.metadata().ok();
+        let owner = meta
+            .as_ref()
+            .map(App::parse_owner)
+            .unwrap_or_else(|| "-".to_string());
+        let group = meta
+            .as_ref()
+            .map(App::parse_group)
+            .unwrap_or_else(|| "-".to_string());
+
+        group_width = group_width.max(group.chars().count());
+        owner_width = owner_width.max(owner.chars().count());
+
+        let total_display_bytes = if include_total_size {
+            Some(App::compute_total_display_bytes(&path).unwrap_or(0))
+        } else {
+            None
+        };
+
+        rows.push(ListRowData {
+            entry,
+            path,
+            meta,
+            owner,
+            group,
+            total_display_bytes,
+        });
+    }
+
+    group_width = group_width.min(16).max(1);
+    owner_width = owner_width.min(20).max(1);
+
+    let mut reserved = 0usize;
+    if show_meta {
+        reserved += perms_width + group_width + owner_width + 3;
+    }
+    if show_size {
+        reserved += size_width + 1;
+    }
+    if show_pct {
+        reserved += pct_width + 1;
+    }
+    if show_date {
+        reserved += date_width + 1;
+    }
+    let name_width = term_w.saturating_sub(reserved).max(20);
+
+    let total_listing_display_bytes = if include_total_size {
+        Some(
+            rows.iter()
+                .map(|row| row.total_display_bytes.unwrap_or(0))
+                .fold(0u64, |acc, v| acc.saturating_add(v)),
+        )
+    } else {
+        None
+    };
+
+    for row in rows {
+        let path = row.path;
+        let meta = row.meta;
+        let owner = row.owner;
+        let group = row.group;
+        let entry_total_bytes = row.total_display_bytes;
+        let entry = row.entry;
         let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
         let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
         let is_dir = path.is_dir();
@@ -5840,21 +5903,37 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
                 .unwrap_or_else(|| "----------".to_string());
             let owner = meta
                 .as_ref()
-                .map(App::parse_owner)
+                .map(|_| owner.clone())
                 .unwrap_or_else(|| "-".to_string());
             let group = meta
                 .as_ref()
-                .map(App::parse_group)
+                .map(|_| group.clone())
                 .unwrap_or_else(|| "-".to_string());
             let perms_col = format!("{:<width$}", truncate_to(&perms, perms_width), width = perms_width);
             let group_col = format!("{:>width$}", truncate_to(&group, group_width), width = group_width);
             let owner_col = format!("{:<width$}", truncate_to(&owner, owner_width), width = owner_width);
 
-            let size = meta
-                .as_ref()
-                .map(|m| if m.is_dir() { "-".to_string() } else { App::format_size(m.len()) })
-                .unwrap_or_else(|| "-".to_string());
+            let size = if include_total_size {
+                App::format_size(entry_total_bytes.unwrap_or(0))
+            } else {
+                meta
+                    .as_ref()
+                    .map(|m| if m.is_dir() { "-".to_string() } else { App::format_size(m.len()) })
+                    .unwrap_or_else(|| "-".to_string())
+            };
             let size_col = format!("{:>width$}", size, width = size_width);
+
+            let pct_col = if show_pct {
+                match (total_listing_display_bytes, entry_total_bytes) {
+                    (Some(total), Some(entry_bytes)) if total > 0 => {
+                        let pct = (entry_bytes as f64 * 100.0) / (total as f64);
+                        format!("{:>5.0}%", pct)
+                    }
+                    _ => format!("{:>width$}", "-", width = pct_width),
+                }
+            } else {
+                String::new()
+            };
 
             let date = meta
                 .as_ref()
@@ -5863,44 +5942,63 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
                 .unwrap_or_else(|| "-".to_string());
             let date_col = format!("{:<width$}", truncate_to(&date, date_width), width = date_width);
 
-            if show_meta && show_size && show_date {
-                println!(
-                    "{} {} {} {} {} {}",
-                    styled_name,
-                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(size_col).with(CtColor::Green),
-                    style(date_col).with(CtColor::Rgb { r: 120, g: 190, b: 210 })
-                );
-            } else if show_meta && show_size {
-                println!(
-                    "{} {} {} {} {}",
-                    styled_name,
-                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(size_col).with(CtColor::Green)
-                );
-            } else if show_meta {
-                println!(
-                    "{} {} {} {}",
-                    styled_name,
+            print!("{}", styled_name);
+            if show_meta {
+                print!(
+                    " {} {} {}",
                     style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
                     style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
                     style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 })
                 );
-            } else if show_size {
-                println!("{} {}", styled_name, style(size_col).with(CtColor::Green));
-            } else {
-                println!("{}", styled_name);
             }
+            if show_size {
+                print!(" {}", style(size_col).with(CtColor::Green));
+            }
+            if show_pct {
+                print!(" {}", style(pct_col).with(CtColor::Rgb { r: 220, g: 200, b: 120 }));
+            }
+            if show_date {
+                print!(" {}", style(date_col).with(CtColor::Rgb { r: 120, g: 190, b: 210 }));
+            }
+            println!();
         } else {
             println!("{} {}", styled_icon, styled_name);
         }
     }
 
     Ok(())
+}
+
+fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Option<&'a str>)> {
+    let mut list_mode_seen = false;
+    let mut include_hidden = false;
+    let mut include_total_size = false;
+    let mut list_path: Option<&str> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "-l" => {
+                list_mode_seen = true;
+            }
+            "-la" => {
+                list_mode_seen = true;
+                include_hidden = true;
+            }
+            "--total-size" => {
+                include_total_size = true;
+            }
+            other if !other.starts_with('-') && list_path.is_none() => {
+                list_path = Some(other);
+            }
+            _ => {}
+        }
+    }
+
+    if list_mode_seen {
+        Some((include_hidden, include_total_size, list_path))
+    } else {
+        None
+    }
 }
 
 fn print_version() {
@@ -5948,8 +6046,9 @@ fn print_help() {
         "{}",
         style("Options:").with(CtColor::Rgb { r: 125, g: 205, b: 255 }).attribute(Attribute::Bold)
     );
-    println!("  -l             List current folder and exit");
-    println!("  -la            List current folder including hidden files and exit");
+    println!("  -l [PATH]      List folder and exit");
+    println!("  -la [PATH]     List folder including hidden files and exit");
+    println!("  --total-size   With -l/-la: recursive size + percent columns");
     println!("  -h, --help     Show this help message");
     println!("  -V, --version  Show app name and current version");
 }
@@ -5964,13 +6063,8 @@ fn main() -> io::Result<()> {
         print_version();
         return Ok(());
     }
-    if let Some(pos) = args.iter().position(|arg| arg == "-la") {
-        let path = args.get(pos + 1).map(|s| s.as_str());
-        return list_current_directory(true, path);
-    }
-    if let Some(pos) = args.iter().position(|arg| arg == "-l") {
-        let path = args.get(pos + 1).map(|s| s.as_str());
-        return list_current_directory(false, path);
+    if let Some((include_hidden, include_total_size, path)) = parse_list_mode_args(&args) {
+        return list_current_directory(include_hidden, include_total_size, path);
     }
 
     enable_raw_mode()?;
@@ -6554,8 +6648,8 @@ fn main() -> io::Result<()> {
                             ("g", "Content search with ripgrep"),
                             ("C", "Delta compare (marked vs cursor)"),
                             ("S", "Open SSH/rclone mount picker"),
-                            ("I", "Split shell (left) + less preview (right 30%)"),
-                            ("i", "Open integrations panel"),
+                            ("i", "Split shell (left) + less preview (right 30%)"),
+                            ("I", "Open integrations panel"),
                             ("b / 0-9", "Open bookmarks / jump to bookmark"),
                             ("", ""),
                         ],
@@ -6686,7 +6780,7 @@ fn main() -> io::Result<()> {
                     app.integration_selected = integrations.len() - 1;
                 }
                 let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ navigate  Space toggle  Enter install missing  Tab/Shift+Tab switch tabs  Esc/i/q close", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("↑↓ navigate  Space toggle  Enter install missing  Tab/Shift+Tab switch tabs  Esc/I/q close", Style::default().fg(Color::DarkGray))),
                     Line::from(""),
                 ];
                 for (i, row) in integrations.iter().enumerate() {
@@ -7330,7 +7424,7 @@ fn main() -> io::Result<()> {
                         app.open_selected_with_default_app()?;
                         terminal.clear()?;
                     }
-                    KeyCode::Char('I') => {
+                    KeyCode::Char('i') => {
                         app.open_split_shell_with_less()?;
                         terminal.clear()?;
                     }
@@ -7385,7 +7479,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('b') => { app.panel_tab = 2; app.mode = AppMode::Bookmarks; }
-                    KeyCode::Char('i') => {
+                    KeyCode::Char('I') => {
                         app.integration_selected = 0;
                         app.refresh_integration_rows_cache();
                         app.panel_tab = 5;
@@ -8116,7 +8210,7 @@ fn main() -> io::Result<()> {
                 }
                 AppMode::Integrations => {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                        KeyCode::Esc | KeyCode::Char('I') | KeyCode::Char('q') => {
                             app.mode = AppMode::Browsing;
                         }
                         KeyCode::BackTab => {
