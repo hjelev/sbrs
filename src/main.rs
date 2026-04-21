@@ -6896,7 +6896,7 @@ fn main() -> io::Result<()> {
                     ]),
                 ];
 
-                let sections: [(&str, [(&str, &str); 9]); 5] = [
+                let sections: [(&str, [(&str, &str); 10]); 5] = [
                     (
                         "Navigation",
                         [
@@ -6907,6 +6907,7 @@ fn main() -> io::Result<()> {
                             ("Left / Backspace", "Go to parent folder"),
                             ("Tab", "Edit current path"),
                             ("~", "Go to home folder"),
+                            ("", ""),
                             ("", ""),
                             ("", ""),
                         ],
@@ -6920,6 +6921,7 @@ fn main() -> io::Result<()> {
                             ("Ctrl+c", "Copy full path(s) to system clipboard"),
                             ("v", "Paste clipboard into current folder"),
                             ("m", "Move clipboard into current folder"),
+                            ("", ""),
                             ("", ""),
                             ("", ""),
                             ("", ""),
@@ -6937,6 +6939,7 @@ fn main() -> io::Result<()> {
                             ("x / p", "Toggle executable bit / protect/unprotect file"),
                             ("Z", "Create or extract archive"),
                             ("o", "Open with default GUI app"),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -6946,6 +6949,7 @@ fn main() -> io::Result<()> {
                             ("f", "Fuzzy search with fzf"),
                             ("g", "Content search with ripgrep"),
                             ("G", "Commit+push if repo is dirty (--amend enables -f push)"),
+                            ("H", "Pretty git log graph (git repos only)"),
                             ("C", "Delta compare (marked vs cursor)"),
                             ("S", "Open SSH/rclone mount picker"),
                             ("i", "Split shell (left) + less preview (right 30%)"),
@@ -6958,6 +6962,7 @@ fn main() -> io::Result<()> {
                         [
                             ("h", "Open help"),
                             ("q / Esc", "Quit Shell Buddy"),
+                            ("", ""),
                             ("", ""),
                             ("", ""),
                             ("", ""),
@@ -7630,6 +7635,52 @@ fn main() -> io::Result<()> {
                         app.help_scroll_offset = 0;
                         app.panel_tab = 0;
                         app.mode = AppMode::Help;
+                    }
+                    KeyCode::Char('H') => {
+                        if app.integration_active("git")
+                            && App::get_git_info(&app.current_dir).is_some()
+                        {
+                            let fmt = "%C(bold blue)%h%C(reset) - %C(cyan)%ad%C(reset) | %C(yellow)%d%C(reset) %C(white)%s%C(reset) %C(green)[%an]%C(reset)";
+                            disable_raw_mode()?;
+                            execute!(io::stdout(), LeaveAlternateScreen)?;
+                            execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+                            let log_child = Command::new("git")
+                                .args([
+                                    "log",
+                                    "--graph",
+                                    &format!("--pretty=format:{}", fmt),
+                                    "--date=short",
+                                    "--all",
+                                    "--color=always",
+                                ])
+                                .current_dir(&app.current_dir)
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::null())
+                                .spawn();
+                            if let Ok(child) = log_child {
+                                let _ = Command::new("less")
+                                    .args(["-R"])
+                                    .stdin(child.stdout.unwrap())
+                                    .status();
+                            } else {
+                                let _ = Command::new("git")
+                                    .args([
+                                        "log",
+                                        "--graph",
+                                        &format!("--pretty=format:{}", fmt),
+                                        "--date=short",
+                                        "--all",
+                                    ])
+                                    .current_dir(&app.current_dir)
+                                    .status();
+                            }
+                            execute!(io::stdout(), EnterAlternateScreen)?;
+                            execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+                            enable_raw_mode()?;
+                            terminal.clear()?;
+                        } else {
+                            app.set_status("not a git repository");
+                        }
                     }
                     KeyCode::Tab => {
                         let current = app.current_dir.to_string_lossy().into_owned();
