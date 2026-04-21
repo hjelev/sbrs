@@ -4786,6 +4786,153 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.set_status("no clipboard backend available (wl-copy/xclip/xsel/pbcopy)");
     }
 
+    fn read_system_clipboard_text(&self) -> Option<(String, &'static str)> {
+        for backend in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+            if !self.integration_active(backend) {
+                continue;
+            }
+
+            let output = match backend {
+                "wl-copy" => {
+                    if !Self::integration_probe("wl-paste").0 {
+                        continue;
+                    }
+                    Command::new("wl-paste")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .output()
+                }
+                "xclip" => Command::new("xclip")
+                    .args(["-selection", "clipboard", "-out"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output(),
+                "xsel" => Command::new("xsel")
+                    .args(["--clipboard", "--output"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output(),
+                "pbcopy" => {
+                    if !Self::integration_probe("pbpaste").0 {
+                        continue;
+                    }
+                    Command::new("pbpaste")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .output()
+                }
+                _ => continue,
+            };
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    return Some((String::from_utf8_lossy(&out.stdout).into_owned(), backend));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn write_system_clipboard_text(&self, payload: &str) -> Option<&'static str> {
+        for backend in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+            if !self.integration_active(backend) {
+                continue;
+            }
+
+            let mut cmd = match backend {
+                "wl-copy" => Command::new("wl-copy"),
+                "xclip" => {
+                    let mut cmd = Command::new("xclip");
+                    cmd.args(["-selection", "clipboard"]);
+                    cmd
+                }
+                "xsel" => {
+                    let mut cmd = Command::new("xsel");
+                    cmd.args(["--clipboard", "--input"]);
+                    cmd
+                }
+                "pbcopy" => Command::new("pbcopy"),
+                _ => continue,
+            };
+
+            let mut child = match cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let write_ok = child
+                .stdin
+                .take()
+                .map(|mut stdin| stdin.write_all(payload.as_bytes()).is_ok())
+                .unwrap_or(false);
+            if !write_ok {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return Some(backend);
+            }
+        }
+
+        None
+    }
+
+    fn edit_system_clipboard_via_temp_file(&mut self) -> io::Result<()> {
+        let Some((clipboard_text, read_backend)) = self.read_system_clipboard_text() else {
+            self.set_status("no clipboard backend available (wl-copy/xclip/xsel/pbcopy)");
+            return Ok(());
+        };
+
+        let tmp = Self::create_temp_selection_path("sbrs_clipboard_edit");
+        if fs::write(&tmp, clipboard_text.as_bytes()).is_err() {
+            self.set_status("failed to create temporary clipboard file");
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Show)?;
+
+        let edit_result = (|| -> io::Result<String> {
+            let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string()))
+                .arg(&tmp)
+                .status();
+            fs::read_to_string(&tmp)
+        })();
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        execute!(io::stdout(), Hide)?;
+
+        let _ = fs::remove_file(&tmp);
+
+        match edit_result {
+            Ok(updated_text) => {
+                if let Some(write_backend) = self.write_system_clipboard_text(&updated_text) {
+                    self.set_status(format!(
+                        "clipboard updated via {} (read via {})",
+                        write_backend, read_backend
+                    ));
+                } else {
+                    self.set_status("failed to write updated clipboard content");
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("clipboard edit failed: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
     fn compute_total_bytes(src: &PathBuf) -> io::Result<u64> {
         Self::compute_total_bytes_inner(src, true)
     }
@@ -6919,9 +7066,9 @@ fn main() -> io::Result<()> {
                             ("*", "Toggle all marks"),
                             ("c / F5", "Copy selected/marked item(s) to app clipboard"),
                             ("Ctrl+c", "Copy full path(s) to system clipboard"),
+                            ("B", "Edit system clipboard content via temporary file"),
                             ("v", "Paste clipboard into current folder"),
                             ("m", "Move clipboard into current folder"),
-                            ("", ""),
                             ("", ""),
                             ("", ""),
                             ("", ""),
@@ -7737,6 +7884,10 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('m') => {
                         app.begin_move();
+                    }
+                    KeyCode::Char('B') => {
+                        app.edit_system_clipboard_via_temp_file()?;
+                        terminal.clear()?;
                     }
                     KeyCode::Char('d') => {
                         if !app.entries.is_empty() {
