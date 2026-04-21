@@ -3982,6 +3982,53 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         (parts.join(" "), amend)
     }
 
+    fn preview_git_diff_and_confirm_commit(&mut self) -> io::Result<bool> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let delta_available = self.integration_active("delta");
+        if delta_available {
+            println!("$ git -c core.pager=delta -c delta.side-by-side=true -c delta.features=side-by-side diff");
+            let _ = Command::new("git")
+                .args([
+                    "-c",
+                    "core.pager=delta",
+                    "-c",
+                    "delta.side-by-side=true",
+                    "-c",
+                    "delta.features=side-by-side",
+                    "diff",
+                ])
+                .current_dir(&self.current_dir)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+        } else {
+            println!("$ git -c color.ui=always diff");
+            let _ = Command::new("git")
+                .args(["-c", "color.ui=always", "diff"])
+                .current_dir(&self.current_dir)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+            println!("\nTip: install delta for side-by-side colored diff preview.");
+        }
+
+        print!("\nDo you really want to commit these changes? [y/N]: ");
+        let _ = io::stdout().flush();
+        let mut answer = String::new();
+        let _ = io::stdin().read_line(&mut answer);
+        let confirmed = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        Ok(confirmed)
+    }
+
     fn run_git_commit_and_push(&mut self, commit_message: &str, amend: bool) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -7952,8 +7999,14 @@ fn main() -> io::Result<()> {
                         } else {
                             match App::get_git_info(&app.current_dir) {
                                 Some((_, true)) => {
-                                    app.begin_input_edit(AppMode::GitCommitMessage, String::new());
-                                    app.set_status("enter commit message (include --amend to amend+force-push)");
+                                    let confirmed = app.preview_git_diff_and_confirm_commit()?;
+                                    terminal.clear()?;
+                                    if confirmed {
+                                        app.begin_input_edit(AppMode::GitCommitMessage, String::new());
+                                        app.set_status("enter commit message (include --amend to amend+force-push)");
+                                    } else {
+                                        app.set_status("git commit cancelled");
+                                    }
                                 }
                                 Some((_, false)) => {
                                     app.set_status("repository is clean");
@@ -8084,6 +8137,7 @@ fn main() -> io::Result<()> {
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("git commit cancelled");
+                        terminal.clear()?;
                     }
                     KeyCode::Backspace => app.input_backspace(),
                     KeyCode::Delete => app.input_delete(),
