@@ -4,6 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use chrono::Local;
 use regex::Regex;
 use ratatui::{prelude::*, widgets::*};
 use std::{
@@ -333,6 +334,8 @@ struct App {
     note_edit_targets: Vec<String>,
     meta_group_width: usize,
     meta_owner_width: usize,
+    header_clock_minute_key: Option<i64>,
+    header_clock_text: String,
 }
 
 const ZIP_BASED_EXTENSIONS: &[&str] = &[
@@ -462,11 +465,24 @@ impl App {
             note_edit_targets: Vec::new(),
             meta_group_width: 1,
             meta_owner_width: 1,
+            header_clock_minute_key: None,
+            header_clock_text: String::new(),
         };
+        app.refresh_header_clock_if_needed();
         app.refresh_entries()?;
         app.request_notes_for_current_dir_once();
         app.request_git_info_for_current_dir_once();
         Ok(app)
+    }
+
+    fn refresh_header_clock_if_needed(&mut self) {
+        let now = Local::now();
+        let minute_key = now.timestamp().div_euclid(60);
+        if self.header_clock_minute_key == Some(minute_key) {
+            return;
+        }
+        self.header_clock_minute_key = Some(minute_key);
+        self.header_clock_text = now.format("%Y-%m-%d %H:%M").to_string();
     }
 
     fn age_encrypt_file_interactive(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
@@ -3377,6 +3393,7 @@ fn main() -> io::Result<()> {
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
 
     loop {
+        app.refresh_header_clock_if_needed();
         app.pump_archive_progress();
         app.pump_copy_total_prescan();
         app.pump_copy_progress();
@@ -3432,8 +3449,22 @@ fn main() -> io::Result<()> {
                     path_spans.push(Span::styled(")", branch_style));
                 }
             }
-            if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
-                let suffix_width = UnicodeWidthStr::width(total_suffix.as_str()) as u16;
+            let header_right = if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
+                Some((
+                    total_suffix,
+                    Style::default().fg(Color::Rgb(150, 220, 150)),
+                ))
+            } else if !app.folder_size_enabled {
+                Some((
+                    app.header_clock_text.clone(),
+                    Style::default().fg(Color::Rgb(120, 190, 210)),
+                ))
+            } else {
+                None
+            };
+
+            if let Some((header_right_text, header_right_style)) = header_right {
+                let suffix_width = UnicodeWidthStr::width(header_right_text.as_str()) as u16;
                 let right_width = suffix_width.saturating_add(1).min(chunks[0].width.saturating_sub(1));
                 if right_width > 0 {
                     let header_chunks = Layout::default()
@@ -3443,7 +3474,7 @@ fn main() -> io::Result<()> {
                     f.render_widget(Paragraph::new(Line::from(path_spans)), header_chunks[0]);
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled(total_suffix, Style::default().fg(Color::Rgb(150, 220, 150))),
+                            Span::styled(header_right_text, header_right_style),
                         ]))
                         .alignment(Alignment::Right),
                         header_chunks[1],
