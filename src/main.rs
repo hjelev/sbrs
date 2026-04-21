@@ -69,7 +69,7 @@ struct SshMount {
 
 struct GitInfoCache {
     path: PathBuf,
-    info: Option<(String, bool)>,
+    info: Option<(String, bool, Option<(String, u64)>)>,
 }
 
 #[derive(Clone)]
@@ -282,7 +282,7 @@ struct App {
     help_scroll_offset: u16,
     help_max_offset: u16,
     git_info_cache: Option<GitInfoCache>,
-    git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool)>)>>,
+    git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool, Option<(String, u64)>)>)>>,
     folder_size_enabled: bool,
     folder_size_rx: Option<Receiver<FolderSizeMsg>>,
     folder_size_scan_id: u64,
@@ -1319,7 +1319,7 @@ IFS= read -rsn1 _
         });
     }
 
-    fn cached_git_info_for_current_dir(&self) -> Option<(&str, bool)> {
+    fn cached_git_info_for_current_dir(&self) -> Option<(&str, bool, Option<(&str, u64)>)> {
         let cache = self.git_info_cache.as_ref()?;
         if cache.path != self.current_dir {
             return None;
@@ -1327,7 +1327,12 @@ IFS= read -rsn1 _
         cache
             .info
             .as_ref()
-            .map(|(branch, dirty)| (branch.as_str(), *dirty))
+            .map(|(branch, dirty, tag)| {
+                let tag_info = tag
+                    .as_ref()
+                    .map(|(name, ahead)| (name.as_str(), *ahead));
+                (branch.as_str(), *dirty, tag_info)
+            })
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -3982,6 +3987,53 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         (parts.join(" "), amend)
     }
 
+    fn preview_git_diff_and_confirm_commit(&mut self) -> io::Result<bool> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let delta_available = self.integration_active("delta");
+        if delta_available {
+            println!("$ git -c core.pager=delta -c delta.side-by-side=true -c delta.features=side-by-side diff");
+            let _ = Command::new("git")
+                .args([
+                    "-c",
+                    "core.pager=delta",
+                    "-c",
+                    "delta.side-by-side=true",
+                    "-c",
+                    "delta.features=side-by-side",
+                    "diff",
+                ])
+                .current_dir(&self.current_dir)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+        } else {
+            println!("$ git -c color.ui=always diff");
+            let _ = Command::new("git")
+                .args(["-c", "color.ui=always", "diff"])
+                .current_dir(&self.current_dir)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+            println!("\nTip: install delta for side-by-side colored diff preview.");
+        }
+
+        print!("\nDo you really want to commit these changes? [y/N]: ");
+        let _ = io::stdout().flush();
+        let mut answer = String::new();
+        let _ = io::stdin().read_line(&mut answer);
+        let confirmed = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        Ok(confirmed)
+    }
+
     fn run_git_commit_and_push(&mut self, commit_message: &str, amend: bool) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -5045,7 +5097,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
-    fn get_git_info(path: &PathBuf) -> Option<(String, bool)> {
+    fn get_git_info(path: &PathBuf) -> Option<(String, bool, Option<(String, u64)>)> {
         let path_str = path.to_str()?;
 
         let branch = Command::new("git")
@@ -5087,7 +5139,39 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             _ => return None,
         };
 
-        Some((branch, is_dirty))
+        let latest_tag = Command::new("git")
+            .args(["-C", path_str, "describe", "--tags", "--abbrev=0"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if value.is_empty() { None } else { Some(value) }
+                } else {
+                    None
+                }
+            });
+
+        let tag_info = latest_tag.and_then(|tag| {
+            let ahead = Command::new("git")
+                .args(["-C", path_str, "rev-list", "--count", &format!("{}..HEAD", tag)])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        String::from_utf8_lossy(&out.stdout)
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            Some((tag, ahead))
+        });
+
+        Some((branch, is_dirty, tag_info))
     }
 
     fn integration_catalog() -> Vec<IntegrationSpec> {
@@ -6229,12 +6313,25 @@ fn main() -> io::Result<()> {
                 },
             ];
             if app.integration_enabled("git") {
-                if let Some((branch, is_dirty)) = app.cached_git_info_for_current_dir() {
+                if let Some((branch, is_dirty, tag_info)) = app.cached_git_info_for_current_dir() {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
                     path_spans.push(Span::styled(" (", branch_style));
                     path_spans.push(Span::styled(branch, branch_style));
                     if is_dirty {
                         path_spans.push(Span::styled("*", Style::default().fg(Color::White)));
+                    }
+                    if let Some((tag_name, ahead)) = tag_info {
+                        let at_style = Style::default().fg(Color::Rgb(120, 120, 120));
+                        let tag_style = Style::default().fg(Color::Rgb(80, 255, 120));
+                        let tag_text = if ahead > 0 {
+                            format!("{}+{}", tag_name, ahead)
+                        } else {
+                            tag_name.to_string()
+                        };
+                        path_spans.push(Span::styled(" ", branch_style));
+                        path_spans.push(Span::styled("@", at_style));
+                        path_spans.push(Span::styled(" ", branch_style));
+                        path_spans.push(Span::styled(tag_text, tag_style));
                     }
                     path_spans.push(Span::styled(")", branch_style));
                 }
@@ -7951,11 +8048,17 @@ fn main() -> io::Result<()> {
                             app.set_status("git not found in PATH");
                         } else {
                             match App::get_git_info(&app.current_dir) {
-                                Some((_, true)) => {
-                                    app.begin_input_edit(AppMode::GitCommitMessage, String::new());
-                                    app.set_status("enter commit message (include --amend to amend+force-push)");
+                                Some((_, true, _)) => {
+                                    let confirmed = app.preview_git_diff_and_confirm_commit()?;
+                                    terminal.clear()?;
+                                    if confirmed {
+                                        app.begin_input_edit(AppMode::GitCommitMessage, String::new());
+                                        app.set_status("enter commit message (include --amend to amend+force-push)");
+                                    } else {
+                                        app.set_status("git commit cancelled");
+                                    }
                                 }
-                                Some((_, false)) => {
+                                Some((_, false, _)) => {
                                     app.set_status("repository is clean");
                                 }
                                 None => {
@@ -8084,6 +8187,7 @@ fn main() -> io::Result<()> {
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("git commit cancelled");
+                        terminal.clear()?;
                     }
                     KeyCode::Backspace => app.input_backspace(),
                     KeyCode::Delete => app.input_delete(),
