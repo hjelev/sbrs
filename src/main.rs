@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{style, Attribute, Color as CtColor, Stylize},
@@ -790,10 +790,12 @@ IFS= read -rsn1 _
 
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Show)?;
         let decrypted = Self::age_decrypt_file_interactive(input, &tmp_path);
         if decrypted.is_err() {
             execute!(io::stdout(), EnterAlternateScreen)?;
             enable_raw_mode()?;
+            execute!(io::stdout(), Hide)?;
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_dir_all(&tmp_dir);
             self.set_status(format!("decrypt failed: {}", decrypted.err().unwrap_or_default()));
@@ -807,6 +809,7 @@ IFS= read -rsn1 _
         let result = Self::age_encrypt_file_interactive(&tmp_path, input);
         execute!(io::stdout(), EnterAlternateScreen)?;
         enable_raw_mode()?;
+        execute!(io::stdout(), Hide)?;
 
         let _ = fs::remove_file(&tmp_path);
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -3805,15 +3808,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         println!("$ {}", trimmed);
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let shell_name = shell.rsplit('/').next().unwrap_or("sh");
         let mut cmd = Command::new(&shell);
-        // Interactive mode loads shell startup files (e.g. .zshrc/.bashrc) so
-        // user-defined environment variables are available to executed commands.
-        if matches!(shell_name, "zsh" | "bash" | "fish") {
-            cmd.args(["-i", "-c", trimmed]);
-        } else {
-            cmd.args(["-c", trimmed]);
-        }
+        // Non-interactive mode avoids shell job-control side effects that can
+        // suspend sbrs when returning from the command runner.
+        cmd.args(["-c", trimmed]);
 
         let status = cmd.current_dir(&self.current_dir).status();
 
@@ -3830,11 +3828,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             }
         }
 
-        println!("\nPress any key to return to sbrs...");
+        println!("\nPress Enter to return to sbrs...");
         let _ = io::stdout().flush();
-        enable_raw_mode()?;
-        let _ = event::read();
-        disable_raw_mode()?;
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
 
         execute!(io::stdout(), EnterAlternateScreen)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
@@ -7321,12 +7318,14 @@ fn main() -> io::Result<()> {
                                 }
                             } else {
                                 disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), Show)?;
                                 if !path.is_dir() && App::is_binary_file(&path) && app.integration_active("hexedit") {
                                     let _ = Command::new("hexedit").arg(&path).status();
                                 } else {
                                     let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string())).arg(&path).status();
                                 }
                                 enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), Hide)?;
                                 terminal.clear()?;
                                 app.refresh_entries_or_status();
                             }
