@@ -78,7 +78,9 @@ struct EntryRenderCache {
     icon_glyph: String,
     icon_style: Style,
     name_style: Style,
-    meta_col: String,
+    perms_col: String,
+    group_col: String,
+    owner_col: String,
     size_col: String,
     size_bytes: Option<u64>,
     date_col: String,
@@ -910,8 +912,9 @@ IFS= read -rsn1 _
 
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
+        let gid_cache = App::build_gid_cache(&self.entries);
             self.entry_render_cache = self.entries.iter()
-            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
+            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
 
         self.marked_indices = self
@@ -1189,7 +1192,7 @@ IFS= read -rsn1 _
     }
 
     fn reset_folder_size_columns(&mut self) {
-        let size_width = 8usize;
+        let size_width = 6usize;
         for (idx, entry) in self.entries.iter().enumerate() {
             if entry.path().is_dir() {
                 self.entry_render_cache[idx].size_col = format!("{:>width$}", "-", width = size_width);
@@ -1344,7 +1347,12 @@ IFS= read -rsn1 _
         self.table_state.select(Some(next));
     }
 
-    fn build_entry_render_cache(entry: &fs::DirEntry, config: EntryRenderConfig, uid_cache: &HashMap<u32, String>) -> EntryRenderCache {
+    fn build_entry_render_cache(
+        entry: &fs::DirEntry,
+        config: EntryRenderConfig,
+        uid_cache: &HashMap<u32, String>,
+        gid_cache: &HashMap<u32, String>,
+    ) -> EntryRenderCache {
         let path = entry.path();
         let meta = entry.metadata().ok();
         let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
@@ -1414,11 +1422,13 @@ IFS= read -rsn1 _
             name_style = name_style.add_modifier(Modifier::DIM);
         }
 
-        let meta_width = 18usize;
-        let size_width = 8usize;
+        let perms_width = 10usize;
+        let group_width = 8usize;
+        let owner_width = 10usize;
+        let size_width = 6usize;
         let date_width = 16usize;
         let perms = meta.as_ref().map(App::parse_permissions).unwrap_or_else(|| "----------".to_string());
-        // Look up owner name from pre-built per-refresh cache — one NSS lookup per unique UID.
+        // Look up owner/group names from per-refresh caches.
         let owner = meta.as_ref().map(|m| {
             #[cfg(unix)] {
                 use std::os::unix::fs::MetadataExt;
@@ -1427,14 +1437,27 @@ IFS= read -rsn1 _
             }
             #[cfg(not(unix))] { "-".to_string() }
         }).unwrap_or_else(|| "-".to_string());
-        let perms_len = perms.chars().count();
-        let owner_width = meta_width.saturating_sub(perms_len + 1);
+        let group = meta.as_ref().map(|m| {
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                let gid = m.gid();
+                gid_cache.get(&gid).cloned().unwrap_or_else(|| gid.to_string())
+            }
+            #[cfg(not(unix))] { "-".to_string() }
+        }).unwrap_or_else(|| "-".to_string());
+        let perms_col = format!("{:<width$}", perms, width = perms_width);
+        let group_trimmed = if group.chars().count() > group_width {
+            group.chars().take(group_width).collect::<String>()
+        } else {
+            group
+        };
         let owner_trimmed = if owner.chars().count() > owner_width {
             owner.chars().take(owner_width).collect::<String>()
         } else {
             owner
         };
-        let meta_col = format!("{:<width$}", format!("{} {}", perms, owner_trimmed), width = meta_width);
+        let group_col = format!("{:>width$}", group_trimmed, width = group_width);
+        let owner_col = format!("{:<width$}", owner_trimmed, width = owner_width);
         let size_bytes = meta.as_ref().and_then(|m| if m.is_dir() { None } else { Some(Self::display_leaf_size(m)) });
         let size = size_bytes
             .map(App::format_size)
@@ -1452,7 +1475,9 @@ IFS= read -rsn1 _
             icon_glyph,
             icon_style,
             name_style,
-            meta_col,
+            perms_col,
+            group_col,
+            owner_col,
             size_col,
             size_bytes,
             date_col,
@@ -3411,8 +3436,9 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.entries = entries;
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
+        let gid_cache = App::build_gid_cache(&self.entries);
             self.entry_render_cache = self.entries.iter()
-            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache))
+            .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
         self.refresh_current_dir_free_space();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
@@ -5234,6 +5260,19 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn parse_group(meta: &fs::Metadata) -> String {
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            let gid = meta.gid();
+            users::get_group_by_gid(gid)
+                .map(|group| group.name().to_string_lossy().into_owned())
+                .unwrap_or_else(|| gid.to_string())
+        }
+        #[cfg(not(unix))] {
+            "-".to_string()
+        }
+    }
+
     /// Build a UID → username map for all entries in the current directory.
     /// Performs at most one NSS lookup per unique UID, so large directories owned
     /// by the same user pay exactly one lookup regardless of file count.
@@ -5248,6 +5287,26 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                         users::get_user_by_uid(uid)
                             .map(|u| u.name().to_string_lossy().into_owned())
                             .unwrap_or_else(|| uid.to_string())
+                    });
+                }
+            }
+            map
+        }
+        #[cfg(not(unix))] { HashMap::new() }
+    }
+
+    /// Build a GID -> group-name map for all entries in the current directory.
+    fn build_gid_cache(entries: &[fs::DirEntry]) -> HashMap<u32, String> {
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            let mut map: HashMap<u32, String> = HashMap::new();
+            for entry in entries {
+                if let Ok(meta) = entry.metadata() {
+                    let gid = meta.gid();
+                    map.entry(gid).or_insert_with(|| {
+                        users::get_group_by_gid(gid)
+                            .map(|g| g.name().to_string_lossy().into_owned())
+                            .unwrap_or_else(|| gid.to_string())
                     });
                 }
             }
@@ -5368,12 +5427,14 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
     let show_meta = term_w >= 50;
 
     let date_width = 16usize;
-    let size_width = 8usize;
-    let meta_width = 20usize;
+    let size_width = 6usize;
+    let perms_width = 10usize;
+    let group_width = 8usize;
+    let owner_width = 10usize;
 
     let mut reserved = 0usize;
     if show_meta {
-        reserved += meta_width + 1;
+        reserved += perms_width + group_width + owner_width + 3;
     }
     if show_size {
         reserved += size_width + 1;
@@ -5560,8 +5621,13 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
                 .as_ref()
                 .map(App::parse_owner)
                 .unwrap_or_else(|| "-".to_string());
-            let meta_col = truncate_to(&format!("{} {}", perms, owner), meta_width);
-            let meta_col = format!("{:<width$}", meta_col, width = meta_width);
+            let group = meta
+                .as_ref()
+                .map(App::parse_group)
+                .unwrap_or_else(|| "-".to_string());
+            let perms_col = format!("{:<width$}", truncate_to(&perms, perms_width), width = perms_width);
+            let group_col = format!("{:>width$}", truncate_to(&group, group_width), width = group_width);
+            let owner_col = format!("{:<width$}", truncate_to(&owner, owner_width), width = owner_width);
 
             let size = meta
                 .as_ref()
@@ -5578,24 +5644,30 @@ fn list_current_directory(include_hidden: bool, path: Option<&str>) -> io::Resul
 
             if show_meta && show_size && show_date {
                 println!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {} {}",
                     styled_name,
-                    style(meta_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
                     style(size_col).with(CtColor::Green),
                     style(date_col).with(CtColor::Rgb { r: 120, g: 190, b: 210 })
                 );
             } else if show_meta && show_size {
                 println!(
-                    "{} {} {}",
+                    "{} {} {} {} {}",
                     styled_name,
-                    style(meta_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
                     style(size_col).with(CtColor::Green)
                 );
             } else if show_meta {
                 println!(
-                    "{} {}",
+                    "{} {} {} {}",
                     styled_name,
-                    style(meta_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 })
+                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 })
                 );
             } else if show_size {
                 println!("{} {}", styled_name, style(size_col).with(CtColor::Green));
@@ -5771,11 +5843,13 @@ fn main() -> io::Result<()> {
             let show_size = term_w >= 70;
             let show_meta = term_w >= 50;
             let show_pct = app.folder_size_enabled && show_size;
-            let meta_width = 18usize;
-            let size_width = 8usize;
+            let perms_width = 10usize;
+            let group_width = 8usize;
+            let owner_width = 10usize;
+            let size_width = 6usize;
             let pct_width = 6usize;
             let date_width = 16usize;
-            let reserved_width = (if show_meta { meta_width } else { 0 })
+            let reserved_width = (if show_meta { perms_width + group_width + owner_width } else { 0 })
                 + (if show_size { size_width } else { 0 })
                 + (if show_pct { pct_width } else { 0 })
                 + (if show_date { date_width } else { 0 });
@@ -5865,13 +5939,17 @@ fn main() -> io::Result<()> {
                     }
                     spans
                 }))];
-                if show_meta { cells.push(Cell::from(Span::styled(entry_cache.meta_col.as_str(), meta_style))); }
+                if show_meta {
+                    cells.push(Cell::from(Span::styled(entry_cache.perms_col.as_str(), meta_style)));
+                    cells.push(Cell::from(Span::styled(entry_cache.group_col.as_str(), meta_style)));
+                    cells.push(Cell::from(Span::styled(entry_cache.owner_col.as_str(), meta_style)));
+                }
                 if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
                 if show_pct {
                     let pct_col = match (app.current_dir_total_size_bytes, entry_cache.size_bytes) {
                         (Some(total), Some(entry_bytes)) if total > 0 => {
                             let pct = (entry_bytes as f64 * 100.0) / (total as f64);
-                            format!("{:>5.1}%", pct)
+                            format!("{:>5.0}%", pct)
                         }
                         _ => format!("{:>width$}", "-", width = pct_width),
                     };
@@ -5882,7 +5960,11 @@ fn main() -> io::Result<()> {
             }).collect();
 
             let mut col_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
-            if show_meta { col_constraints.push(Constraint::Length(meta_width as u16)); }
+            if show_meta {
+                col_constraints.push(Constraint::Length(perms_width as u16));
+                col_constraints.push(Constraint::Length(group_width as u16));
+                col_constraints.push(Constraint::Length(owner_width as u16));
+            }
             if show_size { col_constraints.push(Constraint::Length(size_width as u16)); }
             if show_pct { col_constraints.push(Constraint::Length(pct_width as u16)); }
             if show_date { col_constraints.push(Constraint::Length(date_width as u16)); }
