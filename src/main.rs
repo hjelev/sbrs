@@ -1339,6 +1339,80 @@ IFS= read -rsn1 _
         self.status_message = msg.into();
     }
 
+    fn status_icon_for_message(&self, msg: &str) -> &'static str {
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("not found")
+            || lower.contains("invalid")
+        {
+            ""
+        } else if lower.contains("cancel") {
+            "󰜺"
+        } else if lower.starts_with("selected:") {
+            "󰱒"
+        } else if lower.contains("git")
+            || lower.contains("commit")
+            || lower.contains("branch")
+            || lower.contains("tag")
+        {
+            ""
+        } else if lower.contains("archive")
+            || lower.contains("extract")
+            || lower.contains("zip")
+            || lower.contains("tar")
+            || lower.contains("7z")
+            || lower.contains("rar")
+        {
+            ""
+        } else if lower.contains("copy")
+            || lower.contains("paste")
+            || lower.contains("clipboard")
+            || lower.contains("transfer")
+            || lower.contains("move")
+        {
+            ""
+        } else if lower.contains("search") || lower.contains("find") || lower.contains("index") {
+            "󰍉"
+        } else if lower.contains("mount") || lower.contains("ssh") || lower.contains("rclone") {
+            "󰖟"
+        } else if lower.contains("created")
+            || lower.contains("saved")
+            || lower.contains("installed")
+            || lower.contains("opened")
+            || lower.contains("updated")
+            || lower.contains("toggled")
+            || lower.contains("complete")
+        {
+            ""
+        } else {
+            ""
+        }
+    }
+
+    fn decorate_footer_message(&self, msg: &str) -> String {
+        if !self.nerd_font_active {
+            return msg.to_string();
+        }
+
+        let trimmed = msg.trim_start();
+        if trimmed.starts_with("")
+            || trimmed.starts_with("󰜺")
+            || trimmed.starts_with("󰱒")
+            || trimmed.starts_with("")
+            || trimmed.starts_with("")
+            || trimmed.starts_with("")
+            || trimmed.starts_with("󰍉")
+            || trimmed.starts_with("󰖟")
+            || trimmed.starts_with("")
+            || trimmed.starts_with("")
+        {
+            return msg.to_string();
+        }
+
+        format!("{} {}", self.status_icon_for_message(msg), msg)
+    }
+
     fn begin_input_edit(&mut self, mode: AppMode, initial: String) {
         self.mode = mode;
         self.input_buffer = initial;
@@ -3990,6 +4064,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     fn preview_git_diff_and_confirm_commit(&mut self) -> io::Result<bool> {
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
 
         let delta_available = self.integration_active("delta");
         if delta_available {
@@ -7363,7 +7438,7 @@ fn main() -> io::Result<()> {
                 left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
             }
             let left_status = left_status_parts.join(" │ ");
-            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit I:Split s:Size o:Open-GUI h:Help q:Quit";
+            let right_status = "c:Copy v:paste m:Move r:Rename d:Del e:Edit s:Size o:Open-GUI f:Find g:Grep h:Help q:Quit";
             let width = chunks[1].width as usize;
             let left_len = left_status.chars().count();
             let right_len = right_status.chars().count();
@@ -7519,7 +7594,8 @@ fn main() -> io::Result<()> {
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let message = status_text.as_str();
+                let decorated = app.decorate_footer_message(&status_text);
+                let message = decorated.as_str();
                 let core = format!("─── {} ", message);
                 let core_len = core.chars().count();
                 let width = msg_area.width as usize;
