@@ -5140,7 +5140,15 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         };
 
         let latest_tag = Command::new("git")
-            .args(["-C", path_str, "describe", "--tags", "--abbrev=0"])
+            .args([
+                "-C",
+                path_str,
+                "for-each-ref",
+                "refs/tags",
+                "--sort=-v:refname",
+                "--count=1",
+                "--format=%(refname:short)",
+            ])
             .output()
             .ok()
             .and_then(|out| {
