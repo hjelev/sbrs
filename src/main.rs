@@ -159,6 +159,7 @@ enum AppMode {
     Browsing,
     PathEditing,
     CommandInput,
+    GitCommitMessage,
     InternalSearch,
     NoteEditing,
     Renaming,
@@ -3968,6 +3969,90 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Ok(())
     }
 
+    fn parse_git_commit_message(raw: &str) -> (String, bool) {
+        let mut amend = false;
+        let mut parts: Vec<&str> = Vec::new();
+        for token in raw.split_whitespace() {
+            if token == "--amend" {
+                amend = true;
+            } else {
+                parts.push(token);
+            }
+        }
+        (parts.join(" "), amend)
+    }
+
+    fn run_git_commit_and_push(&mut self, commit_message: &str, amend: bool) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let mut failed_step: Option<String> = None;
+        let mut push_forced = false;
+        let run_step = |args: &[&str], dir: &PathBuf| -> io::Result<bool> {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()?;
+            Ok(status.success())
+        };
+
+        println!("$ git add --all");
+        if !run_step(&["add", "--all"], &self.current_dir)? {
+            failed_step = Some("git add --all failed".to_string());
+        }
+
+        if failed_step.is_none() {
+            if amend {
+                println!("$ git commit -m \"{}\" --amend", commit_message);
+                if !run_step(&["commit", "-m", commit_message, "--amend"], &self.current_dir)? {
+                    failed_step = Some("git commit --amend failed".to_string());
+                }
+            } else {
+                println!("$ git commit -m \"{}\"", commit_message);
+                if !run_step(&["commit", "-m", commit_message], &self.current_dir)? {
+                    failed_step = Some("git commit failed".to_string());
+                }
+            }
+        }
+
+        if failed_step.is_none() {
+            if amend {
+                println!("$ git push origin HEAD -f");
+                push_forced = true;
+                if !run_step(&["push", "origin", "HEAD", "-f"], &self.current_dir)? {
+                    failed_step = Some("git push -f failed".to_string());
+                }
+            } else {
+                println!("$ git push origin HEAD");
+                if !run_step(&["push", "origin", "HEAD"], &self.current_dir)? {
+                    failed_step = Some("git push failed".to_string());
+                }
+            }
+        }
+
+        println!("\nPress Enter to return to sbrs...");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        if let Some(step) = failed_step {
+            self.set_status(step);
+        } else if push_forced {
+            self.set_status("amend commit pushed with -f");
+        } else {
+            self.set_status("commit pushed");
+        }
+
+        self.refresh_entries_or_status();
+        self.git_info_cache = None;
+        self.request_git_info_for_current_dir_once();
+        Ok(())
+    }
+
     fn run_zip_action(&mut self) {
         if self.archive_rx.is_some() {
             self.set_status("archive creation already in progress");
@@ -6680,12 +6765,12 @@ fn main() -> io::Result<()> {
                             ("s / Ctrl+s", "Toggle size calc / open sorting menu"),
                             ("f", "Fuzzy search with fzf"),
                             ("g", "Content search with ripgrep"),
+                            ("G", "Commit+push if repo is dirty (--amend enables -f push)"),
                             ("C", "Delta compare (marked vs cursor)"),
                             ("S", "Open SSH/rclone mount picker"),
                             ("i", "Split shell (left) + less preview (right 30%)"),
                             ("I", "Open integrations panel"),
                             ("b / 0-9", "Open bookmarks / jump to bookmark"),
-                            ("", ""),
                         ],
                     ),
                     (
@@ -6749,7 +6834,7 @@ fn main() -> io::Result<()> {
                         ),
                     help_area,
                 );
-            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput) {
+            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput | AppMode::GitCommitMessage) {
                 let area = f.size();
                 let rename_area = Rect::new(area.width/4, area.height/2 - 1, area.width/2, 3);
                 f.render_widget(Clear, rename_area);
@@ -6760,6 +6845,7 @@ fn main() -> io::Result<()> {
                     AppMode::ArchiveCreate => " Create Archive (Enter=Confirm, Esc=Cancel) ",
                     AppMode::NoteEditing => " Note (Enter=Save, Esc=Cancel) ",
                     AppMode::CommandInput => " Command (; Enter=Run, Esc=Cancel) ",
+                    AppMode::GitCommitMessage => " Commit Message (Enter=Commit+Push, Esc=Cancel) ",
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
@@ -7860,6 +7946,24 @@ fn main() -> io::Result<()> {
                             app.set_status("rg not found; opened Search in content mode");
                         }
                     }
+                    KeyCode::Char('G') => {
+                        if !app.integration_active("git") {
+                            app.set_status("git not found in PATH");
+                        } else {
+                            match App::get_git_info(&app.current_dir) {
+                                Some((_, true)) => {
+                                    app.begin_input_edit(AppMode::GitCommitMessage, String::new());
+                                    app.set_status("enter commit message (include --amend to amend+force-push)");
+                                }
+                                Some((_, false)) => {
+                                    app.set_status("repository is clean");
+                                }
+                                None => {
+                                    app.set_status("not a git repository");
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Char('f') => {
                         if app.integration_active("fzf") {
                             let tmp = App::create_temp_selection_path("sbrs_fzf_selection");
@@ -7948,6 +8052,38 @@ fn main() -> io::Result<()> {
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("command cancelled");
+                    }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.input_insert_char(c)
+                    }
+                    _ => {}
+                },
+                AppMode::GitCommitMessage => match key.code {
+                    KeyCode::Enter => {
+                        let raw = app.input_buffer.clone();
+                        let (commit_message, amend) = App::parse_git_commit_message(&raw);
+                        if commit_message.is_empty() {
+                            app.set_status("commit message cannot be empty");
+                        } else {
+                            app.clear_input_edit();
+                            app.mode = AppMode::Browsing;
+                            app.run_git_commit_and_push(&commit_message, amend)?;
+                            terminal.clear()?;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        app.clear_input_edit();
+                        app.mode = AppMode::Browsing;
+                        app.set_status("git commit cancelled");
                     }
                     KeyCode::Backspace => app.input_backspace(),
                     KeyCode::Delete => app.input_delete(),
