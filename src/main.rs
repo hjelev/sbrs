@@ -7066,7 +7066,7 @@ fn main() -> io::Result<()> {
                             ("*", "Toggle all marks"),
                             ("c / F5", "Copy selected/marked item(s) to app clipboard"),
                             ("Ctrl+c", "Copy full path(s) to system clipboard"),
-                            ("B", "Edit system clipboard content via temporary file"),
+                            ("E", "Edit system clipboard content via temporary file"),
                             ("v", "Paste clipboard into current folder"),
                             ("m", "Move clipboard into current folder"),
                             ("", ""),
@@ -7082,11 +7082,11 @@ fn main() -> io::Result<()> {
                             ("Ctrl+n", "Add/edit note for selected item(s)"),
                             ("Ctrl+z", "Drop to shell in current directory"),
                             ("F2 / r", "Rename or bulk rename"),
-                            ("d", "Delete selected/marked item(s)"),
+                            ("e / F4", "Edit file, or rename if selection is a folder"),
+                            ("d / Del", "Delete selected/marked item(s)"),
                             ("x / p", "Toggle executable bit / protect/unprotect file"),
                             ("Z", "Create or extract archive"),
                             ("o", "Open with default GUI app"),
-                            ("", ""),
                         ],
                     ),
                     (
@@ -7885,11 +7885,11 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('m') => {
                         app.begin_move();
                     }
-                    KeyCode::Char('B') => {
+                    KeyCode::Char('E') => {
                         app.edit_system_clipboard_via_temp_file()?;
                         terminal.clear()?;
                     }
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('d') | KeyCode::Delete => {
                         if !app.entries.is_empty() {
                             app.mode = AppMode::ConfirmDelete;
                         }
@@ -8389,7 +8389,10 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('e') | KeyCode::F(4) => {
                         if let Some(e) = app.entries.get(app.selected_index) {
                             let path = e.path();
-                            if App::is_age_protected_file(&path) {
+                            if path.is_dir() {
+                                let current_name = e.file_name().to_string_lossy().into_owned();
+                                app.begin_input_edit(AppMode::Renaming, current_name);
+                            } else if App::is_age_protected_file(&path) {
                                 if !app.integration_active("age") {
                                     app.set_status("age not found in PATH");
                                 } else if app.edit_age_file(&path)? {
