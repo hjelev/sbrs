@@ -2163,14 +2163,143 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Show)?;
         let _ = Command::new(&shell)
             .current_dir(&self.current_dir)
             .status();
         execute!(io::stdout(), EnterAlternateScreen)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
+        execute!(io::stdout(), Hide)?;
         self.set_status("returned from shell");
         self.refresh_entries_or_status();
+        Ok(())
+    }
+
+    fn open_path_in_view_mode(path: &PathBuf) -> io::Result<()> {
+        if Self::is_image_file(path) {
+            if Self::integration_probe("viu").0 {
+                let _ = Command::new("viu").arg(path).status();
+                return Ok(());
+            }
+            if Self::integration_probe("chafa").0 {
+                let _ = Command::new("chafa").arg(path).status();
+                return Ok(());
+            }
+        }
+
+        if Self::is_markdown_file(path) && Self::integration_probe("glow").0 {
+            let _ = Command::new("glow").arg("-p").arg(path).status();
+            return Ok(());
+        }
+
+        if Self::is_mermaid_file(path) && Self::integration_probe("mmdflux").0 {
+            if let Ok(mut child) = Command::new("mmdflux")
+                .arg(path)
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                if let Some(mmd_out) = child.stdout.take() {
+                    let _ = Command::new("less").args(["-R"]).stdin(mmd_out).status();
+                }
+                let _ = child.wait();
+            }
+            return Ok(());
+        }
+
+        if Self::is_html_file(path) && Self::integration_probe("links").0 {
+            let _ = Command::new("links").arg(path).status();
+            return Ok(());
+        }
+
+        if Self::is_json_file(path) && Self::integration_probe("jnv").0 {
+            let _ = Command::new("jnv").arg(path).status();
+            return Ok(());
+        }
+
+        if Self::is_delimited_text_file(path) && Self::integration_probe("csvlens").0 {
+            let _ = Command::new("csvlens").arg(path).status();
+            return Ok(());
+        }
+
+        if Self::is_audio_file(path) && Self::integration_probe("sox").0 {
+            if Self::integration_probe("play").0 {
+                let _ = Command::new("play")
+                    .arg(path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            } else {
+                let _ = Command::new("sox")
+                    .arg(path)
+                    .arg("-d")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            return Ok(());
+        }
+
+        if Self::is_pdf_file(path) && Self::integration_probe("pdftotext").0 {
+            let mut shown = false;
+            if let Ok(mut child) = Command::new("pdftotext")
+                .args(["-layout", "-nopgbrk"])
+                .arg(path)
+                .arg("-")
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                if let Some(pdf_text) = child.stdout.take() {
+                    shown = Command::new("less")
+                        .args(["-R"])
+                        .stdin(pdf_text)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                }
+                let _ = child.wait();
+            }
+            if !shown {
+                let _ = Command::new("less")
+                    .args(["-R", path.to_str().unwrap_or_default()])
+                    .status();
+            }
+            return Ok(());
+        }
+
+        if Self::is_cast_file(path) && Self::integration_probe("asciinema").0 {
+            let _ = Command::new("asciinema").args(["play", "-i"]).arg(path).status();
+            return Ok(());
+        }
+
+        if Self::is_binary_file(path) && Self::integration_probe("hexyl").0 {
+            if let Ok(child) = Command::new("hexyl")
+                .arg(path)
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                let _ = Command::new("less")
+                    .args(["-R"])
+                    .stdin(child.stdout.unwrap())
+                    .status();
+                return Ok(());
+            }
+        }
+
+        if Self::integration_probe("bat").0 {
+            let bat_cmd = Self::bat_tool().unwrap_or_else(|| "bat".to_string());
+            let _ = Command::new(bat_cmd)
+                .args(["--paging=always", "--style=full", "--color=always"])
+                .arg(path)
+                .status();
+            return Ok(());
+        }
+
+        let _ = Command::new("less")
+            .args(["-R", path.to_str().unwrap_or_default()])
+            .status();
         Ok(())
     }
 
@@ -3576,6 +3705,13 @@ fn main() -> io::Result<()> {
     }
     if let Some((include_hidden, include_total_size, path)) = ui::cli::parse_list_mode_args(&args) {
         return ui::cli::list_current_directory(include_hidden, include_total_size, path);
+    }
+
+    if args.len() == 1 && !args[0].starts_with('-') {
+        let target = PathBuf::from(&args[0]);
+        if target.is_file() {
+            return App::open_path_in_view_mode(&target);
+        }
     }
 
     enable_raw_mode()?;
