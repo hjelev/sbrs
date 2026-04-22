@@ -21,13 +21,19 @@ pub fn named_dir_icon(name: &str) -> Option<(&'static str, (u8, u8, u8))> {
         ".github" | "github" => Some(("\u{F09B}", (220, 220, 220))),
         ".gitlab" | "gitlab" => Some(("\u{F296}", (252, 109, 38))),
 
+        // --- Gaming & Media ---
+        "games" | "gaming" => Some(("\u{F11B}", (80, 220, 80))),
+        "steam" | ".steam" | "steamapps" => Some(("\u{F1B7}", (100, 160, 220))),
+        "discord" | ".discord" => Some(("\u{F086}", (88, 101, 242))),
+        "obs" | "obs-studio" => Some(("\u{F03D}", (70, 180, 255))),
+
         // --- Development & Runtimes ---
-        "go" => Some(("\u{E724}", (0, 173, 216))),
+        "go" => Some(("\u{F07D3}", (0, 220, 255))),
         "node_modules" => Some(("\u{E718}", (76, 175, 80))),
         "venv" | ".venv" | "env" => Some(("\u{E235}", (59, 153, 11))),
         "python" | "py" | "__pycache__" => Some(("\u{E235}", (255, 212, 59))),
         ".cargo" | "cargo" | "rust" => Some(("\u{E7A8}", (222, 165, 132))),
-        "java" | "maven" | "gradle" => Some(("\u{E738}", (231, 10, 26))),
+        "java" | "maven" | "gradle" => Some(("\u{F0F4}", (200, 130, 60))),
         "ruby" | "gems" => Some(("\u{E739}", (170, 20, 1))),
         "php" => Some(("\u{E73D}", (119, 123, 179))),
 
