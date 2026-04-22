@@ -183,6 +183,7 @@ enum AppMode {
     PathEditing,
     CommandInput,
     GitCommitMessage,
+    GitTagInput,
     InternalSearch,
     NoteEditing,
     Renaming,
@@ -2540,6 +2541,25 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         (parts.join(" "), amend)
     }
 
+    fn latest_git_tag(&self) -> Option<String> {
+        let out = Command::new("git")
+            .args(["describe", "--tags", "--abbrev=0"])
+            .current_dir(&self.current_dir)
+            .output()
+            .ok()?;
+
+        if !out.status.success() {
+            return None;
+        }
+
+        let tag = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if tag.is_empty() {
+            None
+        } else {
+            Some(tag)
+        }
+    }
+
     fn preview_git_diff_and_confirm_commit(&mut self) -> io::Result<bool> {
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -2645,6 +2665,78 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             }
         }
 
+        let mut tag_requested = false;
+        if failed_step.is_none() {
+            println!("\nPress Enter to return to sbrs, or type 't' then Enter to create+push a tag...");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+            tag_requested = line.trim().eq_ignore_ascii_case("t");
+        } else {
+            println!("\nPress Enter to return to sbrs...");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+        }
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
+        enable_raw_mode()?;
+
+        if let Some(step) = failed_step {
+            self.set_status(step);
+        } else if push_forced {
+            self.set_status("amend commit pushed with -f");
+            if tag_requested {
+                let prefill = self
+                    .latest_git_tag()
+                    .unwrap_or_else(|| "v0.1.0".to_string());
+                self.begin_input_edit(AppMode::GitTagInput, prefill);
+                self.set_status("edit tag and press Enter to create+push (Esc=cancel)");
+            }
+        } else {
+            self.set_status("commit pushed");
+            if tag_requested {
+                let prefill = self
+                    .latest_git_tag()
+                    .unwrap_or_else(|| "v0.1.0".to_string());
+                self.begin_input_edit(AppMode::GitTagInput, prefill);
+                self.set_status("edit tag and press Enter to create+push (Esc=cancel)");
+            }
+        }
+
+        self.refresh_entries_or_status();
+        self.git_info_cache = None;
+        self.request_git_info_for_current_dir_once();
+        Ok(())
+    }
+
+    fn run_git_tag_and_push(&mut self, tag: &str) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let run_step = |args: &[&str], dir: &PathBuf| -> io::Result<bool> {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()?;
+            Ok(status.success())
+        };
+
+        let mut failed_step: Option<String> = None;
+
+        println!("$ git tag {}", tag);
+        if !run_step(&["tag", tag], &self.current_dir)? {
+            failed_step = Some("git tag failed".to_string());
+        }
+
+        if failed_step.is_none() {
+            println!("$ git push origin {}", tag);
+            if !run_step(&["push", "origin", tag], &self.current_dir)? {
+                failed_step = Some("git push tag failed".to_string());
+            }
+        }
+
         println!("\nPress Enter to return to sbrs...");
         let _ = io::stdout().flush();
         let mut line = String::new();
@@ -2656,10 +2748,8 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         if let Some(step) = failed_step {
             self.set_status(step);
-        } else if push_forced {
-            self.set_status("amend commit pushed with -f");
         } else {
-            self.set_status("commit pushed");
+            self.set_status(format!("tag pushed: {}", tag));
         }
 
         self.refresh_entries_or_status();
@@ -4429,7 +4519,7 @@ fn main() -> io::Result<()> {
                         ),
                     help_area,
                 );
-            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput | AppMode::GitCommitMessage) {
+            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput | AppMode::GitCommitMessage | AppMode::GitTagInput) {
                 let area = f.size();
                 let rename_area = Rect::new(area.width/4, area.height/2 - 1, area.width/2, 3);
                 f.render_widget(Clear, rename_area);
@@ -4441,6 +4531,7 @@ fn main() -> io::Result<()> {
                     AppMode::NoteEditing => " Note (Enter=Save, Esc=Cancel) ",
                     AppMode::CommandInput => " Command (; Enter=Run, Esc=Cancel) ",
                     AppMode::GitCommitMessage => " Commit Message (Enter=Commit+Push, Esc=Cancel) ",
+                    AppMode::GitTagInput => " Tag (Enter=Create+Push Tag, Esc=Cancel) ",
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
@@ -5771,6 +5862,38 @@ fn main() -> io::Result<()> {
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                         app.set_status("git commit cancelled");
+                        terminal.clear()?;
+                    }
+                    KeyCode::Backspace => app.input_backspace(),
+                    KeyCode::Delete => app.input_delete(),
+                    KeyCode::Left => app.input_move_left(),
+                    KeyCode::Right => app.input_move_right(),
+                    KeyCode::Home => app.input_move_home(),
+                    KeyCode::End => app.input_move_end(),
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.input_insert_char(c)
+                    }
+                    _ => {}
+                },
+                AppMode::GitTagInput => match key.code {
+                    KeyCode::Enter => {
+                        let tag = app.input_buffer.trim().to_string();
+                        if tag.is_empty() {
+                            app.set_status("tag cannot be empty");
+                        } else {
+                            app.clear_input_edit();
+                            app.mode = AppMode::Browsing;
+                            app.run_git_tag_and_push(&tag)?;
+                            terminal.clear()?;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        app.clear_input_edit();
+                        app.mode = AppMode::Browsing;
+                        app.set_status("tag creation cancelled");
                         terminal.clear()?;
                     }
                     KeyCode::Backspace => app.input_backspace(),
