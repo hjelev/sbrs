@@ -2818,6 +2818,40 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Ok(())
     }
 
+    fn open_todo_file_in_editor(&mut self) -> io::Result<()> {
+        let home = match env::var("HOME") {
+            Ok(v) => v,
+            Err(_) => {
+                self.set_status("HOME is not set");
+                return Ok(());
+            }
+        };
+
+        let todo_path = PathBuf::from(home).join(".todo");
+        if !todo_path.exists() {
+            if let Err(e) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&todo_path)
+            {
+                self.set_status(format!("failed to create ~/.todo: {}", e));
+                return Ok(());
+            }
+        }
+
+        let editor = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), Show)?;
+        let _ = Command::new(editor).arg(&todo_path).status();
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), Hide)?;
+        enable_raw_mode()?;
+        self.refresh_entries_or_status();
+        self.set_status("opened ~/.todo");
+        Ok(())
+    }
+
     fn create_archive_from_input(&mut self) {
         if self.archive_rx.is_some() {
             self.set_status("archive creation already in progress");
@@ -5154,6 +5188,10 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('o') => {
                         app.open_selected_with_default_app()?;
+                        terminal.clear()?;
+                    }
+                    KeyCode::Char('t') => {
+                        app.open_todo_file_in_editor()?;
                         terminal.clear()?;
                     }
                     KeyCode::Char('i') => {
