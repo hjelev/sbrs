@@ -35,7 +35,7 @@ pub fn integration_catalog() -> Vec<IntegrationSpec> {
         IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
         IntegrationSpec { key: "sshfs", description: "mount SSH hosts via S picker", category: "network", required: false },
         IntegrationSpec { key: "rclone", description: "mount rclone remotes via S picker", category: "network", required: false },
-        IntegrationSpec { key: "tmux", description: "split shell + less preview (i)", category: "terminal", required: false },
+        IntegrationSpec { key: "tmux", description: "split shell + less preview (i), editor (E)", category: "terminal", required: false },
         IntegrationSpec { key: "rg", description: "content search, fzf preview if avail (g)", category: "search", required: false },
         IntegrationSpec { key: "fzf", description: "fuzzy file search (f)", category: "search", required: false },
         IntegrationSpec { key: "wl-copy", description: "Wayland clipboard backend used by Ctrl+c full-path copy", category: "clipboard", required: false },
