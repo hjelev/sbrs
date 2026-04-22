@@ -9,10 +9,28 @@ use regex::{Regex, RegexBuilder};
 
 use crate::{
     App, AppMode, InternalSearchCandidatesMsg, InternalSearchContentLimits, InternalSearchContentMsg,
-    InternalSearchPattern, InternalSearchResult, InternalSearchScope,
+    InternalSearchPattern, InternalSearchResult, InternalSearchScope, PathFilterMode,
+    PathInputFilter,
 };
 
 impl App {
+    pub(crate) fn build_path_filter_regex(filter: &PathInputFilter) -> Result<Regex, String> {
+        let pattern = match filter.mode {
+            PathFilterMode::Prefix => format!("^(?:{})", filter.pattern),
+            PathFilterMode::Suffix => format!("(?:{})$", filter.pattern),
+            PathFilterMode::Contains => filter.pattern.clone(),
+        };
+
+        RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn entry_name_matches_path_filter(name: &str, filter_regex: &Regex) -> bool {
+        filter_regex.is_match(name)
+    }
+
     pub(crate) fn collect_internal_search_candidates(root: &PathBuf, max_items: usize) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         let mut stack: Vec<PathBuf> = vec![root.clone()];

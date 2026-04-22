@@ -150,6 +150,19 @@ enum SortMode {
     ModifiedOldest,
 }
 
+#[derive(Clone)]
+pub(crate) enum PathFilterMode {
+    Prefix,
+    Suffix,
+    Contains,
+}
+
+#[derive(Clone)]
+pub(crate) struct PathInputFilter {
+    pub(crate) mode: PathFilterMode,
+    pub(crate) pattern: String,
+}
+
 impl SortMode {
     fn label(self) -> &'static str {
         match self {
@@ -253,6 +266,7 @@ struct App {
     paste_current_src: Option<PathBuf>,
     paste_move_mode: bool,
     paste_target_dir: Option<PathBuf>,
+    path_input_filter: Option<PathInputFilter>,
     input_buffer: String,
     input_cursor: usize,
     status_message: String,
@@ -384,6 +398,7 @@ impl App {
             paste_current_src: None,
             paste_move_mode: false,
             paste_target_dir: None,
+            path_input_filter: None,
             input_buffer: String::new(),
             input_cursor: 0,
             status_message: String::new(),
@@ -1022,10 +1037,16 @@ IFS= read -rsn1 _
 
     fn try_enter_dir(&mut self, target: PathBuf) {
         let previous_dir = self.current_dir.clone();
+        let previous_filter = self.path_input_filter.clone();
+        let changed_dir = target != previous_dir;
         self.remember_current_selection();
         self.current_dir = target;
+        if changed_dir {
+            self.path_input_filter = None;
+        }
         if !self.refresh_entries_or_status() {
             self.current_dir = previous_dir;
+            self.path_input_filter = previous_filter;
         } else {
             self.restore_selection_for_current_dir();
             self.request_git_info_for_current_dir_once();
@@ -1428,6 +1449,37 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn path_filter_suffix_text(&self) -> Option<String> {
+        let filter = self.path_input_filter.as_ref()?;
+        let suffix = match filter.mode {
+            PathFilterMode::Prefix => format!("^{}", filter.pattern),
+            PathFilterMode::Suffix => format!("{}$", filter.pattern),
+            PathFilterMode::Contains => format!("~{}", filter.pattern),
+        };
+        Some(suffix)
+    }
+
+    fn path_with_filter_suffix(base: String, suffix: Option<String>) -> String {
+        let Some(suffix) = suffix else {
+            return base;
+        };
+
+        if base == "/" {
+            format!("/{}", suffix)
+        } else {
+            format!("{}/{}", base, suffix)
+        }
+    }
+
+    fn current_dir_display_path_with_filter(&self) -> String {
+        Self::path_with_filter_suffix(self.current_dir_display_path(), self.path_filter_suffix_text())
+    }
+
+    fn current_path_edit_value(&self) -> String {
+        let base = self.current_dir.to_string_lossy().into_owned();
+        Self::path_with_filter_suffix(base, self.path_filter_suffix_text())
+    }
+
     fn mount_rclone_remote(&mut self, name: &str, rtype: &str) -> io::Result<()> {
         // If already mounted, just navigate there
         if let Some(existing) = self.ssh_mounts.iter_mut().find(|m| m._host_alias == name) {
@@ -1647,14 +1699,37 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn apply_path_input(&mut self) {
-        let target = self.resolve_input_path(&self.input_buffer);
+        let raw_input = self.input_buffer.trim().to_string();
+        let target = self.resolve_input_path(&raw_input);
         if target.is_dir() {
+            self.path_input_filter = None;
             self.try_enter_dir(target);
             self.mode = AppMode::Browsing;
             self.clear_input_edit();
-        } else {
-            self.set_status("path is not a directory");
+            return;
         }
+
+        let Some((base_raw, filter)) = Self::parse_path_filter_suffix(&raw_input) else {
+            self.set_status("path is not a directory");
+            return;
+        };
+
+        if let Err(err) = Self::build_path_filter_regex(&filter) {
+            self.set_status(format!("invalid path filter regex: {}", err));
+            return;
+        }
+
+        let base_target = self.resolve_input_path(&base_raw);
+        if !base_target.is_dir() {
+            self.set_status("path is not a directory");
+            return;
+        }
+
+        self.try_enter_dir(base_target);
+        self.path_input_filter = Some(filter);
+        self.refresh_entries_or_status();
+        self.mode = AppMode::Browsing;
+        self.clear_input_edit();
     }
 
     fn create_entry_from_input(&mut self, is_dir: bool) {
@@ -1701,6 +1776,14 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .collect();
 
         Self::sort_entries_by_mode(&mut entries, self.sort_mode);
+        if let Some(filter) = self.path_input_filter.as_ref() {
+            let filter_regex = Self::build_path_filter_regex(filter)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            entries.retain(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                Self::entry_name_matches_path_filter(&name, &filter_regex)
+            });
+        }
         self.entries = entries;
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
@@ -3439,7 +3522,7 @@ fn main() -> io::Result<()> {
             let current_display_path = if app.mode == AppMode::PathEditing {
                 app.input_buffer.clone()
             } else {
-                app.current_dir_display_path()
+                app.current_dir_display_path_with_filter()
             };
             let mut path_spans = vec![
                 Span::styled(header_identity.as_str(), Style::default().fg(Color::Cyan)),
@@ -4752,7 +4835,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                     KeyCode::Tab => {
-                        let current = app.current_dir.to_string_lossy().into_owned();
+                        let current = app.current_path_edit_value();
                         app.begin_input_edit(AppMode::PathEditing, current);
                     }
                     KeyCode::Char(' ') | KeyCode::Insert => {
@@ -5362,6 +5445,10 @@ fn main() -> io::Result<()> {
                         app.apply_path_input();
                     }
                     KeyCode::Esc => {
+                        let had_filter = app.path_input_filter.take().is_some();
+                        if had_filter && app.refresh_entries_or_status() {
+                            app.set_status("path filter cleared");
+                        }
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
                     }

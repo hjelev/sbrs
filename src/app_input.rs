@@ -1,6 +1,52 @@
-use crate::{App, AppMode};
+use crate::{App, AppMode, PathFilterMode, PathInputFilter};
 
 impl App {
+    pub(crate) fn parse_path_filter_suffix(raw: &str) -> Option<(String, PathInputFilter)> {
+        let trimmed = raw.trim();
+        let (base, tail) = trimmed.rsplit_once('/')?;
+        if tail.is_empty() {
+            return None;
+        }
+
+        let base_path = if base.is_empty() && trimmed.starts_with('/') {
+            "/".to_string()
+        } else {
+            base.to_string()
+        };
+
+        if let Some(pattern) = tail.strip_prefix('^') {
+            return Some((
+                base_path,
+                PathInputFilter {
+                    mode: PathFilterMode::Prefix,
+                    pattern: pattern.to_string(),
+                },
+            ));
+        }
+
+        if let Some(pattern) = tail.strip_suffix('$') {
+            return Some((
+                base_path,
+                PathInputFilter {
+                    mode: PathFilterMode::Suffix,
+                    pattern: pattern.to_string(),
+                },
+            ));
+        }
+
+        if let Some(pattern) = tail.strip_prefix('~') {
+            return Some((
+                base_path,
+                PathInputFilter {
+                    mode: PathFilterMode::Contains,
+                    pattern: pattern.to_string(),
+                },
+            ));
+        }
+
+        None
+    }
+
     pub(crate) fn begin_input_edit(&mut self, mode: AppMode, initial: String) {
         self.mode = mode;
         self.input_buffer = initial;
