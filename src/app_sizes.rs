@@ -258,7 +258,7 @@ impl App {
         self.current_dir_total_size_bytes = None;
     }
 
-    pub(crate) fn filesystem_free_space_bytes(path: &PathBuf) -> Option<u64> {
+    pub(crate) fn filesystem_space_bytes(path: &PathBuf) -> Option<(u64, u64)> {
         let output = Command::new("df").args(["-kP"]).arg(path).output().ok()?;
         if !output.status.success() {
             return None;
@@ -271,12 +271,22 @@ impl App {
             return None;
         }
 
+        let total_kb = u64::from_str(cols[1]).ok()?;
         let available_kb = u64::from_str(cols[3]).ok()?;
-        Some(available_kb.saturating_mul(1024))
+        Some((
+            available_kb.saturating_mul(1024),
+            total_kb.saturating_mul(1024),
+        ))
     }
 
     pub(crate) fn refresh_current_dir_free_space(&mut self) {
-        self.current_dir_free_bytes = Self::filesystem_free_space_bytes(&self.current_dir);
+        if let Some((free, total)) = Self::filesystem_space_bytes(&self.current_dir) {
+            self.current_dir_free_bytes = Some(free);
+            self.current_dir_total_space_bytes = (total > 0).then_some(total);
+        } else {
+            self.current_dir_free_bytes = None;
+            self.current_dir_total_space_bytes = None;
+        }
     }
 
     pub(crate) fn start_current_dir_total_size_scan(&mut self) {
@@ -331,18 +341,45 @@ impl App {
             return None;
         }
 
+        let fmt_pct = |num: u64, den: u64| -> Option<String> {
+            if den == 0 {
+                None
+            } else {
+                Some(format!("{:.1}%", (num as f64 * 100.0) / den as f64))
+            }
+        };
+
         let free_part = self
             .current_dir_free_bytes
-            .map(|bytes| format!("free: {}", Self::format_size(bytes)))
+            .map(|bytes| {
+                let pct_suffix = self
+                    .current_dir_total_space_bytes
+                    .and_then(|total| fmt_pct(bytes, total))
+                    .map(|pct| format!(" ({})", pct))
+                    .unwrap_or_default();
+                format!("free: {}{}", Self::format_size(bytes), pct_suffix)
+            })
             .unwrap_or_else(|| "free: ?".to_string());
 
         if self.current_dir_total_size_pending {
-            return Some(format!("dir size: scanning... | {}", free_part));
+            return Some(format!("folder size: scanning... | {}", free_part));
         }
 
         Some(match self.current_dir_total_size_bytes {
-            Some(bytes) => format!("dir size: {} | {}", Self::format_size(bytes), free_part),
-            None => format!("dir size: ? | {}", free_part),
+            Some(bytes) => {
+                let used_pct_suffix = self
+                    .current_dir_total_space_bytes
+                    .and_then(|total| fmt_pct(bytes, total))
+                    .map(|pct| format!(" ({})", pct))
+                    .unwrap_or_default();
+                format!(
+                    "folder size: {}{} | {}",
+                    Self::format_size(bytes),
+                    used_pct_suffix,
+                    free_part
+                )
+            }
+            None => format!("folder size: ? | {}", free_part),
         })
     }
 

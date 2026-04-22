@@ -322,6 +322,7 @@ struct App {
     current_dir_total_size_pending: bool,
     current_dir_total_size_bytes: Option<u64>,
     current_dir_free_bytes: Option<u64>,
+    current_dir_total_space_bytes: Option<u64>,
     recursive_mtime_rx: Option<Receiver<RecursiveMtimeMsg>>,
     recursive_mtime_scan_id: u64,
     selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
@@ -456,6 +457,7 @@ impl App {
             current_dir_total_size_pending: false,
             current_dir_total_size_bytes: None,
             current_dir_free_bytes: None,
+            current_dir_total_space_bytes: None,
             recursive_mtime_rx: None,
             recursive_mtime_scan_id: 0,
             selected_total_size_rx: None,
@@ -4044,6 +4046,16 @@ fn main() -> io::Result<()> {
                 Color::Rgb(r, g, b)
             };
 
+            let pct_shade_color = |t: f64| -> Color {
+                let t = t.clamp(0.0, 1.0);
+                let base = (220.0, 200.0, 120.0);
+                let white = (255.0, 255.0, 255.0);
+                let r = (base.0 + (white.0 - base.0) * t).round() as u8;
+                let g = (base.1 + (white.1 - base.1) * t).round() as u8;
+                let b = (base.2 + (white.2 - base.2) * t).round() as u8;
+                Color::Rgb(r, g, b)
+            };
+
             let date_rank_by_ts: HashMap<u64, f64> = if show_date {
                 let mut values: Vec<u64> = app
                     .entry_render_cache
@@ -4084,7 +4096,6 @@ fn main() -> io::Result<()> {
 
                 let group_style = Style::default().fg(Color::Rgb(172, 136, 98));
                 let owner_style = Style::default().fg(Color::Rgb(196, 172, 118));
-                let pct_style = Style::default().fg(Color::Rgb(220, 200, 120));
                 let size_style = match (size_min_max, entry_cache.size_bytes) {
                     (Some((min_size, max_size)), Some(entry_bytes)) if max_size > min_size => {
                         let min_log = (min_size as f64 + 1.0).ln();
@@ -4097,6 +4108,17 @@ fn main() -> io::Result<()> {
                         Style::default().fg(size_shade_color(0.0))
                     }
                     _ => Style::default().fg(Color::Green),
+                };
+                let pct_style = match (size_min_max, entry_cache.size_bytes) {
+                    (Some((min_size, max_size)), Some(entry_bytes)) if max_size > min_size => {
+                        let min_log = (min_size as f64 + 1.0).ln();
+                        let max_log = (max_size as f64 + 1.0).ln();
+                        let entry_log = (entry_bytes as f64 + 1.0).ln();
+                        let t = ((entry_log - min_log) / (max_log - min_log)).clamp(0.0, 1.0);
+                        Style::default().fg(pct_shade_color(t))
+                    }
+                    (Some(_), Some(_)) => Style::default().fg(pct_shade_color(0.0)),
+                    _ => Style::default().fg(Color::Rgb(220, 200, 120)),
                 };
                 let date_style = entry_cache
                     .modified_unix
