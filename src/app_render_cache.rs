@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, str::FromStr};
+use std::{collections::HashMap, fs, str::FromStr, time::UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use devicons::{icon_for_file, File as DevFile, Theme};
@@ -155,6 +155,11 @@ impl App {
             .map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default();
         let date_col = format!("{:>width$}", date, width = date_width);
+        let modified_unix = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
 
         EntryRenderCache {
             raw_name: entry.file_name().to_string_lossy().into_owned(),
@@ -167,6 +172,7 @@ impl App {
             size_col,
             size_bytes,
             date_col,
+            modified_unix,
         }
     }
 

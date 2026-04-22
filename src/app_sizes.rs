@@ -5,13 +5,116 @@ use std::{
     str::FromStr,
     sync::mpsc,
     thread,
+    time::UNIX_EPOCH,
 };
 
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
 
-use crate::{App, CurrentDirTotalSizeMsg, FolderSizeMsg, SelectedTotalSizeMsg};
+use crate::{
+    App, CurrentDirTotalSizeMsg, FolderSizeMsg, RecursiveMtimeMsg, SelectedTotalSizeMsg,
+};
 
 impl App {
+    pub(crate) fn start_recursive_mtime_scan(&mut self) {
+        self.recursive_mtime_scan_id = self.recursive_mtime_scan_id.wrapping_add(1);
+        let scan_id = self.recursive_mtime_scan_id;
+
+        let dir_paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+
+        if dir_paths.is_empty() {
+            self.recursive_mtime_rx = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.recursive_mtime_rx = Some(rx);
+        thread::spawn(move || {
+            let updated: Vec<(PathBuf, u64)> = dir_paths
+                .par_iter()
+                .map(|dir| (dir.clone(), App::compute_latest_modified_unix_recursive(dir).unwrap_or(0)))
+                .collect();
+
+            for (dir, latest_unix) in updated {
+                let _ = tx.send(RecursiveMtimeMsg::EntryMtime(scan_id, dir, latest_unix));
+            }
+            let _ = tx.send(RecursiveMtimeMsg::Finished(scan_id));
+        });
+    }
+
+    pub(crate) fn pump_recursive_mtime_progress(&mut self) {
+        let Some(rx) = self.recursive_mtime_rx.take() else {
+            return;
+        };
+
+        let mut keep_rx = true;
+        loop {
+            match rx.try_recv() {
+                Ok(RecursiveMtimeMsg::EntryMtime(scan_id, dir_path, unix_secs)) => {
+                    if scan_id != self.recursive_mtime_scan_id {
+                        continue;
+                    }
+                    if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
+                        self.entry_render_cache[idx].modified_unix = Some(unix_secs);
+                        let dt = DateTime::<Local>::from(UNIX_EPOCH + std::time::Duration::from_secs(unix_secs));
+                        self.entry_render_cache[idx].date_col =
+                            format!("{:>width$}", dt.format("%Y-%m-%d %H:%M"), width = 16);
+                    }
+                }
+                Ok(RecursiveMtimeMsg::Finished(scan_id)) => {
+                    if scan_id == self.recursive_mtime_scan_id {
+                        keep_rx = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    keep_rx = false;
+                    break;
+                }
+            }
+        }
+
+        if keep_rx {
+            self.recursive_mtime_rx = Some(rx);
+        }
+    }
+
+    pub(crate) fn compute_latest_modified_unix_recursive(path: &PathBuf) -> io::Result<u64> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return Ok(0),
+        };
+
+        let mut latest = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+            return Ok(latest);
+        }
+
+        let children = match fs::read_dir(path) {
+            Ok(rd) => rd,
+            Err(_) => return Ok(latest),
+        };
+
+        for child in children.flatten() {
+            let child_path = child.path();
+            let child_latest = Self::compute_latest_modified_unix_recursive(&child_path).unwrap_or(0);
+            latest = latest.max(child_latest);
+        }
+
+        Ok(latest)
+    }
+
     pub(crate) fn clear_selected_total_size_state(&mut self) {
         self.selected_total_size_scan_id = self.selected_total_size_scan_id.wrapping_add(1);
         self.selected_total_size_rx = None;

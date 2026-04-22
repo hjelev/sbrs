@@ -94,6 +94,7 @@ struct EntryRenderCache {
     size_col: String,
     size_bytes: Option<u64>,
     date_col: String,
+    modified_unix: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +126,11 @@ enum SelectedTotalSizeMsg {
 
 enum CurrentDirTotalSizeMsg {
     Finished(u64, u64),
+}
+
+enum RecursiveMtimeMsg {
+    EntryMtime(u64, PathBuf, u64),
+    Finished(u64),
 }
 
 enum NotesLoadMsg {
@@ -316,6 +322,8 @@ struct App {
     current_dir_total_size_pending: bool,
     current_dir_total_size_bytes: Option<u64>,
     current_dir_free_bytes: Option<u64>,
+    recursive_mtime_rx: Option<Receiver<RecursiveMtimeMsg>>,
+    recursive_mtime_scan_id: u64,
     selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
     selected_total_size_scan_id: u64,
     selected_total_size_pending: bool,
@@ -448,6 +456,8 @@ impl App {
             current_dir_total_size_pending: false,
             current_dir_total_size_bytes: None,
             current_dir_free_bytes: None,
+            recursive_mtime_rx: None,
+            recursive_mtime_scan_id: 0,
             selected_total_size_rx: None,
             selected_total_size_scan_id: 0,
             selected_total_size_pending: false,
@@ -1796,6 +1806,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.refresh_current_dir_free_space();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
         self.folder_size_rx = None;
+        self.recursive_mtime_rx = None;
         self.clear_current_dir_total_size_state();
         self.clear_selected_total_size_state();
         self.marked_indices.clear();
@@ -1812,6 +1823,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             self.start_folder_size_scan();
             self.start_current_dir_total_size_scan();
         }
+        self.start_recursive_mtime_scan();
         self.request_notes_for_current_dir_once();
         Ok(())
     }
@@ -2667,16 +2679,26 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         let mut tag_requested = false;
         if failed_step.is_none() {
-            println!("\nPress Enter to return to sbrs, or type 't' then Enter to create+push a tag...");
+            println!("\nPress any key to return to sbrs, or press 't' to create+push a tag...");
             let _ = io::stdout().flush();
-            let mut line = String::new();
-            let _ = io::stdin().read_line(&mut line);
-            tag_requested = line.trim().eq_ignore_ascii_case("t");
+            enable_raw_mode()?;
+            loop {
+                if let Event::Key(key) = event::read()? {
+                    tag_requested = matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'));
+                    break;
+                }
+            }
+            disable_raw_mode()?;
         } else {
-            println!("\nPress Enter to return to sbrs...");
+            println!("\nPress any key to return to sbrs...");
             let _ = io::stdout().flush();
-            let mut line = String::new();
-            let _ = io::stdin().read_line(&mut line);
+            enable_raw_mode()?;
+            loop {
+                if let Event::Key(_) = event::read()? {
+                    break;
+                }
+            }
+            disable_raw_mode()?;
         }
 
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -3854,6 +3876,7 @@ fn main() -> io::Result<()> {
         app.pump_copy_total_prescan();
         app.pump_copy_progress();
         app.pump_folder_size_progress();
+        app.pump_recursive_mtime_progress();
         app.pump_current_dir_total_size_progress();
         app.pump_selected_total_size_progress();
         app.pump_git_info();
@@ -3913,7 +3936,7 @@ fn main() -> io::Result<()> {
             } else if !app.folder_size_enabled {
                 Some((
                     app.header_clock_text.clone(),
-                    Style::default().fg(Color::Rgb(120, 190, 210)),
+                    Style::default().fg(Color::White),
                 ))
             } else {
                 None
@@ -4001,15 +4024,88 @@ fn main() -> io::Result<()> {
                 (icon_style, name_style)
             };
 
+            let size_min_max = if show_size {
+                let mut min_size: Option<u64> = None;
+                let mut max_size: u64 = 0;
+                for size in app.entry_render_cache.iter().filter_map(|entry| entry.size_bytes) {
+                    min_size = Some(min_size.map_or(size, |current| current.min(size)));
+                    max_size = max_size.max(size);
+                }
+                min_size.map(|min| (min, max_size))
+            } else {
+                None
+            };
+
+            let size_shade_color = |t: f64| -> Color {
+                let t = t.clamp(0.0, 1.0);
+                let r = (255.0 * t).round() as u8;
+                let g = 255u8;
+                let b = (255.0 * t).round() as u8;
+                Color::Rgb(r, g, b)
+            };
+
+            let date_rank_by_ts: HashMap<u64, f64> = if show_date {
+                let mut values: Vec<u64> = app
+                    .entry_render_cache
+                    .iter()
+                    .filter_map(|entry| entry.modified_unix)
+                    .collect();
+                values.sort_unstable();
+                values.dedup();
+
+                if values.len() <= 1 {
+                    values.into_iter().map(|ts| (ts, 1.0)).collect()
+                } else {
+                    let denom = (values.len() - 1) as f64;
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, ts)| (ts, idx as f64 / denom))
+                        .collect()
+                }
+            } else {
+                HashMap::new()
+            };
+
+            let date_fade_color = |age_t: f64| -> Color {
+                let age_t = age_t.clamp(0.0, 1.0);
+                let base = (116.0, 178.0, 205.0);
+                let white = (255.0, 255.0, 255.0);
+                let r = (white.0 + (base.0 - white.0) * age_t).round() as u8;
+                let g = (white.1 + (base.1 - white.1) * age_t).round() as u8;
+                let b = (white.2 + (base.2 - white.2) * age_t).round() as u8;
+                Color::Rgb(r, g, b)
+            };
+
             let rows: Vec<Row> = app.entry_render_cache.iter().enumerate().map(|(idx, entry_cache)| {
                 let is_marked = app.marked_indices.contains(&idx);
                 let is_selected = idx == app.selected_index;
                 let (icon_style, name_style) = entry_styles(entry_cache.icon_style, entry_cache.name_style, is_selected);
 
-                let meta_style = Style::default().fg(Color::Rgb(180, 150, 100));
-                let size_style = Style::default().fg(Color::Green);
+                let group_style = Style::default().fg(Color::Rgb(172, 136, 98));
+                let owner_style = Style::default().fg(Color::Rgb(196, 172, 118));
                 let pct_style = Style::default().fg(Color::Rgb(220, 200, 120));
-                let date_style = Style::default().fg(Color::Rgb(120, 190, 210));
+                let size_style = match (size_min_max, entry_cache.size_bytes) {
+                    (Some((min_size, max_size)), Some(entry_bytes)) if max_size > min_size => {
+                        let min_log = (min_size as f64 + 1.0).ln();
+                        let max_log = (max_size as f64 + 1.0).ln();
+                        let entry_log = (entry_bytes as f64 + 1.0).ln();
+                        let t = ((entry_log - min_log) / (max_log - min_log)).clamp(0.0, 1.0);
+                        Style::default().fg(size_shade_color(t))
+                    }
+                    (Some(_), Some(_)) => {
+                        Style::default().fg(size_shade_color(0.0))
+                    }
+                    _ => Style::default().fg(Color::Green),
+                };
+                let date_style = entry_cache
+                    .modified_unix
+                    .and_then(|ts| date_rank_by_ts.get(&ts).copied())
+                    .map(|rank_t| {
+                        // rank_t: 0=oldest, 1=newest. Newest should be white.
+                        Style::default().fg(date_fade_color(1.0 - rank_t))
+                    })
+                    .unwrap_or_else(|| Style::default().fg(Color::Rgb(116, 178, 205)));
                 let marker = if app.no_color {
                     format!(
                         "{}{} ",
@@ -4054,14 +4150,29 @@ fn main() -> io::Result<()> {
                     spans
                 }))];
                 if show_meta {
-                    cells.push(Cell::from(Span::styled(entry_cache.perms_col.as_str(), meta_style)));
+                    let perms_text = entry_cache.perms_col.trim();
+                    let left_pad = perms_width.saturating_sub(perms_text.chars().count());
+                    let mut perms_spans: Vec<Span> = Vec::new();
+                    if left_pad > 0 {
+                        perms_spans.push(Span::raw(" ".repeat(left_pad)));
+                    }
+                    let chars: Vec<char> = perms_text.chars().collect();
+                    let steps = chars.len().saturating_sub(1).max(1) as f32;
+                    for (i, ch) in chars.iter().enumerate() {
+                        let t = 1.0 - (i as f32 / steps);
+                        let r = (196.0 + (255.0 - 196.0) * t).round() as u8;
+                        let g = (150.0 + (255.0 - 150.0) * t).round() as u8;
+                        let b = (96.0 + (255.0 - 96.0) * t).round() as u8;
+                        perms_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r, g, b))));
+                    }
+                    cells.push(Cell::from(Line::from(perms_spans)));
                     cells.push(Cell::from(Span::styled(
                         format!("{:>width$}", entry_cache.group_name, width = group_width),
-                        meta_style,
+                        group_style,
                     )));
                     cells.push(Cell::from(Span::styled(
                         format!("{:<width$}", entry_cache.owner_name, width = owner_width),
-                        meta_style,
+                        owner_style,
                     )));
                 }
                 if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
@@ -4075,7 +4186,9 @@ fn main() -> io::Result<()> {
                     };
                     cells.push(Cell::from(Span::styled(pct_col, pct_style)));
                 }
-                if show_date { cells.push(Cell::from(Span::styled(entry_cache.date_col.as_str(), date_style))); }
+                if show_date {
+                    cells.push(Cell::from(Span::styled(entry_cache.date_col.as_str(), date_style)));
+                }
                 Row::new(cells).style(if is_marked { Style::default().bg(Color::Rgb(0, 100, 150)) } else { Style::default() })
             }).collect();
 
