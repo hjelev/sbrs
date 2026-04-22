@@ -172,6 +172,12 @@ impl App {
                 ]);
             }
         }
+        if key == "mmdflux" {
+            install_steps.push(vec![
+                "tap".to_string(),
+                "kevinswiber/mmdflux".to_string(),
+            ]);
+        }
         install_steps.push(vec!["install".to_string(), package.clone()]);
 
         let mut failed_step: Option<String> = None;

@@ -601,6 +601,22 @@ impl App {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
+            } else if Self::is_mermaid_file(&tmp_path) && self.integration_active("mmdflux") {
+                if let Ok(mut child) = Command::new("mmdflux")
+                    .arg(&tmp_path)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mmd_out) = child.stdout.take() {
+                        shown = Command::new("less")
+                            .args(["-R"])
+                            .stdin(mmd_out)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                    }
+                    let _ = child.wait();
+                }
             } else if Self::is_html_file(&tmp_path) && self.integration_active("links") {
                 shown = Command::new("links")
                     .arg(&tmp_path)
@@ -2258,6 +2274,15 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 .status();
             println!("\nTip: install delta for side-by-side colored diff preview.");
         }
+
+        println!("\n$ git status");
+        let _ = Command::new("git")
+            .arg("status")
+            .current_dir(&self.current_dir)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
 
         print!("\nDo you really want to commit these changes? [y/N]: ");
         let _ = io::stdout().flush();
@@ -5029,6 +5054,26 @@ fn main() -> io::Result<()> {
                                     .arg("-p")
                                     .arg(&selected_path)
                                     .status();
+                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?;
+                                terminal.clear()?;
+                            }
+                            else if App::is_mermaid_file(&selected_path) && app.integration_active("mmdflux") {
+                                disable_raw_mode()?;
+                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                if let Ok(mut child) = Command::new("mmdflux")
+                                    .arg(&selected_path)
+                                    .stdout(Stdio::piped())
+                                    .spawn()
+                                {
+                                    if let Some(mmd_out) = child.stdout.take() {
+                                        let _ = Command::new("less")
+                                            .args(["-R"])
+                                            .stdin(mmd_out)
+                                            .status();
+                                    }
+                                    let _ = child.wait();
+                                }
                                 execute!(io::stdout(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;

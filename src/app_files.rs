@@ -133,6 +133,13 @@ impl App {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_mermaid_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("mmd"))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn is_pdf_file(path: &PathBuf) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
