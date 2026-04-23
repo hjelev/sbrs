@@ -321,8 +321,8 @@ struct App {
     current_dir_total_size_scan_id: u64,
     current_dir_total_size_pending: bool,
     current_dir_total_size_bytes: Option<u64>,
-    current_dir_free_bytes: Option<u64>,
     current_dir_total_space_bytes: Option<u64>,
+    current_dir_free_bytes: Option<u64>,
     recursive_mtime_rx: Option<Receiver<RecursiveMtimeMsg>>,
     recursive_mtime_scan_id: u64,
     selected_total_size_rx: Option<Receiver<SelectedTotalSizeMsg>>,
@@ -456,8 +456,8 @@ impl App {
             current_dir_total_size_scan_id: 0,
             current_dir_total_size_pending: false,
             current_dir_total_size_bytes: None,
-            current_dir_free_bytes: None,
             current_dir_total_space_bytes: None,
+            current_dir_free_bytes: None,
             recursive_mtime_rx: None,
             recursive_mtime_scan_id: 0,
             selected_total_size_rx: None,
@@ -3985,8 +3985,17 @@ fn main() -> io::Result<()> {
             let perms_width = 11usize;
             let group_width = app.meta_group_width.max(1);
             let owner_width = app.meta_owner_width.max(1);
-            let size_width = 6usize;
-            let pct_width = 6usize;
+            let size_width = if show_size {
+                app.entry_render_cache
+                    .iter()
+                    .map(|entry| entry.size_col.trim().chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
+            } else {
+                1
+            };
+            let pct_width = 4usize;
             let date_width = 16usize;
             let reserved_width = (if show_meta { perms_width + group_width + owner_width } else { 0 })
                 + (if show_size { size_width } else { 0 })
@@ -4046,16 +4055,6 @@ fn main() -> io::Result<()> {
                 Color::Rgb(r, g, b)
             };
 
-            let pct_shade_color = |t: f64| -> Color {
-                let t = t.clamp(0.0, 1.0);
-                let base = (220.0, 200.0, 120.0);
-                let white = (255.0, 255.0, 255.0);
-                let r = (base.0 + (white.0 - base.0) * t).round() as u8;
-                let g = (base.1 + (white.1 - base.1) * t).round() as u8;
-                let b = (base.2 + (white.2 - base.2) * t).round() as u8;
-                Color::Rgb(r, g, b)
-            };
-
             let date_rank_by_ts: HashMap<u64, f64> = if show_date {
                 let mut values: Vec<u64> = app
                     .entry_render_cache
@@ -4109,17 +4108,7 @@ fn main() -> io::Result<()> {
                     }
                     _ => Style::default().fg(Color::Green),
                 };
-                let pct_style = match (size_min_max, entry_cache.size_bytes) {
-                    (Some((min_size, max_size)), Some(entry_bytes)) if max_size > min_size => {
-                        let min_log = (min_size as f64 + 1.0).ln();
-                        let max_log = (max_size as f64 + 1.0).ln();
-                        let entry_log = (entry_bytes as f64 + 1.0).ln();
-                        let t = ((entry_log - min_log) / (max_log - min_log)).clamp(0.0, 1.0);
-                        Style::default().fg(pct_shade_color(t))
-                    }
-                    (Some(_), Some(_)) => Style::default().fg(pct_shade_color(0.0)),
-                    _ => Style::default().fg(Color::Rgb(220, 200, 120)),
-                };
+                let pct_style = size_style;
                 let date_style = entry_cache
                     .modified_unix
                     .and_then(|ts| date_rank_by_ts.get(&ts).copied())
@@ -4197,12 +4186,15 @@ fn main() -> io::Result<()> {
                         owner_style,
                     )));
                 }
-                if show_size { cells.push(Cell::from(Span::styled(entry_cache.size_col.as_str(), size_style))); }
+                if show_size {
+                    let size_col = format!("{:>width$}", entry_cache.size_col.trim(), width = size_width);
+                    cells.push(Cell::from(Span::styled(size_col, size_style)));
+                }
                 if show_pct {
                     let pct_col = match (app.current_dir_total_size_bytes, entry_cache.size_bytes) {
                         (Some(total), Some(entry_bytes)) if total > 0 => {
                             let pct = (entry_bytes as f64 * 100.0) / (total as f64);
-                            format!("{:>5.0}%", pct)
+                            format!("{:>width$}", format!("{:.0}%", pct), width = pct_width)
                         }
                         _ => format!("{:>width$}", "-", width = pct_width),
                     };
