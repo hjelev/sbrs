@@ -187,6 +187,7 @@ impl SortMode {
 enum AppMode {
     Browsing,
     PathEditing,
+    DbPreview,
     CommandInput,
     GitCommitMessage,
     GitTagInput,
@@ -360,6 +361,12 @@ struct App {
     meta_owner_width: usize,
     header_clock_minute_key: Option<i64>,
     header_clock_text: String,
+    db_preview_path: Option<PathBuf>,
+    db_preview_tables: Vec<String>,
+    db_preview_selected: usize,
+    db_preview_output_lines: Vec<String>,
+    db_preview_row_limit: usize,
+    db_preview_error: Option<String>,
 }
 
 const ZIP_BASED_EXTENSIONS: &[&str] = &[
@@ -495,6 +502,12 @@ impl App {
             meta_owner_width: 1,
             header_clock_minute_key: None,
             header_clock_text: String::new(),
+            db_preview_path: None,
+            db_preview_tables: Vec::new(),
+            db_preview_selected: 0,
+            db_preview_output_lines: Vec::new(),
+            db_preview_row_limit: 8,
+            db_preview_error: None,
         };
         app.refresh_header_clock_if_needed();
         app.refresh_entries()?;
@@ -2316,6 +2329,135 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .args(["-R", path.to_str().unwrap_or_default()])
             .status();
         Ok(())
+    }
+
+    fn sqlite_quote_ident(name: &str) -> String {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+
+    fn sqlite_query_rows(path: &PathBuf, sql: &str, with_header: bool) -> io::Result<Vec<Vec<String>>> {
+        let mut cmd = Command::new("sqlite3");
+        cmd.args(["-readonly", "-batch", "-separator", "\x1f", "-nullvalue", "NULL"]);
+        if with_header {
+            cmd.arg("-header");
+        } else {
+            cmd.arg("-noheader");
+        }
+        cmd.arg(path);
+        cmd.arg(sql);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if stderr.is_empty() {
+                "sqlite3 query failed".to_string()
+            } else {
+                format!("sqlite3 query failed: {}", stderr)
+            };
+            return Err(io::Error::other(msg));
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let rows = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.split('\x1f').map(|s| s.to_string()).collect::<Vec<String>>())
+            .collect::<Vec<Vec<String>>>();
+        Ok(rows)
+    }
+
+    fn sqlite_query_box_lines(path: &PathBuf, sql: &str) -> io::Result<Vec<String>> {
+        let out = Command::new("sqlite3")
+            .args(["-readonly", "-batch", "-header", "-box"])
+            .arg(path)
+            .arg(sql)
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if stderr.is_empty() {
+                "sqlite3 query failed".to_string()
+            } else {
+                format!("sqlite3 query failed: {}", stderr)
+            };
+            return Err(io::Error::other(msg));
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Ok(stdout.lines().map(|line| line.to_string()).collect())
+    }
+
+    fn sqlite_list_tables(path: &PathBuf) -> io::Result<Vec<String>> {
+        let rows = Self::sqlite_query_rows(
+            path,
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name;",
+            false,
+        )?;
+        let mut tables = rows
+            .into_iter()
+            .filter_map(|row| row.first().cloned())
+            .filter(|name| !name.trim().is_empty())
+            .collect::<Vec<String>>();
+        tables.sort();
+        tables.dedup();
+        Ok(tables)
+    }
+
+    fn refresh_sqlite_preview_rows(&mut self) {
+        self.db_preview_output_lines.clear();
+        self.db_preview_error = None;
+
+        let Some(path) = self.db_preview_path.clone() else {
+            return;
+        };
+        let Some(table_name) = self.db_preview_tables.get(self.db_preview_selected).cloned() else {
+            return;
+        };
+
+        let quoted_table = Self::sqlite_quote_ident(&table_name);
+        let sql = format!("SELECT * FROM {} LIMIT {};", quoted_table, self.db_preview_row_limit);
+        match Self::sqlite_query_box_lines(&path, &sql) {
+            Ok(lines) => {
+                self.db_preview_output_lines = lines;
+            }
+            Err(err) => {
+                self.db_preview_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn begin_sqlite_preview(&mut self, db_path: PathBuf) {
+        self.db_preview_path = Some(db_path.clone());
+        self.db_preview_tables.clear();
+        self.db_preview_selected = 0;
+        self.db_preview_output_lines.clear();
+        self.db_preview_error = None;
+
+        match Self::sqlite_list_tables(&db_path) {
+            Ok(tables) => {
+                self.db_preview_tables = tables;
+                if self.db_preview_tables.is_empty() {
+                    self.db_preview_error = Some("No tables/views found in this database".to_string());
+                } else {
+                    self.refresh_sqlite_preview_rows();
+                }
+            }
+            Err(err) => {
+                self.db_preview_error = Some(err.to_string());
+            }
+        }
+
+        self.mode = AppMode::DbPreview;
+    }
+
+    fn switch_sqlite_preview_table(&mut self, delta: isize) {
+        if self.db_preview_tables.is_empty() {
+            return;
+        }
+        let last = self.db_preview_tables.len().saturating_sub(1) as isize;
+        let next = (self.db_preview_selected as isize + delta).clamp(0, last) as usize;
+        if next != self.db_preview_selected {
+            self.db_preview_selected = next;
+            self.refresh_sqlite_preview_rows();
+        }
     }
 
     fn shell_single_quote(value: &str) -> String {
@@ -4505,6 +4647,109 @@ fn main() -> io::Result<()> {
                     cursor_x.min(popup_area.x + popup_area.width.saturating_sub(1)),
                     cursor_y,
                 );
+            } else if app.mode == AppMode::DbPreview {
+                let popup_area = Rect::new(
+                    tab_overlay_anchor.x,
+                    tab_overlay_anchor.y,
+                    tab_overlay_anchor.width,
+                    tab_overlay_anchor.height,
+                );
+
+                let db_title = app
+                    .db_preview_path
+                    .as_ref()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "SQLite Preview".to_string());
+
+                let mut lines: Vec<Line> = vec![
+                    Line::from(Span::styled(
+                        "Left/Right switch table  Home/End jump  Esc/q close",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+
+                let mut table_spans: Vec<Span> = vec![Span::styled(
+                    "Tables: ",
+                    Style::default().fg(Color::Rgb(160, 160, 160)),
+                )];
+                if app.db_preview_tables.is_empty() {
+                    table_spans.push(Span::styled(
+                        "(none)",
+                        Style::default().fg(Color::Rgb(180, 90, 90)),
+                    ));
+                } else {
+                    for (idx, table_name) in app.db_preview_tables.iter().enumerate() {
+                        if idx > 0 {
+                            table_spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+                        }
+                        let display = if table_name.chars().count() > 20 {
+                            let mut t = table_name.chars().take(19).collect::<String>();
+                            t.push('…');
+                            t
+                        } else {
+                            table_name.clone()
+                        };
+                        let style = if idx == app.db_preview_selected {
+                            Style::default()
+                                .fg(Color::Rgb(20, 20, 20))
+                                .bg(Color::Rgb(120, 220, 140))
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Rgb(170, 210, 255))
+                        };
+                        table_spans.push(Span::styled(display, style));
+                    }
+                }
+                lines.push(Line::from(table_spans));
+
+                if let Some(err) = &app.db_preview_error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        err.clone(),
+                        Style::default().fg(Color::Rgb(255, 120, 120)),
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                    if app.db_preview_output_lines.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "(no rows)",
+                            Style::default().fg(Color::Rgb(140, 140, 140)),
+                        )));
+                    } else {
+                        let visible_w = popup_area.width.saturating_sub(4) as usize;
+                        let clip_line = |text: &str| -> String {
+                            if text.chars().count() <= visible_w {
+                                return text.to_string();
+                            }
+                            if visible_w <= 1 {
+                                return "…".to_string();
+                            }
+                            let mut out = text.chars().take(visible_w - 1).collect::<String>();
+                            out.push('…');
+                            out
+                        };
+
+                        for row in &app.db_preview_output_lines {
+                            lines.push(Line::from(Span::styled(
+                                clip_line(row),
+                                Style::default().fg(Color::Rgb(210, 210, 210)),
+                            )));
+                        }
+                    }
+                }
+
+                f.render_widget(Clear, popup_area);
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!(" SQLite: {} ", db_title))
+                                .border_style(Style::default().fg(Color::Rgb(120, 200, 150))),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    popup_area,
+                );
             } else if app.mode == AppMode::Help {
                 let help_w = tab_overlay_anchor.width;
                 let inner_w = help_w.saturating_sub(4) as usize;
@@ -5670,6 +5915,13 @@ fn main() -> io::Result<()> {
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
+                            else if App::is_sqlite_db_file(&selected_path) {
+                                if app.integration_active("sqlite3") {
+                                    app.begin_sqlite_preview(selected_path);
+                                } else {
+                                    app.set_status("sqlite3 not found in PATH");
+                                }
+                            }
                             else if App::is_audio_file(&selected_path) && app.integration_active("sox") {
                                 use std::process::Stdio;
                                 disable_raw_mode()?;
@@ -5943,6 +6195,30 @@ fn main() -> io::Result<()> {
                     KeyCode::Home => app.input_move_home(),
                     KeyCode::End => app.input_move_end(),
                     KeyCode::Char(c) => app.input_insert_char(c),
+                    _ => {}
+                },
+                AppMode::DbPreview => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        app.mode = AppMode::Browsing;
+                    }
+                    KeyCode::Left => {
+                        app.switch_sqlite_preview_table(-1);
+                    }
+                    KeyCode::Right => {
+                        app.switch_sqlite_preview_table(1);
+                    }
+                    KeyCode::Home => {
+                        if !app.db_preview_tables.is_empty() {
+                            app.db_preview_selected = 0;
+                            app.refresh_sqlite_preview_rows();
+                        }
+                    }
+                    KeyCode::End => {
+                        if !app.db_preview_tables.is_empty() {
+                            app.db_preview_selected = app.db_preview_tables.len() - 1;
+                            app.refresh_sqlite_preview_rows();
+                        }
+                    }
                     _ => {}
                 },
                 AppMode::CommandInput => match key.code {

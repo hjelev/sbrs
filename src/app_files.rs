@@ -205,6 +205,22 @@ impl App {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_sqlite_db_file(path: &PathBuf) -> bool {
+        const SQLITE_EXTENSIONS: &[&str] = &[
+            "db",
+            "sqlite",
+            "sqlite3",
+            "db3",
+            "s3db",
+            "sl3",
+        ];
+
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| SQLITE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn is_binary_file(path: &PathBuf) -> bool {
         let Ok(mut file) = fs::File::open(path) else {
             return false;
