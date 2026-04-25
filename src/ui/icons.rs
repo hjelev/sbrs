@@ -111,24 +111,20 @@ pub fn named_file_icon(name: &str) -> Option<(&'static str, (u8, u8, u8))> {
     let name_low = name.to_lowercase();
     
     match name_low.as_str() {
-        // --- Specific Exact Matches ---
         "desktop" => Some(("\u{f10b5}", (100, 160, 240))),
         "documents" | "docs" => Some(("\u{f0c82}", (100, 160, 240))),
         "downloads" => Some(("\u{f024d}", (100, 200, 120))),
-        "music" => Some(("\u{f1359}", (180, 100, 220))),
-        "bin" => Some(("\u{F10BA}", (255, 183, 77))), // folder_wrench
-        "boot" => Some(("\u{F0251}", (255, 100, 100))), // folder_pwr
-        
-        // --- Fuzzy Matches (Contains) ---
+        "music" => Some(("\u{f075a}", (180, 100, 220))),
+        "legal" => Some(("\u{f08ea}", (255, 183, 77))),
+        "makefile" => Some(("\u{f1323}", (158, 158, 158))),
         _ if name_low.contains("lib") => Some(("\u{f0770}", (100, 181, 246))),
         
-        _ if name_low.contains("masoko") || name_low.contains("star") => {
-            Some(("\u{f069d}", (255, 183, 77)))
-        }
+        _ if name_low.contains("masoko") || name_low.contains("star") => Some(("\u{f04ce}", (255, 183, 77))),
+        _ if name_low.contains("love") || name_low.contains("heart") || name_low.contains("adult") => Some(("\u{f02d1}", (244, 67, 54))),
 
-        // --- Hidden File Fallback ---
-        _ if name.starts_with('.') => Some(("\u{f0255}", (120, 120, 120))),
-
+        _ if name_low.starts_with('.') => Some(("\u{f0613}", (120, 120, 120))),
+        _ if name_low.starts_with("license") => Some(("\u{f0fc3}", (120, 120, 120))),
+        _ if name_low.ends_with(".mmd") => Some(("\u{f154f}", (120, 120, 120))),
         _ => None,
     }
 }
