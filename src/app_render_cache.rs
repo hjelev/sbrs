@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, str::FromStr, time::UNIX_EPOCH};
 use chrono::{DateTime, Local};
 use devicons::{icon_for_file, File as DevFile, Theme};
 use ratatui::prelude::*;
-
+use crate::ui::icons::named_file_icon;
 use crate::{ui, App, EntryRenderCache, EntryRenderConfig};
 
 impl App {
@@ -28,7 +28,7 @@ impl App {
             (String::new(), Style::default())
         } else if config.nerd_font_active {
             if is_symlink {
-                ("".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
+                ("\u{f1177}".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
             } else if is_dir {
                 let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let dir_style = Style::default()
@@ -37,19 +37,26 @@ impl App {
                 if let Some((glyph, _)) = ui::icons::named_dir_icon(dir_name) {
                     (glyph.to_string(), dir_style)
                 } else {
-                    ("\u{F07B}".to_string(), dir_style)
+                    ("\u{f024b}".to_string(), dir_style)
                 }
             } else if Self::is_age_protected_file(&path) {
                 ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
             } else {
-                let icon = icon_data
-                    .as_ref()
-                    .map(|i| i.icon.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let color = icon_data
-                    .as_ref()
-                    .and_then(|i| Color::from_str(i.color).ok())
-                    .unwrap_or(Color::White);
+                let name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let (icon, color): (String, Color) = if let Some((custom_icon, (r, g, b))) = named_file_icon(name_str) {
+                    // 1. Check your custom rules FIRST
+                    (custom_icon.to_string(), Color::Rgb(r, g, b))
+                } else if let Some(data) = icon_data.as_ref() {
+                    // 2. Fallback to standard devicons
+                    let icon = data.icon.to_string();
+                    let color = Color::from_str(data.color).unwrap_or(Color::White);
+                    (icon, color)
+                } else {
+                    // 3. Final fallback
+                    ("?".to_string(), Color::White)
+                };
+
+                // Return the final tuple with the style applied
                 (icon, Style::default().fg(color))
             }
         } else if is_dir {

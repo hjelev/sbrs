@@ -213,7 +213,7 @@ pub fn list_current_directory(
                 if let Some((glyph, (r, g, b))) = named_dir_icon(dir_name) {
                     (glyph.to_string(), CtColor::Rgb { r, g, b })
                 } else {
-                    ("\u{F07B}".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
+                    ("\u{f024b}".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
                 }
             } else if App::is_age_protected_file(&path) {
                 ("".to_string(), CtColor::Rgb { r: 230, g: 190, b: 90 })
