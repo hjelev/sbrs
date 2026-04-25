@@ -4,6 +4,10 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 
 `sbrs` (Shell Buddy, or `sb` for short) is a keyboard-driven explorer focused on fast local navigation with optional integrations for previews, archive handling, searching, remote mounts, and lightweight Git workflows.
 
+## Screenshot
+
+![Shell Buddy screenshot](images/screenshot.png)
+
 ## Highlights
 
 - Single-binary terminal UI
