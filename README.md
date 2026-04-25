@@ -115,7 +115,7 @@ Use the installer there if you want the fastest setup without building from sour
 - `p`: protect/unprotect file with `age` (`.age`)
 - `F2` or `r`: rename (or bulk rename with `vidir` when multiple are marked)
 - `e` or `F4`: open in `$EDITOR` (or `hexedit` for binary if available)
-- `E`: split tmux session with shell on the left and `$EDITOR` on the right
+- `E`: split tmux session with shell on the left and `$EDITOR` on the right (`Ctrl+e` is clipboard edit)
 - `n`: new file
 - `N`: new folder
 - `Ctrl+n`: add/edit note for selected item(s)

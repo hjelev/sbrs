@@ -4791,7 +4791,7 @@ fn main() -> io::Result<()> {
                             ("*", "Toggle all marks"),
                             ("c / F5", "Copy selected/marked item(s) to app clipboard"),
                             ("Ctrl+c", "Copy full path(s) to system clipboard"),
-                            ("E", "Edit system clipboard content via temporary file"),
+                            ("Ctrl+e", "Edit system clipboard content via temporary file"),
                             ("v", "Paste clipboard into current folder"),
                             ("m", "Move clipboard into current folder"),
                             ("", ""),
@@ -4834,7 +4834,7 @@ fn main() -> io::Result<()> {
                         [
                             ("h", "Open help"),
                             ("q / Esc", "Quit Shell Buddy"),
-                            ("", ""),
+                            ("t", "Open ~/.todo in $EDITOR (creates if missing)"),
                             ("", ""),
                             ("", ""),
                             ("", ""),
