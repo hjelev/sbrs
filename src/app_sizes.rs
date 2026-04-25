@@ -366,12 +366,12 @@ impl App {
             .unwrap_or_else(|| format!("free: ? ({})", free_pct));
 
         if self.current_dir_total_size_pending {
-            return Some(format!("dir size: scanning... ({}) | {}", folder_pct, free_part));
+            return Some(format!("folder: scanning... ({}) | {}", folder_pct, free_part));
         }
 
         Some(match self.current_dir_total_size_bytes {
-            Some(bytes) => format!("dir size: {} ({}) | {}", Self::format_size(bytes), folder_pct, free_part),
-            None => format!("dir size: ? ({}) | {}", folder_pct, free_part),
+            Some(bytes) => format!("folder: {} ({}) | {}", Self::format_size(bytes), folder_pct, free_part),
+            None => format!("folder: ? ({}) | {}", folder_pct, free_part),
         })
     }
 
