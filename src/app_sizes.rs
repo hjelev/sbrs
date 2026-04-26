@@ -15,6 +15,26 @@ use crate::{
 };
 
 impl App {
+    pub(crate) fn apply_cached_folder_size_columns(&mut self) {
+        if !self.folder_size_enabled {
+            return;
+        }
+
+        let size_width = 6usize;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if let Some(size) = self.folder_size_cache.get(&path).copied() {
+                self.entry_render_cache[idx].size_col =
+                    format!("{:>width$}", Self::format_size(size), width = size_width);
+                self.entry_render_cache[idx].size_bytes = Some(size);
+            }
+        }
+    }
+
     pub(crate) fn start_recursive_mtime_scan(&mut self) {
         self.recursive_mtime_scan_id = self.recursive_mtime_scan_id.wrapping_add(1);
         let scan_id = self.recursive_mtime_scan_id;
@@ -394,6 +414,7 @@ impl App {
         self.reset_folder_size_columns();
 
         if enabled {
+            self.apply_cached_folder_size_columns();
             self.set_status("folder size calculation: on");
             self.start_folder_size_scan();
             self.start_current_dir_total_size_scan();
@@ -411,11 +432,16 @@ impl App {
         };
 
         let mut keep_rx = true;
+        let mut any_size_changed = false;
         loop {
             match rx.try_recv() {
                 Ok(FolderSizeMsg::EntrySize(scan_id, dir_path, size)) => {
                     if !self.folder_size_enabled || scan_id != self.folder_size_scan_id {
                         continue;
+                    }
+                    let previous = self.folder_size_cache.insert(dir_path.clone(), size);
+                    if previous != Some(size) {
+                        any_size_changed = true;
                     }
                     if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
                         self.entry_render_cache[idx].size_col =
@@ -434,6 +460,10 @@ impl App {
                     break;
                 }
             }
+        }
+
+        if any_size_changed && matches!(self.sort_mode, crate::SortMode::SizeAsc | crate::SortMode::SizeDesc) {
+            self.apply_sort_to_current_entries();
         }
 
         if keep_rx && self.folder_size_enabled {

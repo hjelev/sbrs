@@ -306,6 +306,10 @@ pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Optio
             "-l" => {
                 list_mode_seen = true;
             }
+            "-a" => {
+                list_mode_seen = true;
+                include_hidden = true;
+            }
             "-la" => {
                 list_mode_seen = true;
                 include_hidden = true;
@@ -325,6 +329,84 @@ pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Optio
     } else {
         None
     }
+}
+
+pub fn validate_cli_args(args: &[String]) -> Result<(), String> {
+    let mut positional_count = 0usize;
+
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" | "-V" | "--version" | "-l" | "-a" | "-la" | "-e" | "--total-size" => {}
+            other if other.starts_with('-') => {
+                return Err(format!("unrecognized option: {}", other));
+            }
+            _ => {
+                positional_count += 1;
+                if positional_count > 1 {
+                    return Err("too many positional arguments".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectFileMode {
+    ViewNoPager,
+    ViewWithPager,
+    Edit,
+}
+
+pub fn parse_direct_file_mode_args<'a>(args: &'a [String]) -> Option<(DirectFileMode, &'a str)> {
+    let mut edit_mode = false;
+    let mut pager_mode = false;
+    let mut has_hidden_list_mode = false;
+    let mut has_unknown_flag = false;
+    let mut path: Option<&str> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "-e" => {
+                edit_mode = true;
+            }
+            "-l" => {
+                pager_mode = true;
+            }
+            "-a" => {
+                has_hidden_list_mode = true;
+            }
+            "-la" => {
+                has_hidden_list_mode = true;
+            }
+            "--total-size" => {}
+            other if !other.starts_with('-') && path.is_none() => {
+                path = Some(other);
+            }
+            other if other.starts_with('-') => {
+                has_unknown_flag = true;
+            }
+            _ => {}
+        }
+    }
+
+    let path = path?;
+
+    // Keep -a/-la reserved for list mode semantics.
+    if has_hidden_list_mode || has_unknown_flag {
+        return None;
+    }
+
+    let mode = if edit_mode {
+        DirectFileMode::Edit
+    } else if pager_mode {
+        DirectFileMode::ViewWithPager
+    } else {
+        DirectFileMode::ViewNoPager
+    };
+
+    Some((mode, path))
 }
 
 pub fn print_version() {
@@ -399,9 +481,11 @@ pub fn print_help() {
             })
             .attribute(Attribute::Bold)
     );
-    println!("  -l [PATH]      List folder and exit");
-    println!("  -la [PATH]     List folder including hidden files and exit");
-    println!("  --total-size   With -l/-la: recursive size + percent columns");
+    println!("  -l [PATH]      List folder and exit; with FILE uses pager mode");
+    println!("  -a [PATH]      List folder including hidden files and exit");
+    println!("  -la [PATH]     Same as -a");
+    println!("  -e [FILE]      Open file in $EDITOR (fallback: nano)");
+    println!("  --total-size   With -l/-a/-la: recursive size + percent columns");
     println!("  -h, --help     Show this help message");
     println!("  -V, --version  Show app name and current version");
 }

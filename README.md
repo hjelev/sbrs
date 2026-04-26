@@ -32,8 +32,10 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 - Tabbed Help/Search/Bookmarks/Remote Mounts/Sorting/Integrations overlays (`Tab` / `Shift+Tab`)
 - Built-in async Search overlay with filename/content scope, regex support, and highlighted matches
 - In-app command runner (`;`) with "press any key to return" pause
-- CLI list mode: `-l`, `-la`, and optional `--total-size` recursive size/% columns
-- Direct file mode: `sbrs <file>` opens the file immediately with the best available viewer
+- CLI list mode: `-l`, `-a`/`-la`, and optional `--total-size` recursive size/% columns
+- Direct file mode: `sbrs <file>` opens immediately with best available viewer (no pager)
+- Pager file mode: `sbrs -l <file>` opens immediate viewer output in pager mode
+- Edit file mode: `sbrs -e <file>` opens the file in `$EDITOR` (fallback: `nano`)
 - Writes last directory to `/tmp/sb_path` on exit for shell integration
 
 ## Build and Run
@@ -62,6 +64,7 @@ List mode examples:
 sbrs -l
 
 # Include hidden entries
+sbrs -a
 sbrs -la
 
 # Recursive display size + percent share columns
@@ -74,19 +77,28 @@ sbrs --total-size -l /var/log
 # Open a file directly with the best available previewer/viewer
 sbrs README.md
 sbrs diagram.mmd
+
+# Open a file with pager mode enabled
+sbrs -l README.md
+
+# Open a file in $EDITOR (fallback: nano)
+sbrs -e README.md
 ```
 
 ## CLI List Mode
 
 - `-l [PATH]`: list directory entries and exit.
+- `-a [PATH]`: same as `-l`, but includes hidden files.
 - `-la [PATH]`: same as `-l`, but includes hidden files.
-- `--total-size`: when used with `-l` or `-la`, shows recursive display size for each entry and a `%` column with that entry's share of the listed total.
+- `-e [FILE]`: open file in `$EDITOR` (fallback: `nano`) and exit.
+- `--total-size`: when used with `-l`, `-a`, or `-la`, shows recursive display size for each entry and a `%` column with that entry's share of the listed total.
 
 Notes:
 
-- `PATH` is optional and can be placed after `-l`/`-la` or after `--total-size`.
+- `PATH` is optional and can be placed after `-l`/`-a`/`-la` or after `--total-size`.
 - The list output reuses the file manager's auto-calculated owner/group column widths for consistent alignment.
-- When invoked as `sbrs <FILE>`, the app skips the TUI and opens that file directly using the same preview dispatch used by `Enter` inside the file manager.
+- When invoked as `sbrs <FILE>`, the app skips the TUI and opens the file directly with best-available viewer output (no pager).
+- When invoked as `sbrs -l <FILE>`, direct file mode uses pager-enabled output.
 
 ## Installation
 

@@ -297,6 +297,7 @@ struct App {
     git_info_cache: Option<GitInfoCache>,
     git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool, Option<(String, u64)>)>)>>,
     folder_size_enabled: bool,
+    folder_size_cache: HashMap<PathBuf, u64>,
     folder_size_rx: Option<Receiver<FolderSizeMsg>>,
     folder_size_scan_id: u64,
     current_dir_total_size_rx: Option<Receiver<CurrentDirTotalSizeMsg>>,
@@ -377,6 +378,36 @@ fn env_flag_true(names: &[&str]) -> bool {
 }
 
 impl App {
+    fn open_path_in_editor_cli(path: &PathBuf) -> io::Result<()> {
+        // Check if file is binary and use appropriate editor
+        if Self::is_binary_file(path) {
+            // Try hexedit first (interactive binary editor)
+            if Self::integration_probe("hexedit").0 {
+                let _ = Command::new("hexedit").arg(path).status();
+                return Ok(());
+            }
+            // Fall back to hexyl with less paging if hexedit is not available
+            if Self::integration_probe("hexyl").0 {
+                if let Ok(mut child) = Command::new("hexyl")
+                    .arg(path)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(hex_out) = child.stdout.take() {
+                        let _ = Command::new("less").args(["-R"]).stdin(hex_out).status();
+                    }
+                    let _ = child.wait();
+                }
+                return Ok(());
+            }
+        }
+
+        // For text files or if no binary editors available, use regular editor
+        let editor = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
+        let _ = Command::new(editor).arg(path).status()?;
+        Ok(())
+    }
+
     fn new() -> io::Result<Self> {
         let current_dir = env::current_dir()?;
         let internal_search_content_limits = Self::internal_search_content_limits();
@@ -438,6 +469,7 @@ impl App {
             git_info_cache: None,
             git_info_rx: None,
             folder_size_enabled: false,
+            folder_size_cache: HashMap::new(),
             folder_size_rx: None,
             folder_size_scan_id: 0,
             current_dir_total_size_rx: None,
@@ -910,7 +942,11 @@ IFS= read -rsn1 _
             .to_ascii_lowercase()
     }
 
-    fn sort_entries_by_mode(entries: &mut Vec<fs::DirEntry>, mode: SortMode) {
+    fn sort_entries_by_mode(
+        entries: &mut Vec<fs::DirEntry>,
+        mode: SortMode,
+        folder_size_cache: Option<&HashMap<PathBuf, u64>>,
+    ) {
         if entries.len() < 2 {
             return;
         }
@@ -921,8 +957,23 @@ IFS= read -rsn1 _
             .map(|m| m.as_ref().map(|m| m.is_dir()).unwrap_or(false))
             .collect();
         let names: Vec<String> = entries.iter().map(|e| Self::entry_name_key(e)).collect();
+        let paths: Vec<PathBuf> = entries.iter().map(|e| e.path()).collect();
         let sizes: Vec<u64>    = metas.iter()
-            .map(|m| m.as_ref().map(|m| m.len()).unwrap_or(0))
+            .enumerate()
+            .map(|(idx, m)| {
+                let default_size = m.as_ref().map(|m| m.len()).unwrap_or(0);
+                if !matches!(mode, SortMode::SizeAsc | SortMode::SizeDesc) {
+                    return default_size;
+                }
+
+                if is_dirs[idx] {
+                    folder_size_cache
+                        .and_then(|cache| cache.get(&paths[idx]).copied())
+                        .unwrap_or(0)
+                } else {
+                    default_size
+                }
+            })
             .collect();
         let times: Vec<u64>    = metas.iter().map(|m| {
             m.as_ref()
@@ -964,7 +1015,12 @@ IFS= read -rsn1 _
             .filter_map(|idx| self.entries.get(*idx).map(|e| e.path()))
             .collect();
 
-        Self::sort_entries_by_mode(&mut self.entries, self.sort_mode);
+        let folder_size_cache = if self.folder_size_enabled {
+            Some(&self.folder_size_cache)
+        } else {
+            None
+        };
+        Self::sort_entries_by_mode(&mut self.entries, self.sort_mode, folder_size_cache);
 
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
@@ -972,6 +1028,7 @@ IFS= read -rsn1 _
             self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
+        self.apply_cached_folder_size_columns();
         self.refresh_meta_identity_widths();
 
         self.marked_indices = self
@@ -1782,7 +1839,12 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .filter(|e| self.show_hidden || !e.file_name().to_string_lossy().starts_with('.'))
             .collect();
 
-        Self::sort_entries_by_mode(&mut entries, self.sort_mode);
+        let folder_size_cache = if self.folder_size_enabled {
+            Some(&self.folder_size_cache)
+        } else {
+            None
+        };
+        Self::sort_entries_by_mode(&mut entries, self.sort_mode, folder_size_cache);
         if let Some(filter) = self.path_input_filter.as_ref() {
             let filter_regex = Self::build_path_filter_regex(filter)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -1798,6 +1860,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             self.entry_render_cache = self.entries.iter()
             .map(|entry| App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache))
             .collect();
+        self.apply_cached_folder_size_columns();
         self.refresh_meta_identity_widths();
         self.refresh_current_dir_free_space();
         self.folder_size_scan_id = self.folder_size_scan_id.wrapping_add(1);
@@ -2185,7 +2248,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         Ok(())
     }
 
-    fn open_path_in_view_mode(path: &PathBuf) -> io::Result<()> {
+    fn open_path_in_view_mode(path: &PathBuf, use_pager: bool) -> io::Result<()> {
         if Self::is_image_file(path) {
             if Self::integration_probe("viu").0 {
                 let _ = Command::new("viu").arg(path).status();
@@ -2198,20 +2261,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         if Self::is_markdown_file(path) && Self::integration_probe("glow").0 {
-            let _ = Command::new("glow").arg("-p").arg(path).status();
+            let mut cmd = Command::new("glow");
+            if use_pager {
+                cmd.arg("-p");
+            }
+            let _ = cmd.arg(path).status();
             return Ok(());
         }
 
         if Self::is_mermaid_file(path) && Self::integration_probe("mmdflux").0 {
-            if let Ok(mut child) = Command::new("mmdflux")
-                .arg(path)
-                .stdout(Stdio::piped())
-                .spawn()
-            {
-                if let Some(mmd_out) = child.stdout.take() {
-                    let _ = Command::new("less").args(["-R"]).stdin(mmd_out).status();
+            if use_pager {
+                if let Ok(mut child) = Command::new("mmdflux")
+                    .arg(path)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(mmd_out) = child.stdout.take() {
+                        let _ = Command::new("less").args(["-R"]).stdin(mmd_out).status();
+                    }
+                    let _ = child.wait();
                 }
-                let _ = child.wait();
+            } else {
+                let _ = Command::new("mmdflux").arg(path).status();
             }
             return Ok(());
         }
@@ -2252,27 +2323,35 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         if Self::is_pdf_file(path) && Self::integration_probe("pdftotext").0 {
-            let mut shown = false;
-            if let Ok(mut child) = Command::new("pdftotext")
-                .args(["-layout", "-nopgbrk"])
-                .arg(path)
-                .arg("-")
-                .stdout(Stdio::piped())
-                .spawn()
-            {
-                if let Some(pdf_text) = child.stdout.take() {
-                    shown = Command::new("less")
-                        .args(["-R"])
-                        .stdin(pdf_text)
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
+            if use_pager {
+                let mut shown = false;
+                if let Ok(mut child) = Command::new("pdftotext")
+                    .args(["-layout", "-nopgbrk"])
+                    .arg(path)
+                    .arg("-")
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(pdf_text) = child.stdout.take() {
+                        shown = Command::new("less")
+                            .args(["-R"])
+                            .stdin(pdf_text)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                    }
+                    let _ = child.wait();
                 }
-                let _ = child.wait();
-            }
-            if !shown {
-                let _ = Command::new("less")
-                    .args(["-R", path.to_str().unwrap_or_default()])
+                if !shown {
+                    let _ = Command::new("less")
+                        .args(["-R", path.to_str().unwrap_or_default()])
+                        .status();
+                }
+            } else {
+                let _ = Command::new("pdftotext")
+                    .args(["-layout", "-nopgbrk"])
+                    .arg(path)
+                    .arg("-")
                     .status();
             }
             return Ok(());
@@ -2284,31 +2363,43 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         if Self::is_binary_file(path) && Self::integration_probe("hexyl").0 {
-            if let Ok(child) = Command::new("hexyl")
-                .arg(path)
-                .stdout(Stdio::piped())
-                .spawn()
-            {
-                let _ = Command::new("less")
-                    .args(["-R"])
-                    .stdin(child.stdout.unwrap())
-                    .status();
+            if use_pager {
+                if let Ok(child) = Command::new("hexyl")
+                    .arg(path)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                {
+                    let _ = Command::new("less")
+                        .args(["-R"])
+                        .stdin(child.stdout.unwrap())
+                        .status();
+                    return Ok(());
+                }
+            } else {
+                let _ = Command::new("hexyl").arg(path).status();
                 return Ok(());
             }
         }
 
         if Self::integration_probe("bat").0 {
             let bat_cmd = Self::bat_tool().unwrap_or_else(|| "bat".to_string());
+            let paging = if use_pager { "always" } else { "never" };
             let _ = Command::new(bat_cmd)
-                .args(["--paging=always", "--style=full", "--color=always"])
+                .args([&format!("--paging={}", paging), "--style=full", "--color=always"])
                 .arg(path)
                 .status();
             return Ok(());
         }
 
-        let _ = Command::new("less")
-            .args(["-R", path.to_str().unwrap_or_default()])
-            .status();
+        if use_pager {
+            let _ = Command::new("less")
+                .args(["-R", path.to_str().unwrap_or_default()])
+                .status();
+        } else {
+            let _ = Command::new("cat")
+                .arg(path)
+                .status();
+        }
         Ok(())
     }
 
@@ -3974,14 +4065,43 @@ fn main() -> io::Result<()> {
         ui::cli::print_version();
         return Ok(());
     }
+    if let Err(message) = ui::cli::validate_cli_args(&args) {
+        eprintln!("Error: {}", message);
+        eprintln!("Run with --help to see supported usage.");
+        return Ok(());
+    }
     if let Some((include_hidden, include_total_size, path)) = ui::cli::parse_list_mode_args(&args) {
+        if !include_hidden {
+            if let Some(path) = path {
+                let target = PathBuf::from(path);
+                if target.is_file() {
+                    return App::open_path_in_view_mode(&target, true);
+                }
+            }
+        }
         return ui::cli::list_current_directory(include_hidden, include_total_size, path);
     }
 
-    if args.len() == 1 && !args[0].starts_with('-') {
-        let target = PathBuf::from(&args[0]);
+    if let Some((mode, path)) = ui::cli::parse_direct_file_mode_args(&args) {
+        let target = PathBuf::from(path);
         if target.is_file() {
-            return App::open_path_in_view_mode(&target);
+            return match mode {
+                ui::cli::DirectFileMode::ViewNoPager => App::open_path_in_view_mode(&target, false),
+                ui::cli::DirectFileMode::ViewWithPager => App::open_path_in_view_mode(&target, true),
+                ui::cli::DirectFileMode::Edit => App::open_path_in_editor_cli(&target),
+            };
+        } else if target.is_dir() && matches!(mode, ui::cli::DirectFileMode::Edit) {
+            // If -e is used with a directory, open the TUI file manager in that directory
+            let _ = env::set_current_dir(&target);
+        }
+    }
+
+    // If a single argument is provided that is a directory, list it like -l
+    if args.len() == 1 && !args[0].starts_with('-') {
+        if let Ok(target) = PathBuf::from(&args[0]).canonicalize() {
+            if target.is_dir() {
+                return ui::cli::list_current_directory(false, false, Some(&args[0]));
+            }
         }
     }
 
