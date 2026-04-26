@@ -4293,6 +4293,19 @@ fn main() -> io::Result<()> {
             app.page_size = (table_area.height as usize).saturating_sub(1).max(1);
             f.render_stateful_widget(table, table_area, &mut app.table_state);
 
+            if app.entries.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "No files or folders yet. Use the 'n' or 'N' buttons to break the silence.",
+                        Style::default()
+                            .fg(Color::Rgb(140, 140, 140))
+                            .add_modifier(Modifier::ITALIC),
+                    )))
+                    .alignment(Alignment::Left),
+                    table_area,
+                );
+            }
+
             // If the selected item is truncated, temporarily hide its metadata and
             // render its full name across the whole row width.
             if let Some(selected_idx) = app.table_state.selected() {
@@ -5239,7 +5252,13 @@ fn main() -> io::Result<()> {
             }
 
             // --- Footer ---
-            let mut left_status_parts = vec![format!("Total:{}", app.entries.len())];
+            let total_entries = app.entries.len();
+            let selected_ordinal = if total_entries == 0 {
+                0
+            } else {
+                app.selected_index.min(total_entries - 1) + 1
+            };
+            let mut left_status_parts = vec![format!("{}/{}", selected_ordinal, total_entries)];
             if !app.clipboard.is_empty() {
                 left_status_parts.push(format!("Clipboard:{}", app.clipboard.len()));
             }
