@@ -157,11 +157,11 @@ fn tree_prefix_compact(ancestor_last: &[bool], is_last: bool) -> String {
     let mut out = String::new();
     for ancestor_is_last in ancestor_last.iter().skip(1) {
         if *ancestor_is_last {
-            out.push(' ');
+            out.push_str("  ");
         } else {
-            out.push('│');
+            out.push_str("│ ");
         }
     }
-    out.push_str(if is_last { "╰" } else { "├" });
+    out.push_str(if is_last { "╰─" } else { "├─" });
     out
 }
