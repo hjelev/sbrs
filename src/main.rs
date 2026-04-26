@@ -127,7 +127,7 @@ enum ArchiveKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SortMode {
+pub(crate) enum SortMode {
     NameAsc,
     NameDesc,
     ExtensionAsc,
@@ -300,6 +300,9 @@ struct App {
     folder_size_cache: HashMap<PathBuf, u64>,
     folder_size_rx: Option<Receiver<FolderSizeMsg>>,
     folder_size_scan_id: u64,
+    tree_expansion_levels: HashMap<PathBuf, usize>,
+    tree_last_tap: Option<(char, Instant)>,
+    tree_row_prefixes: Vec<String>,
     current_dir_total_size_rx: Option<Receiver<CurrentDirTotalSizeMsg>>,
     current_dir_total_size_scan_id: u64,
     current_dir_total_size_pending: bool,
@@ -384,7 +387,6 @@ impl App {
             // Try hexedit first (interactive binary editor)
             if Self::integration_probe("hexedit").0 {
                 let _ = Command::new("hexedit").arg(path).status();
-                return Ok(());
             }
             // Fall back to hexyl with less paging if hexedit is not available
             if Self::integration_probe("hexyl").0 {
@@ -472,6 +474,9 @@ impl App {
             folder_size_cache: HashMap::new(),
             folder_size_rx: None,
             folder_size_scan_id: 0,
+            tree_expansion_levels: HashMap::new(),
+            tree_last_tap: None,
+            tree_row_prefixes: Vec::new(),
             current_dir_total_size_rx: None,
             current_dir_total_size_scan_id: 0,
             current_dir_total_size_pending: false,
@@ -942,7 +947,7 @@ IFS= read -rsn1 _
             .to_ascii_lowercase()
     }
 
-    fn sort_entries_by_mode(
+    pub(crate) fn sort_entries_by_mode(
         entries: &mut Vec<fs::DirEntry>,
         mode: SortMode,
         folder_size_cache: Option<&HashMap<PathBuf, u64>>,
@@ -1008,6 +1013,17 @@ IFS= read -rsn1 _
     }
 
     fn apply_sort_to_current_entries(&mut self) {
+        if !self.tree_expansion_levels.is_empty() {
+            let selected_path = self.entries.get(self.selected_index).map(|e| e.path());
+            let _ = self.refresh_entries();
+            if let Some(path) = selected_path {
+                if let Some(idx) = self.entries.iter().position(|e| e.path() == path) {
+                    self.selected_index = idx;
+                    self.table_state.select(Some(idx));
+                }
+            }
+            return;
+        }
         let selected_path = self.entries.get(self.selected_index).map(|e| e.path());
         let marked_paths: HashSet<PathBuf> = self
             .marked_indices
@@ -1834,26 +1850,58 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     }
 
     fn refresh_entries(&mut self) -> io::Result<()> {
-        let mut entries: Vec<_> = fs::read_dir(&self.current_dir)?
-            .filter_map(|res| res.ok())
-            .filter(|e| self.show_hidden || !e.file_name().to_string_lossy().starts_with('.'))
-            .collect();
-
         let folder_size_cache = if self.folder_size_enabled {
             Some(&self.folder_size_cache)
         } else {
             None
         };
-        Self::sort_entries_by_mode(&mut entries, self.sort_mode, folder_size_cache);
+        let mut tree_row_prefixes = Vec::new();
+        let mut entries: Vec<_> = if !self.tree_expansion_levels.is_empty() {
+            let rows = ui::tree::collect_tree_rows_with_expansions(
+                &self.current_dir,
+                self.show_hidden,
+                self.sort_mode,
+                folder_size_cache,
+                &self.tree_expansion_levels,
+            )?;
+            tree_row_prefixes = rows.iter().map(|row| row.prefix.clone()).collect();
+            rows.into_iter().map(|row| row.entry).collect()
+        } else {
+            let mut direct_entries: Vec<_> = fs::read_dir(&self.current_dir)?
+                .filter_map(|res| res.ok())
+                .filter(|e| self.show_hidden || !e.file_name().to_string_lossy().starts_with('.'))
+                .collect();
+            Self::sort_entries_by_mode(&mut direct_entries, self.sort_mode, folder_size_cache);
+            direct_entries
+        };
         if let Some(filter) = self.path_input_filter.as_ref() {
             let filter_regex = Self::build_path_filter_regex(filter)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            entries.retain(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                Self::entry_name_matches_path_filter(&name, &filter_regex)
-            });
+            if !self.tree_expansion_levels.is_empty() {
+                let mut filtered_entries = Vec::new();
+                let mut filtered_prefixes = Vec::new();
+                for (entry, prefix) in entries.into_iter().zip(tree_row_prefixes.into_iter()) {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if Self::entry_name_matches_path_filter(&name, &filter_regex) {
+                        filtered_entries.push(entry);
+                        filtered_prefixes.push(prefix);
+                    }
+                }
+                entries = filtered_entries;
+                tree_row_prefixes = filtered_prefixes;
+            } else {
+                entries.retain(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    Self::entry_name_matches_path_filter(&name, &filter_regex)
+                });
+            }
         }
         self.entries = entries;
+        self.tree_row_prefixes = if !self.tree_expansion_levels.is_empty() {
+            tree_row_prefixes
+        } else {
+            vec![String::new(); self.entries.len()]
+        };
         let config = EntryRenderConfig { nerd_font_active: self.nerd_font_active, show_icons: self.show_icons };
         let uid_cache = App::build_uid_cache(&self.entries);
         let gid_cache = App::build_gid_cache(&self.entries);
@@ -4070,16 +4118,21 @@ fn main() -> io::Result<()> {
         eprintln!("Run with --help to see supported usage.");
         return Ok(());
     }
-    if let Some((include_hidden, include_total_size, path)) = ui::cli::parse_list_mode_args(&args) {
-        if !include_hidden {
-            if let Some(path) = path {
+    if let Some(list_args) = ui::cli::parse_list_mode_args(&args) {
+        if !list_args.include_hidden && list_args.tree_depth.is_none() {
+            if let Some(path) = list_args.path {
                 let target = PathBuf::from(path);
                 if target.is_file() {
                     return App::open_path_in_view_mode(&target, true);
                 }
             }
         }
-        return ui::cli::list_current_directory(include_hidden, include_total_size, path);
+        return ui::cli::list_current_directory(
+            list_args.include_hidden,
+            list_args.include_total_size,
+            list_args.tree_depth,
+            list_args.path,
+        );
     }
 
     if let Some((mode, path)) = ui::cli::parse_direct_file_mode_args(&args) {
@@ -4100,7 +4153,7 @@ fn main() -> io::Result<()> {
     if args.len() == 1 && !args[0].starts_with('-') {
         if let Ok(target) = PathBuf::from(&args[0]).canonicalize() {
             if target.is_dir() {
-                return ui::cli::list_current_directory(false, false, Some(&args[0]));
+                return ui::cli::list_current_directory(false, false, None, Some(&args[0]));
             }
         }
     }
@@ -4264,6 +4317,7 @@ fn main() -> io::Result<()> {
             };
 
             let note_style = Style::default().fg(Color::Rgb(150, 150, 150));
+            let tree_style = Style::default().fg(Color::Rgb(140, 140, 140));
 
             // Keep selected-row background while preserving per-span foreground colors
             // (e.g. filename white, note text gray).
@@ -4325,10 +4379,14 @@ fn main() -> io::Result<()> {
                     .get(&entry_cache.raw_name)
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, name_text_width);
+                let tree_prefix = app.tree_row_prefixes.get(idx).map(|s| s.as_str()).unwrap_or("");
+                let icon_prefix_width = if app.show_icons && !entry_cache.icon_glyph.is_empty() { 2usize } else { 0usize };
+                let prefix_width = tree_prefix.chars().count();
+                let available_name_width = name_text_width.saturating_sub(prefix_width + icon_prefix_width).max(1);
+                let rendered_name = truncate_with_ellipsis(&entry_cache.raw_name, available_name_width);
                 let mut rendered_note = String::new();
                 if !note_text.is_empty() {
-                    let used = rendered_name.chars().count();
+                    let used = prefix_width + icon_prefix_width + rendered_name.chars().count();
                     let sep = "  ";
                     let sep_len = sep.chars().count();
                     if used + sep_len < name_text_width {
@@ -4344,6 +4402,9 @@ fn main() -> io::Result<()> {
                     let mut spans = vec![];
                     if !marker.is_empty() {
                         spans.push(Span::raw(marker));
+                    }
+                    if !tree_prefix.is_empty() {
+                        spans.push(Span::styled(tree_prefix.to_string(), tree_style));
                     }
                     if app.show_icons {
                         spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
@@ -4430,8 +4491,9 @@ fn main() -> io::Result<()> {
             // render its full name across the whole row width.
             if let Some(selected_idx) = app.table_state.selected() {
                 if let Some(entry_cache) = app.entry_render_cache.get(selected_idx) {
+                    let tree_prefix = app.tree_row_prefixes.get(selected_idx).map(|s| s.as_str()).unwrap_or("");
                     let full_name = entry_cache.raw_name.as_str();
-                    if full_name.chars().count() > file_name_width {
+                    if tree_prefix.chars().count() + full_name.chars().count() > file_name_width {
                         let offset = app.table_state.offset();
                         if selected_idx >= offset {
                             let row_in_view = selected_idx - offset;
@@ -4452,7 +4514,7 @@ fn main() -> io::Result<()> {
                                 };
                                 let note_text = app
                                     .notes_by_name
-                                    .get(full_name)
+                                    .get(entry_cache.raw_name.as_str())
                                     .map(|s| s.as_str())
                                     .unwrap_or("");
                                 let note_suffix = if note_text.is_empty() {
@@ -4472,10 +4534,13 @@ fn main() -> io::Result<()> {
                                         if !marker.is_empty() {
                                             spans.push(Span::raw(marker));
                                         }
+                                        if !tree_prefix.is_empty() {
+                                            spans.push(Span::styled(tree_prefix.to_string(), tree_style));
+                                        }
                                         if app.show_icons {
                                             spans.push(Span::styled(format!("{} ", entry_cache.icon_glyph), icon_style));
                                         }
-                                        spans.push(Span::styled(full_name, name_style));
+                                        spans.push(Span::styled(full_name.to_string(), name_style));
                                         if !note_suffix.is_empty() {
                                             spans.push(Span::styled(note_suffix, note_style));
                                         }
@@ -5711,6 +5776,20 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('s') => {
                         let enabled = !app.folder_size_enabled;
                         app.set_folder_size_enabled(enabled);
+                    }
+                    KeyCode::Char('+') => {
+                        if app.consume_quick_tree_double_tap('+') {
+                            app.expand_tree_to_max_on_selected_dirs();
+                        } else {
+                            app.expand_tree_on_selected_dirs(1);
+                        }
+                    }
+                    KeyCode::Char('-') => {
+                        if app.consume_quick_tree_double_tap('-') {
+                            app.collapse_all_tree_expansions();
+                        } else {
+                            app.contract_tree_on_selected_dirs(1);
+                        }
                     }
                     KeyCode::Char('C') => {
                         app.run_delta_compare()?;

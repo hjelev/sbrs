@@ -33,6 +33,7 @@ A terminal file manager (TUI) written in Rust using `ratatui` + `crossterm`.
 - Built-in async Search overlay with filename/content scope, regex support, and highlighted matches
 - In-app command runner (`;`) with "press any key to return" pause
 - CLI list mode: `-l`, `-a`/`-la`, and optional `--total-size` recursive size/% columns
+- CLI tree mode: `-t` (full tree) and `-lN` / `-l N` (tree depth)
 - Direct file mode: `sbrs <file>` opens immediately with best available viewer (no pager)
 - Pager file mode: `sbrs -l <file>` opens immediate viewer output in pager mode
 - Edit file mode: `sbrs -e <file>` opens the file in `$EDITOR` (fallback: `nano`)
@@ -70,6 +71,13 @@ sbrs -la
 # Recursive display size + percent share columns
 sbrs -l --total-size
 
+# Full tree output
+sbrs -t
+
+# Tree output limited to depth 2
+sbrs -l2
+sbrs -l 2
+
 # Path can appear before or after --total-size
 sbrs -la /var/log --total-size
 sbrs --total-size -l /var/log
@@ -91,6 +99,8 @@ sbrs -e README.md
 - `-a [PATH]`: same as `-l`, but includes hidden files.
 - `-la [PATH]`: same as `-l`, but includes hidden files.
 - `-e [FILE]`: open file in `$EDITOR` (fallback: `nano`) and exit.
+- `-t [PATH]`: tree-list recursively (full depth) and exit.
+- `-lN [PATH]` / `-l N [PATH]`: tree-list to depth `N` and exit.
 - `--total-size`: when used with `-l`, `-a`, or `-la`, shows recursive display size for each entry and a `%` column with that entry's share of the listed total.
 
 Notes:
@@ -152,6 +162,10 @@ Use the installer there if you want the fastest setup without building from sour
 - `Tab` / `Shift+Tab` in Help/Search/Bookmarks/Remote Mounts/Sorting/Integrations: cycle tabs forward/backward
 - `s`: toggle folder size calculation in listing
 - `Ctrl+s`: open sort mode menu
+- `+`: expand selected/marked non-empty folder(s) by one tree level
+- `-`: contract selected/marked folder(s) by one tree level
+- quick `++`: expand selected/marked non-empty folder(s) to max depth
+- quick `--`: collapse all opened folders in tree view
 - `0-9`: jump to bookmark (`SB_BOOKMARK_0..9`)
 - `.`: toggle hidden files
 - `~`: jump to home

@@ -40,6 +40,7 @@ pub(crate) fn rt_to_ct_color(color: ratatui::style::Color) -> CtColor {
 pub fn list_current_directory(
     include_hidden: bool,
     include_total_size: bool,
+    tree_depth: Option<usize>,
     path: Option<&str>,
 ) -> io::Result<()> {
     let current_dir = if let Some(p) = path {
@@ -100,27 +101,38 @@ pub fn list_current_directory(
         out
     }
 
-    fn pad_to_display_width(s: &str, width: usize) -> String {
-        let used = UnicodeWidthStr::width(s);
-        if used >= width {
-            return s.to_string();
-        }
-        format!("{}{}", s, " ".repeat(width - used))
+    let tree_rows = tree_depth.map(|depth| {
+        crate::ui::tree::collect_tree_rows(
+            &current_dir,
+            include_hidden,
+            if depth == 0 { None } else { Some(depth) },
+            crate::SortMode::NameAsc,
+            None,
+        )
+    }).transpose()?;
+
+    let mut direct_entries: Vec<fs::DirEntry> = Vec::new();
+    if tree_rows.is_none() {
+        direct_entries = fs::read_dir(&current_dir)?
+            .filter_map(|res| res.ok())
+            .filter(|e| include_hidden || !e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        direct_entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
     }
 
-    let mut entries: Vec<_> = fs::read_dir(&current_dir)?
-        .filter_map(|res| res.ok())
-        .filter(|e| include_hidden || !e.file_name().to_string_lossy().starts_with('.'))
-        .collect();
-
-    entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
+    let entries: Vec<&fs::DirEntry> = if let Some(rows) = tree_rows.as_ref() {
+        rows.iter().map(|row| &row.entry).collect::<Vec<_>>()
+    } else {
+        direct_entries.iter().collect::<Vec<_>>()
+    };
 
     let config = EntryRenderConfig { nerd_font_active, show_icons };
-    let uid_cache = App::build_uid_cache(&entries);
-    let gid_cache = App::build_gid_cache(&entries);
+    let uid_cache = App::build_uid_cache_refs(&entries);
+    let gid_cache = App::build_gid_cache_refs(&entries);
 
     struct RowData {
         path: PathBuf,
+        tree_prefix: String,
         cache: EntryRenderCache,
         entry_total_bytes: Option<u64>,
     }
@@ -128,12 +140,16 @@ pub fn list_current_directory(
     let mut rows: Vec<RowData> = Vec::with_capacity(entries.len());
     let mut group_width = 1usize;
     let mut owner_width = 1usize;
-    for entry in &entries {
+    for (idx, entry) in entries.iter().enumerate() {
         let path = entry.path();
         let cache = App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache);
         group_width = group_width.max(cache.group_name.chars().count());
         owner_width = owner_width.max(cache.owner_name.chars().count());
-        rows.push(RowData { path, cache, entry_total_bytes: None });
+        let tree_prefix = tree_rows
+            .as_ref()
+            .map(|rows| rows[idx].prefix.clone())
+            .unwrap_or_default();
+        rows.push(RowData { path, tree_prefix, cache, entry_total_bytes: None });
     }
 
     group_width = group_width.min(16).max(1);
@@ -186,6 +202,7 @@ pub fn list_current_directory(
     };
 
     for row in rows {
+        let tree_prefix = row.tree_prefix;
         let cache = row.cache;
 
         // Derive crossterm colours from the ratatui styles stored in the cache
@@ -196,14 +213,24 @@ pub fn list_current_directory(
             icon_color = CtColor::Reset;
         }
 
+        let tree_color = if no_color {
+            CtColor::Reset
+        } else {
+            CtColor::Rgb { r: 140, g: 140, b: 140 }
+        };
+
         let icon_prefix = if show_icons && !cache.icon_glyph.is_empty() {
             format!("{} ", cache.icon_glyph)
         } else {
             String::new()
         };
-        let rendered_name =
-            truncate_to_display_width(&format!("{}{}", icon_prefix, cache.raw_name), name_width);
-        let rendered_name = pad_to_display_width(&rendered_name, name_width);
+        let prefix_width = UnicodeWidthStr::width(tree_prefix.as_str());
+        let icon_width = UnicodeWidthStr::width(icon_prefix.as_str());
+        let base_name_width = name_width.saturating_sub(prefix_width + icon_width).max(1);
+        let rendered_name = truncate_to_display_width(&cache.raw_name, base_name_width);
+        let rendered_name_width = UnicodeWidthStr::width(rendered_name.as_str());
+        let used_name_width = prefix_width + icon_width + rendered_name_width;
+        let trailing_pad = " ".repeat(name_width.saturating_sub(used_name_width));
 
         let mut styled_name = style(rendered_name).with(name_color);
         if cache.name_style.add_modifier.contains(Modifier::BOLD) {
@@ -214,6 +241,7 @@ pub fn list_current_directory(
         }
 
         let styled_icon = style(cache.icon_glyph.clone()).with(icon_color);
+        let styled_tree = style(tree_prefix.as_str()).with(tree_color);
 
         if show_meta || show_size || show_date {
             // perms_col is already left-padded to 11 chars by the cache builder
@@ -258,7 +286,13 @@ pub fn list_current_directory(
             };
             let pct_color = size_color;
 
+            print!("{}", styled_tree);
+            if show_icons && !cache.icon_glyph.is_empty() {
+                print!("{}", styled_icon);
+                print!(" ");
+            }
             print!("{}", styled_name);
+            print!("{}", trailing_pad);
             if show_meta {
                 let perms_segments = list_render::permission_gradient_segments(perms_col, perms_width);
                 print!(
@@ -288,23 +322,39 @@ pub fn list_current_directory(
             }
             println!();
         } else {
-            println!("{} {}", styled_icon, styled_name);
+            print!("{}", styled_tree);
+            if show_icons && !cache.icon_glyph.is_empty() {
+                print!("{} ", styled_icon);
+            }
+            println!("{}{}", styled_name, trailing_pad);
         }
     }
 
     Ok(())
 }
 
-pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Option<&'a str>)> {
+pub(crate) struct ListModeArgs<'a> {
+    pub(crate) include_hidden: bool,
+    pub(crate) include_total_size: bool,
+    pub(crate) tree_depth: Option<usize>,
+    pub(crate) path: Option<&'a str>,
+}
+
+pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<ListModeArgs<'a>> {
     let mut list_mode_seen = false;
     let mut include_hidden = false;
     let mut include_total_size = false;
     let mut list_path: Option<&str> = None;
+    let mut tree_depth: Option<usize> = None;
 
     for arg in args {
         match arg.as_str() {
             "-l" => {
                 list_mode_seen = true;
+            }
+            "-t" => {
+                list_mode_seen = true;
+                tree_depth = Some(0);
             }
             "-a" => {
                 list_mode_seen = true;
@@ -317,6 +367,13 @@ pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Optio
             "--total-size" => {
                 include_total_size = true;
             }
+            other if other.starts_with("-l") && other.len() > 2 && other[2..].chars().all(|c| c.is_ascii_digit()) => {
+                list_mode_seen = true;
+                tree_depth = other[2..].parse::<usize>().ok();
+            }
+            other if other.chars().all(|c| c.is_ascii_digit()) && list_mode_seen && tree_depth.is_none() => {
+                tree_depth = other.parse::<usize>().ok();
+            }
             other if !other.starts_with('-') && list_path.is_none() => {
                 list_path = Some(other);
             }
@@ -325,7 +382,12 @@ pub fn parse_list_mode_args<'a>(args: &'a [String]) -> Option<(bool, bool, Optio
     }
 
     if list_mode_seen {
-        Some((include_hidden, include_total_size, list_path))
+        Some(ListModeArgs {
+            include_hidden,
+            include_total_size,
+            tree_depth,
+            path: list_path,
+        })
     } else {
         None
     }
@@ -336,7 +398,9 @@ pub fn validate_cli_args(args: &[String]) -> Result<(), String> {
 
     for arg in args {
         match arg.as_str() {
-            "-h" | "--help" | "-V" | "--version" | "-l" | "-a" | "-la" | "-e" | "--total-size" => {}
+            "-h" | "--help" | "-V" | "--version" | "-l" | "-a" | "-la" | "-e" | "-t" | "--total-size" => {}
+            other if other.starts_with("-l") && other.len() > 2 && other[2..].chars().all(|c| c.is_ascii_digit()) => {}
+            other if other.chars().all(|c| c.is_ascii_digit()) => {}
             other if other.starts_with('-') => {
                 return Err(format!("unrecognized option: {}", other));
             }
@@ -482,10 +546,12 @@ pub fn print_help() {
             .attribute(Attribute::Bold)
     );
     println!("  -l [PATH]      List folder and exit; with FILE uses pager mode");
+    println!("  -l2 / -l 2     Tree list mode limited to depth 2");
+    println!("  -t [PATH]      Unlimited recursive tree list mode");
     println!("  -a [PATH]      List folder including hidden files and exit");
     println!("  -la [PATH]     Same as -a");
     println!("  -e [FILE]      Open file in $EDITOR (fallback: nano)");
-    println!("  --total-size   With -l/-a/-la: recursive size + percent columns");
+    println!("  --total-size   With -l/-a/-la/-t: recursive size + percent columns");
     println!("  -h, --help     Show this help message");
     println!("  -V, --version  Show app name and current version");
 }

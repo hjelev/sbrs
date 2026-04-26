@@ -27,6 +27,11 @@ impl App {
     }
 
     pub(crate) fn build_uid_cache(entries: &[fs::DirEntry]) -> HashMap<u32, String> {
+        let refs: Vec<&fs::DirEntry> = entries.iter().collect();
+        Self::build_uid_cache_refs(&refs)
+    }
+
+    pub(crate) fn build_uid_cache_refs(entries: &[&fs::DirEntry]) -> HashMap<u32, String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -50,6 +55,11 @@ impl App {
     }
 
     pub(crate) fn build_gid_cache(entries: &[fs::DirEntry]) -> HashMap<u32, String> {
+        let refs: Vec<&fs::DirEntry> = entries.iter().collect();
+        Self::build_gid_cache_refs(&refs)
+    }
+
+    pub(crate) fn build_gid_cache_refs(entries: &[&fs::DirEntry]) -> HashMap<u32, String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

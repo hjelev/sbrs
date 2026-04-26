@@ -5,3 +5,4 @@ pub mod list_temperature;
 pub mod panels;
 pub mod search;
 pub mod status;
+pub mod tree;

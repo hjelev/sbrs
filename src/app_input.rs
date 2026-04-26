@@ -1,6 +1,112 @@
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
 use crate::{App, AppMode, PathFilterMode, PathInputFilter};
 
+const TREE_DOUBLE_TAP_WINDOW_MS: u64 = 320;
+
 impl App {
+    pub(crate) fn consume_quick_tree_double_tap(&mut self, key: char) -> bool {
+        let now = Instant::now();
+        let is_double = self
+            .tree_last_tap
+            .map(|(last_key, last_ts)| {
+                last_key == key
+                    && now.duration_since(last_ts)
+                        <= Duration::from_millis(TREE_DOUBLE_TAP_WINDOW_MS)
+            })
+            .unwrap_or(false);
+
+        self.tree_last_tap = if is_double { None } else { Some((key, now)) };
+        is_double
+    }
+
+    fn dir_has_visible_children(&self, path: &PathBuf) -> bool {
+        let Ok(read_dir) = fs::read_dir(path) else {
+            return false;
+        };
+
+        read_dir.filter_map(|entry| entry.ok()).any(|entry| {
+            if self.show_hidden {
+                true
+            } else {
+                !entry.file_name().to_string_lossy().starts_with('.')
+            }
+        })
+    }
+
+    fn selected_or_marked_dir_paths(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if !self.marked_indices.is_empty() {
+            for idx in &self.marked_indices {
+                if let Some(entry) = self.entries.get(*idx) {
+                    let path = entry.path();
+                    if path.is_dir() && self.dir_has_visible_children(&path) {
+                        dirs.push(path);
+                    }
+                }
+            }
+        } else if let Some(entry) = self.entries.get(self.selected_index) {
+            let path = entry.path();
+            if path.is_dir() && self.dir_has_visible_children(&path) {
+                dirs.push(path);
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    pub(crate) fn expand_tree_on_selected_dirs(&mut self, levels: usize) {
+        let targets = self.selected_or_marked_dir_paths();
+        if targets.is_empty() {
+            self.set_status("tree expand: no non-empty selected folders");
+            return;
+        }
+        for path in targets {
+            let current = self.tree_expansion_levels.get(&path).copied().unwrap_or(0);
+            self.tree_expansion_levels
+                .insert(path, current.saturating_add(levels.max(1)));
+        }
+        self.refresh_entries_or_status();
+    }
+
+    pub(crate) fn contract_tree_on_selected_dirs(&mut self, levels: usize) {
+        let targets = self.selected_or_marked_dir_paths();
+        if targets.is_empty() {
+            self.set_status("tree contract: no selected folders");
+            return;
+        }
+        for path in targets {
+            let current = self.tree_expansion_levels.get(&path).copied().unwrap_or(0);
+            let next = current.saturating_sub(levels.max(1));
+            if next == 0 {
+                self.tree_expansion_levels.remove(&path);
+            } else {
+                self.tree_expansion_levels.insert(path, next);
+            }
+        }
+        self.refresh_entries_or_status();
+    }
+
+    pub(crate) fn collapse_all_tree_expansions(&mut self) {
+        self.tree_expansion_levels.clear();
+        self.refresh_entries_or_status();
+    }
+
+    pub(crate) fn expand_tree_to_max_on_selected_dirs(&mut self) {
+        let targets = self.selected_or_marked_dir_paths();
+        if targets.is_empty() {
+            self.set_status("tree expand: no non-empty selected folders");
+            return;
+        }
+        for path in targets {
+            self.tree_expansion_levels.insert(path, usize::MAX);
+        }
+        self.refresh_entries_or_status();
+    }
+
     pub(crate) fn parse_path_filter_suffix(raw: &str) -> Option<(String, PathInputFilter)> {
         let trimmed = raw.trim();
         let (base, tail) = trimmed.rsplit_once('/')?;
