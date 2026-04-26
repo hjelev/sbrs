@@ -8,7 +8,6 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use chrono::{DateTime, Local};
 use rayon::prelude::*;
 
 use crate::{
@@ -61,9 +60,8 @@ impl App {
                     }
                     if let Some(idx) = self.entries.iter().position(|e| e.path() == dir_path) {
                         self.entry_render_cache[idx].modified_unix = Some(unix_secs);
-                        let dt = DateTime::<Local>::from(UNIX_EPOCH + std::time::Duration::from_secs(unix_secs));
                         self.entry_render_cache[idx].date_col =
-                            format!("{:>width$}", dt.format("%Y-%m-%d %H:%M"), width = 16);
+                            format!("{:>width$}", crate::util::format::format_mtime(UNIX_EPOCH + std::time::Duration::from_secs(unix_secs)), width = 16);
                     }
                 }
                 Ok(RecursiveMtimeMsg::Finished(scan_id)) => {

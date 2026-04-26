@@ -1,3 +1,11 @@
+use std::time::SystemTime;
+use chrono::{DateTime, Local};
+
+/// Formats a `SystemTime` as `"YYYY-MM-DD HH:MM"` in local time.
+pub fn format_mtime(t: SystemTime) -> String {
+    DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
+}
+
 pub fn format_eta(total_seconds: u64) -> String {
     let mins = total_seconds / 60;
     let secs = total_seconds % 60;

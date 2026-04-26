@@ -82,26 +82,7 @@ struct GitInfoCache {
     info: Option<(String, bool, Option<(String, u64)>)>,
 }
 
-#[derive(Clone)]
-struct EntryRenderCache {
-    raw_name: String,
-    icon_glyph: String,
-    icon_style: Style,
-    name_style: Style,
-    perms_col: String,
-    group_name: String,
-    owner_name: String,
-    size_col: String,
-    size_bytes: Option<u64>,
-    date_col: String,
-    modified_unix: Option<u64>,
-}
-
-#[derive(Clone, Copy)]
-struct EntryRenderConfig {
-    nerd_font_active: bool,
-    show_icons: bool,
-}
+pub(crate) use app_render_cache::{EntryRenderCache, EntryRenderConfig};
 
 enum CopyProgressMsg {
     TotalBytes(u64),
@@ -4178,56 +4159,19 @@ fn main() -> io::Result<()> {
             };
 
             let size_min_max = if show_size {
-                let mut min_size: Option<u64> = None;
-                let mut max_size: u64 = 0;
-                for size in app.entry_render_cache.iter().filter_map(|entry| entry.size_bytes) {
-                    min_size = Some(min_size.map_or(size, |current| current.min(size)));
-                    max_size = max_size.max(size);
-                }
-                min_size.map(|min| (min, max_size))
+                ui::list_temperature::size_min_max_from_sizes(
+                    app.entry_render_cache.iter().map(|entry| entry.size_bytes),
+                )
             } else {
                 None
             };
 
-            let size_shade_color = |t: f64| -> Color {
-                let t = t.clamp(0.0, 1.0);
-                let r = (255.0 * t).round() as u8;
-                let g = 255u8;
-                let b = (255.0 * t).round() as u8;
-                Color::Rgb(r, g, b)
-            };
-
-            let date_rank_by_ts: HashMap<u64, f64> = if show_date {
-                let mut values: Vec<u64> = app
-                    .entry_render_cache
-                    .iter()
-                    .filter_map(|entry| entry.modified_unix)
-                    .collect();
-                values.sort_unstable();
-                values.dedup();
-
-                if values.len() <= 1 {
-                    values.into_iter().map(|ts| (ts, 1.0)).collect()
-                } else {
-                    let denom = (values.len() - 1) as f64;
-                    values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, ts)| (ts, idx as f64 / denom))
-                        .collect()
-                }
+            let date_rank_by_ts = if show_date {
+                ui::list_temperature::date_rank_map_from_unix(
+                    app.entry_render_cache.iter().map(|entry| entry.modified_unix),
+                )
             } else {
                 HashMap::new()
-            };
-
-            let date_fade_color = |age_t: f64| -> Color {
-                let age_t = age_t.clamp(0.0, 1.0);
-                let base = (116.0, 178.0, 205.0);
-                let white = (255.0, 255.0, 255.0);
-                let r = (white.0 + (base.0 - white.0) * age_t).round() as u8;
-                let g = (white.1 + (base.1 - white.1) * age_t).round() as u8;
-                let b = (white.2 + (base.2 - white.2) * age_t).round() as u8;
-                Color::Rgb(r, g, b)
             };
 
             let rows: Vec<Row> = app.entry_render_cache.iter().enumerate().map(|(idx, entry_cache)| {
@@ -4237,28 +4181,16 @@ fn main() -> io::Result<()> {
 
                 let group_style = Style::default().fg(Color::Rgb(172, 136, 98));
                 let owner_style = Style::default().fg(Color::Rgb(196, 172, 118));
-                let size_style = match (size_min_max, entry_cache.size_bytes) {
-                    (Some((min_size, max_size)), Some(entry_bytes)) if max_size > min_size => {
-                        let min_log = (min_size as f64 + 1.0).ln();
-                        let max_log = (max_size as f64 + 1.0).ln();
-                        let entry_log = (entry_bytes as f64 + 1.0).ln();
-                        let t = ((entry_log - min_log) / (max_log - min_log)).clamp(0.0, 1.0);
-                        Style::default().fg(size_shade_color(t))
-                    }
-                    (Some(_), Some(_)) => {
-                        Style::default().fg(size_shade_color(0.0))
-                    }
-                    _ => Style::default().fg(Color::Green),
-                };
+                let size_style = Style::default().fg(ui::list_temperature::size_color_for(
+                    entry_cache.size_bytes,
+                    size_min_max,
+                ));
                 let pct_style = size_style;
-                let date_style = entry_cache
-                    .modified_unix
-                    .and_then(|ts| date_rank_by_ts.get(&ts).copied())
-                    .map(|rank_t| {
-                        // rank_t: 0=oldest, 1=newest. Newest should be white.
-                        Style::default().fg(date_fade_color(1.0 - rank_t))
-                    })
-                    .unwrap_or_else(|| Style::default().fg(Color::Rgb(116, 178, 205)));
+                let date_style =
+                    Style::default().fg(ui::list_temperature::date_color_for(
+                        entry_cache.modified_unix,
+                        &date_rank_by_ts,
+                    ));
                 let marker = if app.no_color {
                     format!(
                         "{}{} ",
@@ -4304,20 +4236,16 @@ fn main() -> io::Result<()> {
                 }))];
                 if show_meta {
                     let perms_text = entry_cache.perms_col.trim();
-                    let left_pad = perms_width.saturating_sub(perms_text.chars().count());
-                    let mut perms_spans: Vec<Span> = Vec::new();
-                    if left_pad > 0 {
-                        perms_spans.push(Span::raw(" ".repeat(left_pad)));
-                    }
-                    let chars: Vec<char> = perms_text.chars().collect();
-                    let steps = chars.len().saturating_sub(1).max(1) as f32;
-                    for (i, ch) in chars.iter().enumerate() {
-                        let t = 1.0 - (i as f32 / steps);
-                        let r = (196.0 + (255.0 - 196.0) * t).round() as u8;
-                        let g = (150.0 + (255.0 - 150.0) * t).round() as u8;
-                        let b = (96.0 + (255.0 - 96.0) * t).round() as u8;
-                        perms_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r, g, b))));
-                    }
+                    let perms_spans: Vec<Span> = ui::list_render::permission_gradient_segments(
+                        perms_text,
+                        perms_width,
+                    )
+                    .into_iter()
+                    .map(|(text, color)| match color {
+                        Some(c) => Span::styled(text, Style::default().fg(c)),
+                        None => Span::raw(text),
+                    })
+                    .collect();
                     cells.push(Cell::from(Line::from(perms_spans)));
                     cells.push(Cell::from(Span::styled(
                         format!("{:>width$}", entry_cache.group_name, width = group_width),

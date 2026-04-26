@@ -26,36 +26,6 @@ impl App {
         }
     }
 
-    pub(crate) fn parse_owner(meta: &fs::Metadata) -> String {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let uid = meta.uid();
-            users::get_user_by_uid(uid)
-                .map(|user| user.name().to_string_lossy().into_owned())
-                .unwrap_or_else(|| uid.to_string())
-        }
-        #[cfg(not(unix))]
-        {
-            "-".to_string()
-        }
-    }
-
-    pub(crate) fn parse_group(meta: &fs::Metadata) -> String {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let gid = meta.gid();
-            users::get_group_by_gid(gid)
-                .map(|group| group.name().to_string_lossy().into_owned())
-                .unwrap_or_else(|| gid.to_string())
-        }
-        #[cfg(not(unix))]
-        {
-            "-".to_string()
-        }
-    }
-
     pub(crate) fn build_uid_cache(entries: &[fs::DirEntry]) -> HashMap<u32, String> {
         #[cfg(unix)]
         {

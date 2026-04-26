@@ -1,16 +1,41 @@
-use chrono::{DateTime, Local};
 use crossterm::style::{style, Attribute, Color as CtColor, Stylize};
-use devicons::{icon_for_file, File as DevFile, Theme};
+use ratatui::style::Modifier;
 use std::{
+    collections::HashMap,
     env, fs,
     io::{self},
     path::PathBuf,
-    str::FromStr,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::ui::icons::named_dir_icon;
+use crate::app_render_cache::{EntryRenderCache, EntryRenderConfig};
+use crate::ui::list_render;
+use crate::ui::list_temperature;
 use crate::{env_flag_true, App};
+
+pub(crate) fn rt_to_ct_color(color: ratatui::style::Color) -> CtColor {
+    match color {
+        ratatui::style::Color::Black => CtColor::Black,
+        ratatui::style::Color::Red => CtColor::Red,
+        ratatui::style::Color::Green => CtColor::Green,
+        ratatui::style::Color::Yellow => CtColor::Yellow,
+        ratatui::style::Color::Blue => CtColor::Blue,
+        ratatui::style::Color::Magenta => CtColor::Magenta,
+        ratatui::style::Color::Cyan => CtColor::Cyan,
+        ratatui::style::Color::Gray => CtColor::Grey,
+        ratatui::style::Color::DarkGray => CtColor::DarkGrey,
+        ratatui::style::Color::LightRed => CtColor::DarkRed,
+        ratatui::style::Color::LightGreen => CtColor::DarkGreen,
+        ratatui::style::Color::LightYellow => CtColor::DarkYellow,
+        ratatui::style::Color::LightBlue => CtColor::DarkBlue,
+        ratatui::style::Color::LightMagenta => CtColor::DarkMagenta,
+        ratatui::style::Color::LightCyan => CtColor::DarkCyan,
+        ratatui::style::Color::White => CtColor::White,
+        ratatui::style::Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+        ratatui::style::Color::Indexed(i) => CtColor::AnsiValue(i),
+        ratatui::style::Color::Reset => CtColor::Reset,
+    }
+}
 
 pub fn list_current_directory(
     include_hidden: bool,
@@ -38,39 +63,6 @@ pub fn list_current_directory(
     let pct_width = 6usize;
     let perms_width = 11usize;
 
-    struct ListRowData {
-        entry: fs::DirEntry,
-        path: PathBuf,
-        meta: Option<fs::Metadata>,
-        owner: String,
-        group: String,
-        total_display_bytes: Option<u64>,
-    }
-
-    fn rt_to_ct_color(color: ratatui::style::Color) -> CtColor {
-        match color {
-            ratatui::style::Color::Black => CtColor::Black,
-            ratatui::style::Color::Red => CtColor::Red,
-            ratatui::style::Color::Green => CtColor::Green,
-            ratatui::style::Color::Yellow => CtColor::Yellow,
-            ratatui::style::Color::Blue => CtColor::Blue,
-            ratatui::style::Color::Magenta => CtColor::Magenta,
-            ratatui::style::Color::Cyan => CtColor::Cyan,
-            ratatui::style::Color::Gray => CtColor::Grey,
-            ratatui::style::Color::DarkGray => CtColor::DarkGrey,
-            ratatui::style::Color::LightRed => CtColor::DarkRed,
-            ratatui::style::Color::LightGreen => CtColor::DarkGreen,
-            ratatui::style::Color::LightYellow => CtColor::DarkYellow,
-            ratatui::style::Color::LightBlue => CtColor::DarkBlue,
-            ratatui::style::Color::LightMagenta => CtColor::DarkMagenta,
-            ratatui::style::Color::LightCyan => CtColor::DarkCyan,
-            ratatui::style::Color::White => CtColor::White,
-            ratatui::style::Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
-            ratatui::style::Color::Indexed(i) => CtColor::AnsiValue(i),
-            ratatui::style::Color::Reset => CtColor::Reset,
-        }
-    }
-
     fn truncate_to(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
@@ -93,7 +85,6 @@ pub fn list_current_directory(
         if max <= 1 {
             return "…".to_string();
         }
-
         let mut out = String::new();
         let mut used = 0usize;
         let target = max - 1;
@@ -124,42 +115,39 @@ pub fn list_current_directory(
 
     entries.sort_by_key(|e| (e.path().is_file(), e.file_name()));
 
-    let mut rows: Vec<ListRowData> = Vec::with_capacity(entries.len());
+    let config = EntryRenderConfig { nerd_font_active, show_icons };
+    let uid_cache = App::build_uid_cache(&entries);
+    let gid_cache = App::build_gid_cache(&entries);
+
+    struct RowData {
+        path: PathBuf,
+        cache: EntryRenderCache,
+        entry_total_bytes: Option<u64>,
+    }
+
+    let mut rows: Vec<RowData> = Vec::with_capacity(entries.len());
     let mut group_width = 1usize;
     let mut owner_width = 1usize;
-    for entry in entries {
+    for entry in &entries {
         let path = entry.path();
-        let meta = entry.metadata().ok();
-        let owner = meta
-            .as_ref()
-            .map(App::parse_owner)
-            .unwrap_or_else(|| "-".to_string());
-        let group = meta
-            .as_ref()
-            .map(App::parse_group)
-            .unwrap_or_else(|| "-".to_string());
-
-        group_width = group_width.max(group.chars().count());
-        owner_width = owner_width.max(owner.chars().count());
-
-        let total_display_bytes = if include_total_size {
-            Some(App::compute_total_display_bytes(&path).unwrap_or(0))
-        } else {
-            None
-        };
-
-        rows.push(ListRowData {
-            entry,
-            path,
-            meta,
-            owner,
-            group,
-            total_display_bytes,
-        });
+        let cache = App::build_entry_render_cache(entry, config, &uid_cache, &gid_cache);
+        group_width = group_width.max(cache.group_name.chars().count());
+        owner_width = owner_width.max(cache.owner_name.chars().count());
+        rows.push(RowData { path, cache, entry_total_bytes: None });
     }
 
     group_width = group_width.min(16).max(1);
     owner_width = owner_width.min(20).max(1);
+
+    // Override size columns for all entries when include_total_size=true
+    if include_total_size {
+        for row in &mut rows {
+            let total = App::compute_total_display_bytes(&row.path).unwrap_or(0);
+            row.entry_total_bytes = Some(total);
+            row.cache.size_col = format!("{:>width$}", App::format_size(total), width = size_width);
+            row.cache.size_bytes = Some(total);
+        }
+    }
 
     let mut reserved = 0usize;
     if show_meta {
@@ -179,142 +167,73 @@ pub fn list_current_directory(
     let total_listing_display_bytes = if include_total_size {
         Some(
             rows.iter()
-                .map(|row| row.total_display_bytes.unwrap_or(0))
+                .map(|row| row.cache.size_bytes.unwrap_or(0))
                 .fold(0u64, |acc, v| acc.saturating_add(v)),
         )
     } else {
         None
     };
 
+    let size_min_max = if show_size {
+        list_temperature::size_min_max_from_sizes(rows.iter().map(|row| row.cache.size_bytes))
+    } else {
+        None
+    };
+    let date_rank_by_ts: HashMap<u64, f64> = if show_date {
+        list_temperature::date_rank_map_from_unix(rows.iter().map(|row| row.cache.modified_unix))
+    } else {
+        HashMap::new()
+    };
+
     for row in rows {
-        let path = row.path;
-        let meta = row.meta;
-        let owner = row.owner;
-        let group = row.group;
-        let entry_total_bytes = row.total_display_bytes;
-        let entry = row.entry;
-        let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
-        let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-        let is_dir = path.is_dir();
+        let cache = row.cache;
 
-        let icon_data = if nerd_font_active {
-            Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
-        } else {
-            None
-        };
-
-        let (icon_glyph, mut icon_color) = if !show_icons {
-            (String::new(), CtColor::Reset)
-        } else if nerd_font_active {
-            if is_symlink {
-                ("".to_string(), CtColor::Rgb { r: 100, g: 220, b: 220 })
-            } else if is_dir {
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if let Some((glyph, (r, g, b))) = named_dir_icon(dir_name) {
-                    (glyph.to_string(), CtColor::Rgb { r, g, b })
-                } else {
-                    ("\u{f024b}".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
-                }
-            } else if App::is_age_protected_file(&path) {
-                ("".to_string(), CtColor::Rgb { r: 230, g: 190, b: 90 })
-            } else {
-                let icon = icon_data
-                    .as_ref()
-                    .map(|i| i.icon.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let color = icon_data
-                    .as_ref()
-                    .and_then(|i| ratatui::style::Color::from_str(i.color).ok())
-                    .map(rt_to_ct_color)
-                    .unwrap_or(CtColor::White);
-                (icon, color)
-            }
-        } else if is_dir {
-            ("📁".to_string(), CtColor::Rgb { r: 100, g: 160, b: 240 })
-        } else {
-            ("📄".to_string(), CtColor::White)
-        };
-
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let mut name_color = if is_dir {
-            CtColor::Rgb { r: 100, g: 160, b: 240 }
-        } else if App::is_age_protected_file(&path) {
-            CtColor::Rgb { r: 230, g: 190, b: 90 }
-        } else {
-            icon_data
-                .as_ref()
-                .and_then(|i| ratatui::style::Color::from_str(i.color).ok())
-                .map(rt_to_ct_color)
-                .unwrap_or(CtColor::White)
-        };
-        if is_symlink {
-            name_color = CtColor::Rgb { r: 100, g: 220, b: 220 };
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if !is_dir
-                && meta
-                    .as_ref()
-                    .map(|m| m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            {
-                name_color = CtColor::Rgb { r: 120, g: 220, b: 120 };
-            }
-        }
+        // Derive crossterm colours from the ratatui styles stored in the cache
+        let mut icon_color = cache.icon_style.fg.map(rt_to_ct_color).unwrap_or(CtColor::Reset);
+        let mut name_color = cache.name_style.fg.map(rt_to_ct_color).unwrap_or(CtColor::White);
         if no_color {
             name_color = CtColor::Reset;
             icon_color = CtColor::Reset;
         }
 
-        let icon_prefix = if show_icons && !icon_glyph.is_empty() {
-            format!("{} ", icon_glyph)
+        let icon_prefix = if show_icons && !cache.icon_glyph.is_empty() {
+            format!("{} ", cache.icon_glyph)
         } else {
             String::new()
         };
         let rendered_name =
-            truncate_to_display_width(&format!("{}{}", icon_prefix, name), name_width);
+            truncate_to_display_width(&format!("{}{}", icon_prefix, cache.raw_name), name_width);
         let rendered_name = pad_to_display_width(&rendered_name, name_width);
 
         let mut styled_name = style(rendered_name).with(name_color);
-        if is_dir {
+        if cache.name_style.add_modifier.contains(Modifier::BOLD) {
             styled_name = styled_name.attribute(Attribute::Bold);
         }
-        if is_hidden {
+        if cache.name_style.add_modifier.contains(Modifier::DIM) {
             styled_name = styled_name.attribute(Attribute::Dim);
         }
 
-        let styled_icon = style(format!("{}", icon_glyph)).with(icon_color);
+        let styled_icon = style(cache.icon_glyph.clone()).with(icon_color);
 
         if show_meta || show_size || show_date {
-            let perms = meta
-                .as_ref()
-                .map(App::parse_permissions)
-                .unwrap_or_else(|| "----------".to_string());
-            let owner = meta
-                .as_ref()
-                .map(|_| owner.clone())
-                .unwrap_or_else(|| "-".to_string());
-            let group = meta
-                .as_ref()
-                .map(|_| group.clone())
-                .unwrap_or_else(|| "-".to_string());
-            let perms_col = format!("{:<width$}", truncate_to(&perms, perms_width), width = perms_width);
-            let group_col = format!("{:>width$}", truncate_to(&group, group_width), width = group_width);
-            let owner_col = format!("{:<width$}", truncate_to(&owner, owner_width), width = owner_width);
-
-            let size = if include_total_size {
-                App::format_size(entry_total_bytes.unwrap_or(0))
-            } else {
-                meta.as_ref()
-                    .map(|m| if m.is_dir() { "-".to_string() } else { App::format_size(m.len()) })
-                    .unwrap_or_else(|| "-".to_string())
-            };
-            let size_col = format!("{:>width$}", size, width = size_width);
+            // perms_col is already left-padded to 11 chars by the cache builder
+            let perms_col = cache.perms_col.trim_end();
+            let group_col = format!(
+                "{:>width$}",
+                truncate_to(&cache.group_name, group_width),
+                width = group_width
+            );
+            let owner_col = format!(
+                "{:<width$}",
+                truncate_to(&cache.owner_name, owner_width),
+                width = owner_width
+            );
+            // size_col pre-padded to 6 chars; date_col pre-padded to 16 chars by the cache builder
+            let size_col = &cache.size_col;
+            let date_col = &cache.date_col;
 
             let pct_col = if show_pct {
-                match (total_listing_display_bytes, entry_total_bytes) {
+                match (total_listing_display_bytes, cache.size_bytes) {
                     (Some(total), Some(entry_bytes)) if total > 0 => {
                         let pct = (entry_bytes as f64 * 100.0) / (total as f64);
                         format!("{:>5.0}%", pct)
@@ -324,31 +243,48 @@ pub fn list_current_directory(
             } else {
                 String::new()
             };
-
-            let date = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let date_col = format!("{:<width$}", truncate_to(&date, date_width), width = date_width);
+            let size_color = if no_color {
+                CtColor::Reset
+            } else {
+                rt_to_ct_color(list_temperature::size_color_for(cache.size_bytes, size_min_max))
+            };
+            let date_color = if no_color {
+                CtColor::Reset
+            } else {
+                rt_to_ct_color(list_temperature::date_color_for(
+                    cache.modified_unix,
+                    &date_rank_by_ts,
+                ))
+            };
+            let pct_color = size_color;
 
             print!("{}", styled_name);
             if show_meta {
+                let perms_segments = list_render::permission_gradient_segments(perms_col, perms_width);
                 print!(
-                    " {} {} {}",
-                    style(perms_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(group_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
-                    style(owner_col).with(CtColor::Rgb { r: 180, g: 150, b: 100 })
+                    " "
+                );
+                for (text, color) in perms_segments {
+                    let seg = match (no_color, color) {
+                        (false, Some(c)) => style(text).with(rt_to_ct_color(c)),
+                        _ => style(text),
+                    };
+                    print!("{}", seg);
+                }
+                print!(
+                    " {} {}",
+                    style(group_col.as_str()).with(CtColor::Rgb { r: 180, g: 150, b: 100 }),
+                    style(owner_col.as_str()).with(CtColor::Rgb { r: 180, g: 150, b: 100 })
                 );
             }
             if show_size {
-                print!(" {}", style(size_col).with(CtColor::Green));
+                print!(" {}", style(size_col.as_str()).with(size_color));
             }
             if show_pct {
-                print!(" {}", style(pct_col).with(CtColor::Rgb { r: 220, g: 200, b: 120 }));
+                print!(" {}", style(pct_col.as_str()).with(pct_color));
             }
             if show_date {
-                print!(" {}", style(date_col).with(CtColor::Rgb { r: 120, g: 190, b: 210 }));
+                print!(" {}", style(date_col.as_str()).with(date_color));
             }
             println!();
         } else {

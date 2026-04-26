@@ -1,10 +1,31 @@
 use std::{collections::HashMap, fs, str::FromStr, time::UNIX_EPOCH};
 
-use chrono::{DateTime, Local};
+use crate::util::format::format_mtime;
 use devicons::{icon_for_file, File as DevFile, Theme};
 use ratatui::prelude::*;
 use crate::ui::icons::named_file_icon;
-use crate::{ui, App, EntryRenderCache, EntryRenderConfig};
+use crate::{ui, App};
+
+#[derive(Clone)]
+pub(crate) struct EntryRenderCache {
+    pub(crate) raw_name: String,
+    pub(crate) icon_glyph: String,
+    pub(crate) icon_style: Style,
+    pub(crate) name_style: Style,
+    pub(crate) perms_col: String,
+    pub(crate) group_name: String,
+    pub(crate) owner_name: String,
+    pub(crate) size_col: String,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) date_col: String,
+    pub(crate) modified_unix: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EntryRenderConfig {
+    pub(crate) nerd_font_active: bool,
+    pub(crate) show_icons: bool,
+}
 
 impl App {
     pub(crate) fn build_entry_render_cache(
@@ -159,7 +180,7 @@ impl App {
         let date = meta
             .as_ref()
             .and_then(|m| m.modified().ok())
-            .map(|t| DateTime::<Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
+            .map(format_mtime)
             .unwrap_or_default();
         let date_col = format!("{:>width$}", date, width = date_width);
         let modified_unix = meta
