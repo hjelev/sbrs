@@ -36,6 +36,32 @@ impl App {
         })
     }
 
+    fn visible_child_dirs(&self, path: &PathBuf) -> Vec<PathBuf> {
+        let Ok(read_dir) = fs::read_dir(path) else {
+            return Vec::new();
+        };
+
+        read_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| self.show_hidden || !entry.file_name().to_string_lossy().starts_with('.'))
+            .map(|entry| entry.path())
+            .filter(|entry_path| entry_path.is_dir())
+            .collect()
+    }
+
+    fn max_expand_level_for_dir(&self, path: &PathBuf) -> usize {
+        fn walk(app: &App, dir: &PathBuf, level: usize, max_level: &mut usize) {
+            *max_level = (*max_level).max(level);
+            for child in app.visible_child_dirs(dir) {
+                walk(app, &child, level.saturating_add(1), max_level);
+            }
+        }
+
+        let mut max_level = 1usize;
+        walk(self, path, 1, &mut max_level);
+        max_level
+    }
+
     fn selected_or_marked_dir_paths(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if !self.marked_indices.is_empty() {
@@ -64,10 +90,12 @@ impl App {
             self.set_status("tree expand: no non-empty selected folders");
             return;
         }
+        let step = levels.max(1);
         for path in targets {
             let current = self.tree_expansion_levels.get(&path).copied().unwrap_or(0);
+            let max_expand = self.max_expand_level_for_dir(&path);
             self.tree_expansion_levels
-                .insert(path, current.saturating_add(levels.max(1)));
+                .insert(path, current.saturating_add(step).min(max_expand));
         }
         self.refresh_entries_or_status();
     }
@@ -102,7 +130,8 @@ impl App {
             return;
         }
         for path in targets {
-            self.tree_expansion_levels.insert(path, usize::MAX);
+            let max_expand = self.max_expand_level_for_dir(&path);
+            self.tree_expansion_levels.insert(path, max_expand);
         }
         self.refresh_entries_or_status();
     }
