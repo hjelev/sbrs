@@ -72,7 +72,7 @@ fn walk_tree_rows(
     for (idx, entry) in entries.into_iter().enumerate() {
         let is_last = idx + 1 == total;
         let path = entry.path();
-        let prefix = tree_prefix(ancestor_last, is_last);
+        let prefix = tree_prefix_compact(ancestor_last, is_last);
         let is_dir = path.is_dir();
         out.push(TreeRow {
             entry,
@@ -120,7 +120,7 @@ fn walk_tree_rows_with_expansions(
     for (idx, entry) in entries.into_iter().enumerate() {
         let is_last = idx + 1 == total;
         let path = entry.path();
-        let prefix = tree_prefix_for_expansion_mode(ancestor_last, is_last);
+        let prefix = tree_prefix_compact(ancestor_last, is_last);
         let is_dir = path.is_dir();
         out.push(TreeRow { entry, prefix });
 
@@ -147,7 +147,7 @@ fn walk_tree_rows_with_expansions(
     Ok(())
 }
 
-fn tree_prefix_for_expansion_mode(ancestor_last: &[bool], is_last: bool) -> String {
+fn tree_prefix_compact(ancestor_last: &[bool], is_last: bool) -> String {
     // Keep root-level rows flat (no tree glyphs/spacer), and draw connectors only
     // within expanded subtrees.
     if ancestor_last.is_empty() {
@@ -157,24 +157,11 @@ fn tree_prefix_for_expansion_mode(ancestor_last: &[bool], is_last: bool) -> Stri
     let mut out = String::new();
     for ancestor_is_last in ancestor_last.iter().skip(1) {
         if *ancestor_is_last {
-            out.push_str("  ");
+            out.push(' ');
         } else {
-            out.push_str("│ ");
+            out.push('│');
         }
     }
-    out.push_str(if is_last { "└─" } else { "├─" });
-    out
-}
-
-pub(crate) fn tree_prefix(ancestor_last: &[bool], is_last: bool) -> String {
-    let mut out = String::new();
-    for ancestor_is_last in ancestor_last {
-        if *ancestor_is_last {
-            out.push_str("  ");
-        } else {
-            out.push_str("│ ");
-        }
-    }
-    out.push_str(if is_last { "└─" } else { "├─" });
+    out.push_str(if is_last { "╰" } else { "├" });
     out
 }
