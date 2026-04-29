@@ -597,9 +597,9 @@ impl App {
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         let result = Self::age_encrypt_file_interactive(input, &protected_path);
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -628,9 +628,9 @@ impl App {
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         let result = Self::age_decrypt_file_interactive(input, &plain_path);
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -656,7 +656,7 @@ impl App {
         };
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         let decrypted = Self::age_decrypt_file_interactive(input, &tmp_path);
 
         let mut shown = false;
@@ -793,7 +793,7 @@ impl App {
             }
         }
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
         let _ = fs::remove_file(&tmp_path);
@@ -896,11 +896,11 @@ IFS= read -rsn1 _
         };
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
         let decrypted = Self::age_decrypt_file_interactive(input, &tmp_path);
         if decrypted.is_err() {
-            execute!(io::stdout(), EnterAlternateScreen)?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
             enable_raw_mode()?;
             execute!(io::stdout(), Hide)?;
             let _ = fs::remove_file(&tmp_path);
@@ -914,7 +914,7 @@ IFS= read -rsn1 _
             .status();
 
         let result = Self::age_encrypt_file_interactive(&tmp_path, input);
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
         execute!(io::stdout(), Hide)?;
 
@@ -1170,7 +1170,7 @@ IFS= read -rsn1 _
         ));
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         let script = r#"
 idx="$1"
@@ -1234,7 +1234,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
         let _ = fs::remove_file(&result_file);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
 
         if let Some(name) = images[idx].file_name() {
@@ -1269,7 +1269,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         ));
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         let script = r#"
 idx="$1"
@@ -1333,7 +1333,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
         let _ = fs::remove_file(&result_file);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
 
         if let Some(name) = images[idx].file_name() {
@@ -2377,12 +2377,12 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
     fn drop_to_shell(&mut self) -> io::Result<()> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
         let _ = Command::new(&shell)
             .current_dir(&self.current_dir)
             .status();
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
         execute!(io::stdout(), Hide)?;
@@ -2706,7 +2706,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let session_name = format!("sbrs_i_{}_{}", std::process::id(), stamp % 1_000_000_000);
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
 
         let tmux_result = (|| -> io::Result<()> {
@@ -2752,7 +2752,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             Ok(())
         })();
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
         execute!(io::stdout(), Hide)?;
@@ -2793,7 +2793,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let session_name = format!("sbrs_E_{}_{}", std::process::id(), stamp % 1_000_000_000);
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
 
         let tmux_result = (|| -> io::Result<()> {
@@ -2840,7 +2840,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             Ok(())
         })();
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
         execute!(io::stdout(), Hide)?;
@@ -2861,7 +2861,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         println!("$ {}", trimmed);
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -2890,7 +2890,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -2933,7 +2933,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
     fn preview_git_diff_and_confirm_commit(&mut self) -> io::Result<bool> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
 
         let delta_available = self.integration_active("delta");
@@ -2981,7 +2981,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let _ = io::stdin().read_line(&mut answer);
         let confirmed = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -2990,7 +2990,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
     fn run_git_commit_and_push(&mut self, commit_message: &str, amend: bool) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         let mut failed_step: Option<String> = None;
         let mut push_forced = false;
@@ -3060,7 +3060,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             disable_raw_mode()?;
         }
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -3094,7 +3094,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
     fn run_git_tag_and_push(&mut self, tag: &str) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         let run_step = |args: &[&str], dir: &PathBuf| -> io::Result<bool> {
             let status = Command::new("git")
@@ -3123,7 +3123,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 
@@ -3225,14 +3225,14 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         let _ = Command::new("delta")
             .arg("--side-by-side")
             .arg("--paging=always")
             .arg(&marked_path)
             .arg(&cursor_path)
             .status();
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
 
         let left = marked_path
@@ -3312,10 +3312,10 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         let editor = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
         let _ = Command::new(editor).arg(&todo_path).status();
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), Hide)?;
         enable_raw_mode()?;
         self.refresh_entries_or_status();
@@ -3891,7 +3891,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         execute!(io::stdout(), Show)?;
 
         let edit_result = (|| -> io::Result<String> {
@@ -3901,7 +3901,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             fs::read_to_string(&tmp)
         })();
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
         execute!(io::stdout(), Hide)?;
 
@@ -6970,7 +6970,7 @@ fn main() -> io::Result<()> {
                         {
                             let fmt = "%C(bold blue)%h%C(reset) - %C(cyan)%ad%C(reset) | %C(yellow)%d%C(reset) %C(white)%s%C(reset) %C(green)[%an]%C(reset)";
                             disable_raw_mode()?;
-                            execute!(io::stdout(), LeaveAlternateScreen)?;
+                            execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                             execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
                             let log_child = Command::new("git")
                                 .args([
@@ -7002,7 +7002,7 @@ fn main() -> io::Result<()> {
                                     .current_dir(&app.current_dir)
                                     .status();
                             }
-                            execute!(io::stdout(), EnterAlternateScreen)?;
+                            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                             execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
                             enable_raw_mode()?;
                             terminal.clear()?;
@@ -7139,7 +7139,7 @@ fn main() -> io::Result<()> {
                             let selected_path = entry.path();
                             if !selected_path.is_dir() {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 if App::is_binary_file(&selected_path) && app.integration_active("hexyl") {
                                     use std::process::Stdio;
                                     let hexyl = Command::new("hexyl")
@@ -7162,7 +7162,7 @@ fn main() -> io::Result<()> {
                                         .status();
                                 }
                                 enable_raw_mode()?;
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 terminal.clear()?;
                             }
                         }
@@ -7236,14 +7236,14 @@ fn main() -> io::Result<()> {
                                     app.set_status("no selected item to rename");
                                 } else {
                                     disable_raw_mode()?;
-                                    execute!(io::stdout(), LeaveAlternateScreen)?;
+                                    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                     let mut cmd = Command::new("vidir");
                                     for p in &targets {
                                         cmd.arg(p);
                                     }
                                     let _ = cmd.status();
                                     enable_raw_mode()?;
-                                    execute!(io::stdout(), EnterAlternateScreen)?;
+                                    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                     terminal.clear()?;
                                     app.refresh_entries_or_status();
                                 }
@@ -7327,18 +7327,18 @@ fn main() -> io::Result<()> {
                             }
                             else if App::is_markdown_file(&selected_path) && app.integration_active("glow") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 let _ = Command::new("glow")
                                     .arg("-p")
                                     .arg(&selected_path)
                                     .status();
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_mermaid_file(&selected_path) && app.integration_active("mmdflux") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 if let Ok(mut child) = Command::new("mmdflux")
                                     .arg(&selected_path)
                                     .stdout(Stdio::piped())
@@ -7352,32 +7352,32 @@ fn main() -> io::Result<()> {
                                     }
                                     let _ = child.wait();
                                 }
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_html_file(&selected_path) && app.integration_active("links") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 let _ = Command::new("links").arg(&selected_path).status();
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_json_file(&selected_path) && app.integration_active("jnv") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
                                 let _ = App::preview_json_with_jnv(&selected_path);
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_delimited_text_file(&selected_path) && app.integration_active("csvlens") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 let _ = Command::new("csvlens").arg(&selected_path).status();
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
@@ -7391,7 +7391,7 @@ fn main() -> io::Result<()> {
                             else if App::is_audio_file(&selected_path) && app.integration_active("sox") {
                                 use std::process::Stdio;
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
 
                                 let mut child = if App::integration_probe("play").0 {
@@ -7432,13 +7432,13 @@ fn main() -> io::Result<()> {
                                     disable_raw_mode()?;
                                 }
 
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_pdf_file(&selected_path) && app.integration_active("pdftotext") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
                                 let mut shown = false;
                                 if let Ok(mut child) = Command::new("pdftotext")
@@ -7465,22 +7465,22 @@ fn main() -> io::Result<()> {
                                         .status();
                                 }
 
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else if App::is_cast_file(&selected_path) && app.integration_active("asciinema") {
                                 disable_raw_mode()?;
-                                execute!(io::stdout(), LeaveAlternateScreen)?;
+                                execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
                                 let _ = App::preview_cast_with_asciinema(&selected_path)?;
 
-                                execute!(io::stdout(), EnterAlternateScreen)?;
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 enable_raw_mode()?;
                                 terminal.clear()?;
                             }
                             else { 
-                                disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                                disable_raw_mode()?; execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 if App::is_binary_file(&selected_path) && app.integration_active("hexyl") {
                                     use std::process::Stdio;
                                     let hexyl = Command::new("hexyl")
@@ -7502,7 +7502,7 @@ fn main() -> io::Result<()> {
                                 } else {
                                     let _ = Command::new("less").args(["-R", selected_path.to_str().unwrap()]).status();
                                 }
-                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 terminal.clear()?;
                             }
                         }
@@ -7529,7 +7529,7 @@ fn main() -> io::Result<()> {
                                     tmp.display()
                                 )
                             };
-                            disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                            disable_raw_mode()?; execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                             let _ = Command::new("sh")
                                 .args(["-c", &cmd])
                                 .current_dir(&app.current_dir)
@@ -7537,7 +7537,7 @@ fn main() -> io::Result<()> {
                                 .stdout(Stdio::inherit())
                                 .stderr(Stdio::inherit())
                                 .status();
-                            enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                            enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                             terminal.clear()?;
                             let selected = fs::read_to_string(&tmp).unwrap_or_default();
                             let _ = fs::remove_file(&tmp);
@@ -7587,7 +7587,7 @@ fn main() -> io::Result<()> {
                                 "find . -path '*/.*' -prune -o -print 2>/dev/null | fzf --layout=reverse > {}",
                                 tmp.display()
                             );
-                            disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                            disable_raw_mode()?; execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                             let _ = Command::new("sh")
                                 .args(["-c", &cmd])
                                 .current_dir(&app.current_dir)
@@ -7595,7 +7595,7 @@ fn main() -> io::Result<()> {
                                 .stdout(Stdio::inherit())
                                 .stderr(Stdio::inherit())
                                 .status();
-                            enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                            enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                             terminal.clear()?;
                             let selected = fs::read_to_string(&tmp).unwrap_or_default();
                             let _ = fs::remove_file(&tmp);
@@ -7626,14 +7626,14 @@ fn main() -> io::Result<()> {
                                     terminal.clear()?;
                                 }
                             } else {
-                                disable_raw_mode()?; execute!(io::stdout(), LeaveAlternateScreen)?;
+                                disable_raw_mode()?; execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                 execute!(io::stdout(), Show)?;
                                 if !path.is_dir() && App::is_binary_file(&path) && app.integration_active("hexedit") {
                                     let _ = Command::new("hexedit").arg(&path).status();
                                 } else {
                                     let _ = Command::new(env::var("EDITOR").unwrap_or_else(|_| "nano".to_string())).arg(&path).status();
                                 }
-                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen)?;
+                                enable_raw_mode()?; execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                 execute!(io::stdout(), Hide)?;
                                 terminal.clear()?;
                                 app.refresh_entries_or_status();
@@ -8162,10 +8162,10 @@ fn main() -> io::Result<()> {
                                         app.mount_ssh_host(&host)?;
                                     } else {
                                         disable_raw_mode()?;
-                                        execute!(io::stdout(), LeaveAlternateScreen)?;
+                                        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                         let result = app.mount_ssh_host(&host);
                                         enable_raw_mode()?;
-                                        execute!(io::stdout(), EnterAlternateScreen)?;
+                                        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                         terminal.clear()?;
                                         if result.is_err() {
                                             app.set_status(format!("Failed to mount {}", alias));
@@ -8179,11 +8179,11 @@ fn main() -> io::Result<()> {
                                         app.mount_rclone_remote(&name, &rtype)?;
                                     } else {
                                         disable_raw_mode()?;
-                                        execute!(io::stdout(), LeaveAlternateScreen)?;
+                                        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
                                         println!("Connecting to rclone remote: {}…", name);
                                         let result = app.mount_rclone_remote(&name, &rtype);
                                         enable_raw_mode()?;
-                                        execute!(io::stdout(), EnterAlternateScreen)?;
+                                        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                                         terminal.clear()?;
                                         if result.is_err() {
                                             app.set_status(format!("Failed to mount rclone remote {}", name));
