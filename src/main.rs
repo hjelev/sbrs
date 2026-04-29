@@ -1,6 +1,9 @@
 use crossterm::{
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -4182,6 +4185,346 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         ui::panels::panel_tab_bar_line(active)
     }
 
+    fn panel_tab_hit_test(relative_x: u16) -> Option<u8> {
+        ui::panels::panel_tab_hit_test(relative_x)
+    }
+
+    fn tabbed_overlay_close_area(popup_area: Rect) -> Rect {
+        Rect::new(
+            popup_area.x + popup_area.width.saturating_sub(2),
+            popup_area.y,
+            1,
+            1,
+        )
+    }
+
+    fn primary_content_area(area: Rect) -> Rect {
+        Layout::default()
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(area)[0]
+    }
+
+    fn tab_overlay_anchor(area: Rect) -> Rect {
+        let area = Self::primary_content_area(area);
+        let anchor_w = (area.width * 5 / 6).max(50).min(area.width);
+        let anchor_h = (area.height * 5 / 6).max(12).min(area.height);
+        Rect::new(
+            area.x + (area.width.saturating_sub(anchor_w)) / 2,
+            area.y + (area.height.saturating_sub(anchor_h)) / 2,
+            anchor_w,
+            anchor_h,
+        )
+    }
+
+    fn open_panel_tab(&mut self, tab: u8) {
+        if tab == self.panel_tab
+            && matches!(
+                (tab, self.mode),
+                (0, AppMode::Help)
+                    | (1, AppMode::InternalSearch)
+                    | (2, AppMode::Bookmarks)
+                    | (3, AppMode::SshPicker)
+                    | (4, AppMode::SortMenu)
+                    | (5, AppMode::Integrations)
+            )
+        {
+            return;
+        }
+
+        match tab {
+            0 => {
+                self.panel_tab = 0;
+                self.help_scroll_offset = 0;
+                self.mode = AppMode::Help;
+            }
+            1 => {
+                self.panel_tab = 1;
+                self.start_internal_search();
+            }
+            2 => {
+                self.panel_tab = 2;
+                self.mode = AppMode::Bookmarks;
+            }
+            3 => {
+                self.panel_tab = 3;
+                self.refresh_remote_entries();
+                self.mode = AppMode::SshPicker;
+            }
+            4 => {
+                self.begin_sort_menu();
+            }
+            5 => {
+                self.integration_selected = 0;
+                self.refresh_integration_rows_cache();
+                self.panel_tab = 5;
+                self.mode = AppMode::Integrations;
+            }
+            _ => {}
+        }
+    }
+
+    fn close_tabbed_overlay(&mut self) {
+        match self.mode {
+            AppMode::InternalSearch => {
+                self.cancel_internal_search_candidate_scan();
+                self.cancel_internal_search_content_request();
+                self.clear_input_edit();
+                self.mode = AppMode::Browsing;
+            }
+            AppMode::Help
+            | AppMode::Bookmarks
+            | AppMode::Integrations
+            | AppMode::SortMenu
+            | AppMode::SshPicker => {
+                self.mode = AppMode::Browsing;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tab_close_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !matches!(
+            self.mode,
+            AppMode::InternalSearch
+                | AppMode::Help
+                | AppMode::Bookmarks
+                | AppMode::Integrations
+                | AppMode::SortMenu
+                | AppMode::SshPicker
+        ) {
+            return false;
+        }
+
+        let popup_area = Self::tab_overlay_anchor(area);
+        let close_area = Self::tabbed_overlay_close_area(popup_area);
+        if row == close_area.y && column >= close_area.x && column < close_area.x + close_area.width {
+            self.close_tabbed_overlay();
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_tab_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !matches!(
+            self.mode,
+            AppMode::InternalSearch
+                | AppMode::Help
+                | AppMode::Bookmarks
+                | AppMode::Integrations
+                | AppMode::SortMenu
+                | AppMode::SshPicker
+        ) {
+            return false;
+        }
+
+        let popup_area = Self::tab_overlay_anchor(area);
+        if row != popup_area.y || column <= popup_area.x || column >= popup_area.x + popup_area.width.saturating_sub(1) {
+            return false;
+        }
+
+        let relative_x = column.saturating_sub(popup_area.x + 1);
+        if let Some(tab) = Self::panel_tab_hit_test(relative_x) {
+            self.open_panel_tab(tab);
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_confirm_delete_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if self.mode != AppMode::ConfirmDelete {
+            return false;
+        }
+
+        let to_delete = self.delete_targets();
+        let (mut file_count, mut folder_count) = (0usize, 0usize);
+        for path in &to_delete {
+            if path.is_dir() {
+                folder_count += 1;
+            } else {
+                file_count += 1;
+            }
+        }
+        let plural = |count: usize, singular: &str, plural: &str| -> String {
+            if count == 1 {
+                singular.to_string()
+            } else {
+                plural.to_string()
+            }
+        };
+        let title = if file_count > 0 && folder_count > 0 {
+            format!(
+                " Delete {} {} and {} {}? ",
+                file_count,
+                plural(file_count, "file", "files"),
+                folder_count,
+                plural(folder_count, "folder", "folders")
+            )
+        } else if folder_count > 0 {
+            format!(
+                " Delete {} {}? ",
+                folder_count,
+                plural(folder_count, "folder", "folders")
+            )
+        } else {
+            format!(
+                " Delete {} {}? ",
+                file_count,
+                plural(file_count, "file", "files")
+            )
+        };
+
+        let content_w = title.chars().count().max(42) as u16;
+        let content_h = area.height.saturating_sub(8).max(7);
+        let max_w = area.width.saturating_sub(4).max(1);
+        let max_h = area.height.saturating_sub(4).max(1);
+        let dialog_w = (content_w + 2).max(48).min(max_w);
+        let full_dialog_h = (content_h + 2).max(10).min(max_h);
+        let dialog_h = (full_dialog_h / 2).max(8).min(max_h);
+        let confirm_area = Rect::new(
+            (area.width.saturating_sub(dialog_w)) / 2,
+            (area.height.saturating_sub(dialog_h)) / 2,
+            dialog_w,
+            dialog_h,
+        );
+
+        let inner = Rect::new(
+            confirm_area.x.saturating_add(1),
+            confirm_area.y.saturating_add(1),
+            confirm_area.width.saturating_sub(2),
+            confirm_area.height.saturating_sub(2),
+        );
+        if inner.width == 0 || inner.height == 0 {
+            return false;
+        }
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let button_area = sections[1];
+        if row != button_area.y {
+            return false;
+        }
+
+        let prefix_w = 2u16;
+        let confirm_w = "  Confirm  ".chars().count() as u16;
+        let gap_w = 4u16;
+        let cancel_w = "  Cancel  ".chars().count() as u16;
+        let total_w = prefix_w + confirm_w + gap_w + cancel_w;
+        if button_area.width < total_w {
+            return false;
+        }
+
+        let start_x = button_area.x + (button_area.width - total_w) / 2;
+        let confirm_start = start_x + prefix_w;
+        let cancel_start = confirm_start + confirm_w + gap_w;
+
+        if column >= confirm_start && column < confirm_start + confirm_w {
+            self.confirm_delete_button_focus = 0;
+            self.confirm_delete_selected_targets();
+            return true;
+        }
+        if column >= cancel_start && column < cancel_start + cancel_w {
+            self.confirm_delete_button_focus = 1;
+            self.mode = AppMode::Browsing;
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_mouse_scroll(&mut self, scroll_up: bool) {
+        match self.mode {
+            AppMode::Browsing => {
+                let delta = if scroll_up { -3 } else { 3 };
+                self.move_selection_delta(delta);
+            }
+            AppMode::Help => {
+                if scroll_up {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(3);
+                } else {
+                    self.help_scroll_offset = (self.help_scroll_offset + 3).min(self.help_max_offset);
+                }
+            }
+            AppMode::InternalSearch => {
+                if self.internal_search_limits_menu_open {
+                    if scroll_up {
+                        self.internal_search_limits_selected = self.internal_search_limits_selected.saturating_sub(1);
+                    } else {
+                        self.internal_search_limits_selected = (self.internal_search_limits_selected + 1).min(2);
+                    }
+                } else if !self.internal_search_results.is_empty() {
+                    if scroll_up {
+                        self.internal_search_selected = self.internal_search_selected.saturating_sub(1);
+                    } else {
+                        self.internal_search_selected = (self.internal_search_selected + 1)
+                            .min(self.internal_search_results.len().saturating_sub(1));
+                    }
+                }
+            }
+            AppMode::Bookmarks => {
+                let max_idx = Self::load_bookmarks().len().saturating_sub(1);
+                if scroll_up {
+                    self.bookmark_selected = self.bookmark_selected.saturating_sub(1);
+                } else {
+                    self.bookmark_selected = (self.bookmark_selected + 1).min(max_idx);
+                }
+            }
+            AppMode::Integrations => {
+                let max_idx = self.integration_count().saturating_sub(1);
+                if scroll_up {
+                    self.integration_selected = self.integration_selected.saturating_sub(1);
+                } else {
+                    self.integration_selected = (self.integration_selected + 1).min(max_idx);
+                }
+            }
+            AppMode::SortMenu => {
+                let max_idx = Self::sort_mode_options().len().saturating_sub(1);
+                if scroll_up {
+                    self.sort_menu_selected = self.sort_menu_selected.saturating_sub(1);
+                } else {
+                    self.sort_menu_selected = (self.sort_menu_selected + 1).min(max_idx);
+                }
+            }
+            AppMode::SshPicker => {
+                let max_idx = self.remote_entries.len().saturating_sub(1);
+                if scroll_up {
+                    self.ssh_picker_selection = self.ssh_picker_selection.saturating_sub(1);
+                } else {
+                    self.ssh_picker_selection = (self.ssh_picker_selection + 1).min(max_idx);
+                }
+            }
+            AppMode::ConfirmDelete => {
+                if scroll_up {
+                    self.confirm_delete_scroll_offset = self.confirm_delete_scroll_offset.saturating_sub(3);
+                } else {
+                    self.confirm_delete_scroll_offset =
+                        (self.confirm_delete_scroll_offset + 3).min(self.confirm_delete_max_offset);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.handle_mouse_scroll(true),
+            MouseEventKind::ScrollDown => self.handle_mouse_scroll(false),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.handle_tab_close_click(mouse.column, mouse.row, area) {
+                    return;
+                }
+                if self.handle_tab_click(mouse.column, mouse.row, area) {
+                    return;
+                }
+                let _ = self.handle_confirm_delete_click(mouse.column, mouse.row, area);
+            }
+            _ => {}
+        }
+    }
+
     fn load_bookmarks() -> Vec<(usize, Option<PathBuf>)> {
         (0..=9).map(|i| {
             let path = env::var(format!("SB_BOOKMARK_{}", i))
@@ -4252,7 +4595,7 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new()?;
@@ -4694,6 +5037,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let popup_inner = popup_block.inner(popup_area);
                 f.render_widget(popup_block, popup_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(popup_area),
+                );
 
                 let search_layout = Layout::default()
                     .direction(Direction::Vertical)
@@ -5199,6 +5549,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let help_inner = help_block.inner(help_area);
                 f.render_widget(help_block, help_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(help_area),
+                );
                 let help_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -5491,6 +5848,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let bm_inner = bm_block.inner(bm_area);
                 f.render_widget(bm_block, bm_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(bm_area),
+                );
                 let bm_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -5551,7 +5915,7 @@ fn main() -> io::Result<()> {
                     let category_span = Span::styled(category_text.clone(), base_style);
                     let purpose_span = Span::styled(purpose_text.clone(), base_style);
                     let mut spans = vec![
-                        Span::styled(status_text.clone(), status_style.patch(base_style)),
+                        Span::styled(status_text.clone(), base_style.patch(status_style)),
                         name_span,
                         state_span,
                         category_span,
@@ -5590,6 +5954,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let int_inner = int_block.inner(int_area);
                 f.render_widget(int_block, int_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(int_area),
+                );
                 let int_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -5674,6 +6045,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let sort_inner = sort_block.inner(sort_area);
                 f.render_widget(sort_block, sort_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(sort_area),
+                );
                 let sort_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -5794,6 +6172,13 @@ fn main() -> io::Result<()> {
                     .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
                 let ssh_inner = ssh_block.inner(ssh_area);
                 f.render_widget(ssh_block, ssh_area);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "x",
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )),
+                    App::tabbed_overlay_close_area(ssh_area),
+                );
                 let ssh_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -6310,8 +6695,16 @@ fn main() -> io::Result<()> {
 
         let mut next_key: Option<KeyEvent> = deferred_key.take();
         if next_key.is_none() && event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                next_key = Some(key);
+            match event::read()? {
+                Event::Key(key) => {
+                    next_key = Some(key);
+                }
+                Event::Mouse(mouse) => {
+                    let area = terminal.size()?;
+                    app.handle_mouse_event(mouse, area);
+                    continue;
+                }
+                _ => {}
             }
         }
 
@@ -7712,6 +8105,7 @@ fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         LeaveAlternateScreen,
         TermClear(ClearType::All),
         MoveTo(0, 0)
