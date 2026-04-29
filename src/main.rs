@@ -79,6 +79,7 @@ struct SshMount {
     return_dir: PathBuf,
     remote_label: String,
     remote_root: String,
+    remote_os_icon: Option<(&'static str, Color)>,
 }
 
 struct GitInfoCache {
@@ -288,6 +289,7 @@ struct App {
     archive_started_at: Option<Instant>,
     archive_name: String,
     nerd_font_active: bool,
+    os_icon: Option<(&'static str, ratatui::style::Color)>,
     no_color: bool,
     show_icons: bool,
     integration_selected: usize,
@@ -466,6 +468,7 @@ impl App {
             archive_started_at: None,
             archive_name: String::new(),
             nerd_font_active: env::var("NERD_FONT_ACTIVE").map(|v| v == "1").unwrap_or(false),
+            os_icon: ui::icons::os_nerd_icon().map(|(g, (r, g2, b))| (g, Color::Rgb(r, g2, b))),
             no_color: env_flag_true(&["NO_COLOR"]),
             show_icons: env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true),
             integration_selected: 0,
@@ -1518,7 +1521,17 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
     fn current_dir_display_path(&self) -> String {
         let Some(mount) = self.current_remote_mount() else {
-            return self.current_dir.to_string_lossy().into_owned();
+            let path_str = self.current_dir.to_string_lossy().into_owned();
+            if let Ok(home) = env::var("HOME") {
+                if path_str == home {
+                    return "~".to_string();
+                }
+                let home_prefix = format!("{}/", home);
+                if let Some(rest) = path_str.strip_prefix(&home_prefix) {
+                    return format!("~/{}", rest);
+                }
+            }
+            return path_str;
         };
 
         let rel = self
@@ -1595,12 +1608,15 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             .status()?;
         if status.success() {
             Self::wait_for_mount_ready(&mount_dir);
+            let remote_os_icon = ui::icons::remote_os_nerd_icon(&mount_dir)
+                .map(|(g, (r, g2, b))| (g, Color::Rgb(r, g2, b)));
             self.ssh_mounts.push(SshMount {
                 _host_alias: name.to_string(),
                 mount_path: mount_dir.clone(),
                 return_dir,
                 remote_label: name.to_string(),
                 remote_root: "/".to_string(),
+                remote_os_icon,
             });
             self.mode = AppMode::Browsing;
             self.try_enter_dir(mount_dir);
@@ -1611,10 +1627,35 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn detect_ssh_remote_os_icon(host: &SshHost) -> Option<(&'static str, Color)> {
+        let target = match &host.user {
+            Some(u) => format!("{}@{}", u, host.hostname),
+            None => host.hostname.clone(),
+        };
+        let mut cmd = Command::new("ssh");
+        if let Some(port) = host.port {
+            cmd.args(["-p", &port.to_string()]);
+        }
+        if let Some(idf) = &host.identity_file {
+            let expanded = idf.replace('~', &env::var("HOME").unwrap_or_default());
+            cmd.args(["-i", &expanded]);
+        }
+        let output = cmd.args([&target, "cat", "/etc/os-release"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let content = String::from_utf8_lossy(&output.stdout);
+        ui::icons::os_nerd_icon_from_os_release_content(content.as_ref())
+            .map(|(g, (r, g2, b))| (g, Color::Rgb(r, g2, b)))
+    }
+
     fn mount_ssh_host(&mut self, host: &SshHost) -> io::Result<()> {
         // If already mounted, just navigate there
         if let Some(existing) = self.ssh_mounts.iter_mut().find(|m| m._host_alias == host.alias) {
             existing.return_dir = self.current_dir.clone();
+            if existing.remote_os_icon.is_none() {
+                existing.remote_os_icon = Self::detect_ssh_remote_os_icon(host);
+            }
             let mount_path = existing.mount_path.clone();
             self.mode = AppMode::Browsing;
             self.try_enter_dir(mount_path);
@@ -1647,12 +1688,16 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 Some(user) => format!("{}@{}", user, host.hostname),
                 None => host.hostname.clone(),
             };
+            let remote_os_icon = ui::icons::remote_os_nerd_icon(&mount_dir)
+                .map(|(g, (r, g2, b))| (g, Color::Rgb(r, g2, b)))
+                .or_else(|| Self::detect_ssh_remote_os_icon(host));
             self.ssh_mounts.push(SshMount {
                 _host_alias: host.alias.clone(),
                 mount_path: mount_dir.clone(),
                 return_dir,
                 remote_label,
                 remote_root: "~".to_string(),
+                remote_os_icon,
             });
             self.mode = AppMode::Browsing;
             self.try_enter_dir(mount_dir);
@@ -4889,15 +4934,36 @@ fn main() -> io::Result<()> {
             } else {
                 app.current_dir_display_path_with_filter()
             };
-            let mut path_spans = vec![
+            let header_sep = if app.nerd_font_active { " \u{f0256} " } else { " » " };
+            let os_icon_span: Option<Span> = if app.nerd_font_active {
+                // Use the remote OS icon if we're inside an SSH/rclone mount
+                let active_remote_icon = app.ssh_mounts.iter()
+                    .filter(|m| app.current_dir.starts_with(&m.mount_path))
+                    .last()
+                    .and_then(|m| m.remote_os_icon);
+                let icon_source = active_remote_icon.or(app.os_icon);
+                icon_source.map(|(glyph, color)| {
+                    Span::styled(format!("{} ", glyph), Style::default().fg(color))
+                })
+            } else {
+                None
+            };
+            let os_icon_width: u16 = os_icon_span.as_ref()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                .unwrap_or(0);
+            let mut path_spans: Vec<Span> = Vec::new();
+            if let Some(icon_span) = os_icon_span {
+                path_spans.push(icon_span);
+            }
+            path_spans.extend([
                 Span::styled(header_identity.as_str(), Style::default().fg(Color::Cyan)),
-                Span::raw(" » "),
+                Span::raw(header_sep),
                 if app.mode == AppMode::PathEditing {
                     Span::styled(current_display_path.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
                 } else {
                     Span::raw(current_display_path.as_str())
                 },
-            ];
+            ]);
             if app.integration_enabled("git") {
                 if let Some((branch, is_dirty, tag_info)) = app.cached_git_info_for_current_dir() {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
@@ -4959,9 +5025,9 @@ fn main() -> io::Result<()> {
                 f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
             }
             if app.mode == AppMode::PathEditing {
-                let prefix_len = format!("{} » ", header_identity).chars().count() as u16;
+                let prefix_len = format!("{}{}", header_identity, header_sep).chars().count() as u16;
                 app.clamp_input_cursor();
-                let cursor_x = chunks[0].x + prefix_len + app.input_cursor as u16;
+                let cursor_x = chunks[0].x + os_icon_width + prefix_len + app.input_cursor as u16;
                 let cursor_y = chunks[0].y;
                 f.set_cursor(cursor_x, cursor_y);
             }
@@ -5478,21 +5544,56 @@ fn main() -> io::Result<()> {
                             app.nerd_font_active,
                             is_symlink,
                         );
-                        if app.show_icons && !icon_glyph.is_empty() {
+                        let icon_span = if app.show_icons && !icon_glyph.is_empty() {
                             let adjusted_icon_style = if is_selected {
                                 icon_style.bg(Color::Rgb(60, 60, 60))
                             } else {
                                 icon_style
                             };
-                            spans.push(Span::styled(format!("{} ", icon_glyph), adjusted_icon_style));
-                        }
+                            Some(Span::styled(format!("{} ", icon_glyph), adjusted_icon_style))
+                        } else {
+                            None
+                        };
 
                         match result_idx {
                             InternalSearchResult::Filename { rel_path, match_ranges } => {
                                 let rel_str = rel_path.to_string_lossy().into_owned();
+                                let basename_start = rel_str.rfind('/').map(|idx| idx + 1).unwrap_or(0);
+                                let (dir_part, base_part) = rel_str.split_at(basename_start);
+
+                                let project_ranges = |start: usize, end: usize| -> Vec<(usize, usize)> {
+                                    match_ranges
+                                        .iter()
+                                        .filter_map(|(rs, re)| {
+                                            let overlap_start = (*rs).max(start);
+                                            let overlap_end = (*re).min(end);
+                                            if overlap_start < overlap_end {
+                                                Some((overlap_start - start, overlap_end - start))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect()
+                                };
+
+                                if !dir_part.is_empty() {
+                                    let dir_ranges = project_ranges(0, basename_start);
+                                    spans.extend(App::search_spans_with_ranges(
+                                        dir_part,
+                                        &dir_ranges,
+                                        base_style,
+                                        match_style,
+                                    ));
+                                }
+
+                                if let Some(icon) = icon_span.clone() {
+                                    spans.push(icon);
+                                }
+
+                                let base_ranges = project_ranges(basename_start, rel_str.len());
                                 spans.extend(App::search_spans_with_ranges(
-                                    &rel_str,
-                                    match_ranges,
+                                    base_part,
+                                    &base_ranges,
                                     base_style,
                                     match_style,
                                 ));
@@ -5503,9 +5604,20 @@ fn main() -> io::Result<()> {
                                 line_text,
                                 match_ranges,
                             } => {
-                                let prefix = format!("{}:{}: ", rel_path.display(), line_number);
+                                let path_text = rel_path.display().to_string();
+                                let basename_start = path_text.rfind('/').map(|idx| idx + 1).unwrap_or(0);
+                                let (dir_part, base_part) = path_text.split_at(basename_start);
+                                if !dir_part.is_empty() {
+                                    spans.push(Span::styled(
+                                        dir_part.to_string(),
+                                        base_style.fg(Color::Rgb(150, 190, 255)),
+                                    ));
+                                }
+                                if let Some(icon) = icon_span {
+                                    spans.push(icon);
+                                }
                                 spans.push(Span::styled(
-                                    prefix,
+                                    format!("{}:{}: ", base_part, line_number),
                                     base_style.fg(Color::Rgb(150, 190, 255)),
                                 ));
                                 spans.extend(App::search_spans_with_ranges(
