@@ -4435,6 +4435,243 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         false
     }
 
+    fn inner_with_borders(area: Rect) -> Rect {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        )
+    }
+
+    fn internal_search_header_rows(&self) -> usize {
+        let mut rows = 0usize;
+        if self.internal_search_candidates_pending || self.internal_search_candidates_truncated {
+            rows += 1;
+        }
+
+        if self.internal_search_scope == InternalSearchScope::Content {
+            rows += 1; // limits summary
+            if self.internal_search_limits_menu_open {
+                rows += 4; // 3 editable rows + helper line
+            } else {
+                rows += 1; // open editor hint
+            }
+            if self.internal_search_content_pending {
+                rows += 1;
+            }
+            if self.internal_search_content_limit_note.is_some() {
+                rows += 1;
+            }
+        }
+
+        rows
+    }
+
+    fn clickable_key_from_tabbed_row(
+        &mut self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<KeyEvent> {
+        match self.mode {
+            AppMode::InternalSearch => {
+                if self.internal_search_results.is_empty() {
+                    return None;
+                }
+
+                let popup_area = Self::tab_overlay_anchor(area);
+                let popup_inner = Self::inner_with_borders(popup_area);
+                let search_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(2),
+                    ])
+                    .split(popup_inner);
+                let body_area = search_layout[1];
+
+                if row < body_area.y || row >= body_area.y + body_area.height {
+                    return None;
+                }
+                if column < body_area.x || column >= body_area.x + body_area.width {
+                    return None;
+                }
+
+                let header_rows = self.internal_search_header_rows();
+                let regex_rows = usize::from(self.internal_search_regex_error.is_some());
+                let visible_rows = body_area.height as usize;
+                let max_rows = visible_rows.saturating_sub(header_rows).max(1);
+                let offset = if self.internal_search_selected >= max_rows {
+                    self.internal_search_selected + 1 - max_rows
+                } else {
+                    0
+                };
+
+                let result_start_y = body_area
+                    .y
+                    .saturating_add((header_rows + regex_rows) as u16);
+                if row < result_start_y {
+                    return None;
+                }
+
+                let clicked_result_row = row.saturating_sub(result_start_y) as usize;
+                let rendered_results = self
+                    .internal_search_results
+                    .len()
+                    .saturating_sub(offset)
+                    .min(max_rows);
+                if clicked_result_row >= rendered_results {
+                    return None;
+                }
+
+                self.internal_search_selected = offset + clicked_result_row;
+                Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            }
+            AppMode::Bookmarks => {
+                let overlay = Self::tab_overlay_anchor(area);
+                let bookmarks = Self::load_bookmarks();
+                if bookmarks.is_empty() {
+                    return None;
+                }
+
+                let bm_w = (area.width * 2 / 3).max(50).min(overlay.width);
+                let mut line_count = 1usize + bookmarks.len();
+                line_count += 4; // trailing helper lines
+                let bm_h = (line_count as u16 + 4).max(17).min(overlay.height);
+                let bm_area = Rect::new(overlay.x, overlay.y, bm_w, bm_h);
+                let bm_inner = Self::inner_with_borders(bm_area);
+                let bm_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(bm_inner);
+                let content = bm_chunks[0];
+
+                if row < content.y || row >= content.y + content.height {
+                    return None;
+                }
+                if column < content.x || column >= content.x + content.width {
+                    return None;
+                }
+
+                let line_idx = row.saturating_sub(content.y) as usize;
+                if line_idx >= 1 && line_idx <= bookmarks.len() {
+                    self.bookmark_selected = line_idx - 1;
+                    return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+
+                None
+            }
+            AppMode::Integrations => {
+                let overlay = Self::tab_overlay_anchor(area);
+                let integrations = self.integration_rows_cache.clone();
+                if integrations.is_empty() {
+                    return None;
+                }
+
+                let int_w = (area.width * 5 / 6).max(70).min(overlay.width);
+                let int_h = (integrations.len() as u16 + 1 + 4).min(overlay.height);
+                let int_area = Rect::new(overlay.x, overlay.y, int_w, int_h);
+                let int_inner = Self::inner_with_borders(int_area);
+                let int_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(int_inner);
+                let content = int_chunks[0];
+
+                if row < content.y || row >= content.y + content.height {
+                    return None;
+                }
+                if column < content.x || column >= content.x + content.width {
+                    return None;
+                }
+
+                let visible_rows = content.height as usize;
+                let selected_line = self.integration_selected + 1;
+                let int_scroll = if selected_line + 1 <= visible_rows {
+                    0usize
+                } else {
+                    selected_line + 1 - visible_rows
+                };
+                let line_idx = int_scroll + row.saturating_sub(content.y) as usize;
+                if line_idx >= 1 && line_idx <= integrations.len() {
+                    self.integration_selected = line_idx - 1;
+                    return Some(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+                }
+
+                None
+            }
+            AppMode::SshPicker => {
+                if self.remote_entries.is_empty() {
+                    return None;
+                }
+
+                let overlay = Self::tab_overlay_anchor(area);
+                let ssh_w = (area.width * 2 / 3).max(60).min(area.width);
+                let ssh_popup_w = ssh_w.min(overlay.width);
+                let lines_len = 1usize + self.remote_entries.len();
+                let ssh_h = (lines_len as u16 + 4).max(8).min(overlay.height);
+                let ssh_area = Rect::new(overlay.x, overlay.y, ssh_popup_w, ssh_h);
+                let ssh_inner = Self::inner_with_borders(ssh_area);
+                let ssh_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(ssh_inner);
+                let content = ssh_chunks[0];
+
+                if row < content.y || row >= content.y + content.height {
+                    return None;
+                }
+                if column < content.x || column >= content.x + content.width {
+                    return None;
+                }
+
+                let line_idx = row.saturating_sub(content.y) as usize;
+                if line_idx >= 1 && line_idx <= self.remote_entries.len() {
+                    self.ssh_picker_selection = line_idx - 1;
+                    return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+
+                None
+            }
+            AppMode::SortMenu => {
+                let overlay = Self::tab_overlay_anchor(area);
+                let options = Self::sort_mode_options();
+                if options.is_empty() {
+                    return None;
+                }
+
+                let sort_w = overlay.width;
+                let line_count = 1usize + options.len();
+                let sort_h = (line_count as u16 + 4).max(10).min(overlay.height);
+                let sort_area = Rect::new(overlay.x, overlay.y, sort_w, sort_h);
+                let sort_inner = Self::inner_with_borders(sort_area);
+                let sort_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(sort_inner);
+                let content = sort_chunks[0];
+
+                if row < content.y || row >= content.y + content.height {
+                    return None;
+                }
+                if column < content.x || column >= content.x + content.width {
+                    return None;
+                }
+
+                let line_idx = row.saturating_sub(content.y) as usize;
+                if line_idx >= 1 && line_idx <= options.len() {
+                    self.sort_menu_selected = line_idx - 1;
+                    return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn handle_mouse_scroll(&mut self, scroll_up: bool) {
         match self.mode {
             AppMode::Browsing => {
@@ -4508,21 +4745,26 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
-    fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> Option<KeyEvent> {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(true),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(false),
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.handle_tab_close_click(mouse.column, mouse.row, area) {
-                    return;
+                    return None;
                 }
                 if self.handle_tab_click(mouse.column, mouse.row, area) {
-                    return;
+                    return None;
+                }
+                if let Some(key) = self.clickable_key_from_tabbed_row(mouse.column, mouse.row, area) {
+                    return Some(key);
                 }
                 let _ = self.handle_confirm_delete_click(mouse.column, mouse.row, area);
             }
             _ => {}
         }
+
+        None
     }
 
     fn load_bookmarks() -> Vec<(usize, Option<PathBuf>)> {
@@ -6701,7 +6943,9 @@ fn main() -> io::Result<()> {
                 }
                 Event::Mouse(mouse) => {
                     let area = terminal.size()?;
-                    app.handle_mouse_event(mouse, area);
+                    if let Some(simulated_key) = app.handle_mouse_event(mouse, area) {
+                        deferred_key = Some(simulated_key);
+                    }
                     continue;
                 }
                 _ => {}
