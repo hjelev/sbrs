@@ -295,6 +295,9 @@ struct App {
     integration_install_brew_path: Option<String>,
     help_scroll_offset: u16,
     help_max_offset: u16,
+    confirm_delete_scroll_offset: u16,
+    confirm_delete_max_offset: u16,
+    confirm_delete_button_focus: u8,
     git_info_cache: Option<GitInfoCache>,
     git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool, Option<(String, u64)>)>)>>,
     folder_size_enabled: bool,
@@ -469,6 +472,9 @@ impl App {
             integration_install_brew_path: None,
             help_scroll_offset: 0,
             help_max_offset: 0,
+            confirm_delete_scroll_offset: 0,
+            confirm_delete_max_offset: 0,
+            confirm_delete_button_focus: 0,
             git_info_cache: None,
             git_info_rx: None,
             folder_size_enabled: false,
@@ -2204,6 +2210,26 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 .into_iter()
                 .collect()
         }
+    }
+
+    fn begin_confirm_delete(&mut self) {
+        self.confirm_delete_scroll_offset = 0;
+        self.confirm_delete_max_offset = 0;
+        self.confirm_delete_button_focus = 0;
+        self.mode = AppMode::ConfirmDelete;
+    }
+
+    fn confirm_delete_selected_targets(&mut self) {
+        let to_delete = self.delete_targets();
+        for path in to_delete {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        self.mode = AppMode::Browsing;
+        self.refresh_entries_or_status();
     }
 
     fn archive_targets(&self) -> Vec<PathBuf> {
@@ -5389,39 +5415,56 @@ fn main() -> io::Result<()> {
             } else if app.mode == AppMode::ConfirmDelete {
                 let area = f.size();
                 let to_delete = app.delete_targets();
-                let mut msg_lines: Vec<String> = vec!["Delete these files?".to_string(), String::new()];
-                let max_list_rows = ((area.height.saturating_sub(10) as usize).min(14)).max(1);
-                for (idx, path) in to_delete.iter().enumerate() {
-                    if idx >= max_list_rows {
-                        break;
+                let (mut file_count, mut folder_count) = (0usize, 0usize);
+                for path in &to_delete {
+                    if path.is_dir() {
+                        folder_count += 1;
+                    } else {
+                        file_count += 1;
                     }
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    msg_lines.push(format!(" - {}", name));
                 }
-                if to_delete.len() > max_list_rows {
-                    let remaining = to_delete.len() - max_list_rows;
-                    msg_lines.push(format!(" ... and {} more", remaining));
-                }
-                msg_lines.push(String::new());
-                msg_lines.push("  y = confirm    n / Esc = cancel".to_string());
-                let msg = msg_lines.join("\n");
 
-                let content_w = msg_lines
-                    .iter()
-                    .map(|line| line.chars().count() as u16)
-                    .max()
-                    .unwrap_or(24);
-                let content_h = msg_lines.len() as u16;
+                let plural = |count: usize, singular: &str, plural: &str| -> String {
+                    if count == 1 {
+                        singular.to_string()
+                    } else {
+                        plural.to_string()
+                    }
+                };
+                let title = if file_count > 0 && folder_count > 0 {
+                    format!(
+                        " Delete {} {} and {} {}? ",
+                        file_count,
+                        plural(file_count, "file", "files"),
+                        folder_count,
+                        plural(folder_count, "folder", "folders")
+                    )
+                } else if folder_count > 0 {
+                    format!(
+                        " Delete {} {}? ",
+                        folder_count,
+                        plural(folder_count, "folder", "folders")
+                    )
+                } else {
+                    format!(
+                        " Delete {} {}? ",
+                        file_count,
+                        plural(file_count, "file", "files")
+                    )
+                };
+
+                let content_w = title.chars().count().max(42) as u16;
+                let content_h = area.height.saturating_sub(8).max(7);
                 let max_w = area.width.saturating_sub(4).max(1);
                 let max_h = area.height.saturating_sub(4).max(1);
                 let dialog_w = (content_w + 2)
-                    .max(36)
+                    .max(48)
                     .min(max_w);
-                let dialog_h = (content_h + 2)
-                    .max(6)
+                let full_dialog_h = (content_h + 2)
+                    .max(10)
+                    .min(max_h);
+                let dialog_h = (full_dialog_h / 2)
+                    .max(8)
                     .min(max_h);
                 let confirm_area = Rect::new(
                     (area.width.saturating_sub(dialog_w)) / 2,
@@ -5430,13 +5473,149 @@ fn main() -> io::Result<()> {
                     dialog_h,
                 );
                 f.render_widget(Clear, confirm_area);
-                f.render_widget(
-                    Paragraph::new(msg)
-                        .wrap(Wrap { trim: true })
-                        .style(Style::default().fg(Color::Rgb(255, 100, 100)))
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Confirm Delete ")),
-                    confirm_area,
-                );
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(title)
+                    .border_style(Style::default().fg(Color::Rgb(255, 100, 100)));
+                let inner = block.inner(confirm_area);
+                f.render_widget(block, confirm_area);
+
+                if inner.width > 2 && inner.height > 2 {
+                    let sections = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(1),
+                            Constraint::Length(1),
+                        ])
+                        .split(inner);
+
+                    let list_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Rgb(90, 90, 90)));
+                    let list_frame_area = sections[0];
+                    let list_inner = list_block.inner(list_frame_area);
+                    f.render_widget(list_block, list_frame_area);
+
+                    let needs_scroll = to_delete.len() > list_inner.height as usize;
+                    let can_draw_scrollbar = list_inner.width > 4 && needs_scroll;
+                    let list_area = if can_draw_scrollbar {
+                        Rect::new(list_inner.x, list_inner.y, list_inner.width.saturating_sub(1), list_inner.height)
+                    } else {
+                        list_inner
+                    };
+                    let visible_rows = list_area.height.max(1) as usize;
+                    let max_scroll = to_delete.len().saturating_sub(visible_rows);
+                    app.confirm_delete_max_offset = max_scroll as u16;
+                    let offset = (app.confirm_delete_scroll_offset as usize).min(max_scroll);
+                    app.confirm_delete_scroll_offset = offset as u16;
+
+                    let mut list_lines: Vec<Line> = Vec::new();
+                    if to_delete.is_empty() {
+                        list_lines.push(Line::from(Span::styled(
+                            "No selected item",
+                            Style::default().fg(Color::Rgb(210, 170, 170)),
+                        )));
+                    } else {
+                        let row_name_max = list_area.width.saturating_sub(4) as usize;
+                        let truncate = |s: &str, max: usize| -> String {
+                            if max <= 1 {
+                                return "…".to_string();
+                            }
+                            let len = s.chars().count();
+                            if len <= max {
+                                return s.to_string();
+                            }
+                            s.chars().take(max - 1).collect::<String>() + "…"
+                        };
+
+                        for path in to_delete.iter().skip(offset).take(visible_rows) {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                            let path_is_symlink = path.symlink_metadata()
+                                .map(|m| m.file_type().is_symlink())
+                                .unwrap_or(false);
+                            let (icon_glyph, icon_style) = App::icon_for_path(path, app.show_icons, app.nerd_font_active, path_is_symlink);
+                            let mut spans: Vec<Span> = Vec::new();
+                            if app.show_icons && !icon_glyph.is_empty() {
+                                spans.push(Span::styled(format!("{} ", icon_glyph), icon_style));
+                            }
+                            spans.push(Span::styled(
+                                truncate(&name, row_name_max.max(1)),
+                                Style::default().fg(Color::Rgb(240, 240, 240)),
+                            ));
+                            list_lines.push(Line::from(spans));
+                        }
+                    }
+                    f.render_widget(Paragraph::new(list_lines), list_area);
+
+                    if can_draw_scrollbar {
+                        let sb_area = Rect::new(
+                            list_inner.x + list_inner.width.saturating_sub(1),
+                            list_inner.y,
+                            1,
+                            list_inner.height,
+                        );
+                        let track_h = sb_area.height as usize;
+                        if track_h > 0 {
+                            let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                            let thumb_h = if to_delete.is_empty() {
+                                track_h
+                            } else {
+                                ((visible_rows * track_h + to_delete.len() - 1) / to_delete.len())
+                                    .max(1)
+                                    .min(track_h)
+                            };
+                            let scroll_space = track_h.saturating_sub(thumb_h);
+                            let thumb_y = if max_scroll == 0 {
+                                0
+                            } else {
+                                (offset * scroll_space + (max_scroll / 2)) / max_scroll
+                            };
+
+                            for row in 0..track_h {
+                                let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                                let (ch, color) = if in_thumb {
+                                    ("█", Color::Rgb(255, 120, 120))
+                                } else {
+                                    ("│", Color::Rgb(90, 70, 70))
+                                };
+                                sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                            }
+                            f.render_widget(Paragraph::new(sb_lines), sb_area);
+                        }
+                    }
+
+                    let confirm_focused = app.confirm_delete_button_focus == 0;
+                    let cancel_focused = !confirm_focused;
+                    let confirm_style = if confirm_focused {
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 30))
+                            .bg(Color::Rgb(255, 130, 130))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 200, 200))
+                    };
+                    let cancel_style = if cancel_focused {
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 30))
+                            .bg(Color::Rgb(200, 200, 220))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 200, 200))
+                    };
+
+                    let button_line = Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("  Confirm  ", confirm_style),
+                        Span::styled("    ", Style::default()),
+                        Span::styled("  Cancel  ", cancel_style),
+                    ]);
+                    f.render_widget(Paragraph::new(button_line).alignment(Alignment::Center), sections[1]);
+                }
             }
 
             // --- Footer ---
@@ -5752,7 +5931,7 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('d') | KeyCode::Delete => {
                         if !app.entries.is_empty() {
-                            app.mode = AppMode::ConfirmDelete;
+                            app.begin_confirm_delete();
                         }
                     }
                     KeyCode::Char('x') => {
@@ -6946,14 +7125,32 @@ fn main() -> io::Result<()> {
                     _ => {}
                 },
                 AppMode::ConfirmDelete => match key.code {
-                    KeyCode::Char('y') => {
-                        let to_delete = app.delete_targets();
-                        for path in to_delete {
-                            if path.is_dir() { let _ = fs::remove_dir_all(&path); }
-                            else { let _ = fs::remove_file(&path); }
+                    KeyCode::Left => {
+                        app.confirm_delete_button_focus = 0;
+                    }
+                    KeyCode::Right => {
+                        app.confirm_delete_button_focus = 1;
+                    }
+                    KeyCode::Up => {
+                        app.confirm_delete_scroll_offset = app.confirm_delete_scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        app.confirm_delete_scroll_offset =
+                            (app.confirm_delete_scroll_offset + 1).min(app.confirm_delete_max_offset);
+                    }
+                    KeyCode::PageUp => {
+                        app.confirm_delete_scroll_offset = app.confirm_delete_scroll_offset.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        app.confirm_delete_scroll_offset =
+                            (app.confirm_delete_scroll_offset + 8).min(app.confirm_delete_max_offset);
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        if key.code == KeyCode::Enter && app.confirm_delete_button_focus == 1 {
+                            app.mode = AppMode::Browsing;
+                        } else {
+                            app.confirm_delete_selected_targets();
                         }
-                        app.mode = AppMode::Browsing;
-                        app.refresh_entries_or_status();
                     }
                     KeyCode::Char('n') | KeyCode::Esc => { app.mode = AppMode::Browsing; }
                     _ => {}

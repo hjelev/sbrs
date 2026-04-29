@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, str::FromStr, time::UNIX_EPOCH};
+use std::{collections::HashMap, fs, path::Path, str::FromStr, time::UNIX_EPOCH};
 
 use crate::util::format::format_mtime;
 use devicons::{icon_for_file, File as DevFile, Theme};
@@ -28,6 +28,52 @@ pub(crate) struct EntryRenderConfig {
 }
 
 impl App {
+    pub(crate) fn icon_for_path(path: &Path, show_icons: bool, nerd_font_active: bool, is_symlink: bool) -> (String, Style) {
+        if !show_icons {
+            return (String::new(), Style::default());
+        }
+
+        if is_symlink {
+            return ("\u{f1177}".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)));
+        }
+
+        let is_dir = path.is_dir();
+        if nerd_font_active {
+            if is_dir {
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let dir_style = Style::default()
+                    .fg(Color::Rgb(100, 160, 240))
+                    .add_modifier(Modifier::BOLD);
+                if let Some((glyph, _)) = ui::icons::named_dir_icon(dir_name) {
+                    (glyph.to_string(), dir_style)
+                } else {
+                    ("\u{f024b}".to_string(), dir_style)
+                }
+            } else if Self::is_age_protected_file(&path.to_path_buf()) {
+                ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
+            } else if let Some((custom_icon, (r, g, b))) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(named_file_icon)
+            {
+                (custom_icon.to_string(), Style::default().fg(Color::Rgb(r, g, b)))
+            } else {
+                let data = icon_for_file(&DevFile::new(path), Some(Theme::Dark));
+                let color = Color::from_str(data.color).unwrap_or(Color::White);
+                (data.icon.to_string(), Style::default().fg(color))
+            }
+        } else if is_dir {
+            (
+                "📁".to_string(),
+                Style::default()
+                    .fg(Color::Rgb(100, 160, 240))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("📄".to_string(), Style::default().fg(Color::White))
+        }
+    }
+
     pub(crate) fn build_entry_render_cache(
         entry: &fs::DirEntry,
         config: EntryRenderConfig,
@@ -39,57 +85,14 @@ impl App {
         let is_hidden = entry.file_name().to_string_lossy().starts_with('.');
         let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let icon_data = if config.nerd_font_active {
+        // icon_data is still needed for name_style color on regular nerd-font files.
+        let icon_data = if config.nerd_font_active && !is_symlink && !is_dir {
             Some(icon_for_file(&DevFile::new(&path), Some(Theme::Dark)))
         } else {
             None
         };
 
-        let (icon_glyph, icon_style) = if !config.show_icons {
-            (String::new(), Style::default())
-        } else if config.nerd_font_active {
-            if is_symlink {
-                ("\u{f1177}".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)))
-            } else if is_dir {
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let dir_style = Style::default()
-                    .fg(Color::Rgb(100, 160, 240))
-                    .add_modifier(Modifier::BOLD);
-                if let Some((glyph, _)) = ui::icons::named_dir_icon(dir_name) {
-                    (glyph.to_string(), dir_style)
-                } else {
-                    ("\u{f024b}".to_string(), dir_style)
-                }
-            } else if Self::is_age_protected_file(&path) {
-                ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
-            } else {
-                let name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let (icon, color): (String, Color) = if let Some((custom_icon, (r, g, b))) = named_file_icon(name_str) {
-                    // 1. Check your custom rules FIRST
-                    (custom_icon.to_string(), Color::Rgb(r, g, b))
-                } else if let Some(data) = icon_data.as_ref() {
-                    // 2. Fallback to standard devicons
-                    let icon = data.icon.to_string();
-                    let color = Color::from_str(data.color).unwrap_or(Color::White);
-                    (icon, color)
-                } else {
-                    // 3. Final fallback
-                    ("?".to_string(), Color::White)
-                };
-
-                // Return the final tuple with the style applied
-                (icon, Style::default().fg(color))
-            }
-        } else if is_dir {
-            (
-                "📁".to_string(),
-                Style::default()
-                    .fg(Color::Rgb(100, 160, 240))
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ("📄".to_string(), Style::default().fg(Color::White))
-        };
+        let (icon_glyph, icon_style) = Self::icon_for_path(&path, config.show_icons, config.nerd_font_active, is_symlink);
 
         let mut name_style = if is_dir {
             Style::default()
