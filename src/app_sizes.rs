@@ -355,19 +355,24 @@ impl App {
         if !self.folder_size_enabled {
             return None;
         }
-
-        let folder_pct = match (self.current_dir_total_space_bytes, self.current_dir_free_bytes, self.current_dir_total_size_bytes) {
-            (Some(total), Some(free), Some(folder_size)) => {
-                let used = total.saturating_sub(free);
-                if used > 0 {
-                    let pct = (folder_size as f64 * 100.0) / (used as f64);
-                    format!("{:.0}%", pct)
-                } else {
-                    "?".to_string()
-                }
-            }
-            _ => "?".to_string(),
+        let (folder_label, free_label) = if self.nerd_font_active {
+            ("\u{f10b7}", "\u{f02ca}")
+        } else {
+            ("folder:", "free:")
         };
+        // Compute free space percentage for display. If folder/used space info is unavailable, show "?".
+        // let folder_pct = match (self.current_dir_total_space_bytes, self.current_dir_free_bytes, self.current_dir_total_size_bytes) {
+        //     (Some(total), Some(free), Some(folder_size)) => {
+        //         let used = total.saturating_sub(free);
+        //         if used > 0 {
+        //             let pct = (folder_size as f64 * 100.0) / (used as f64);
+        //             format!("{:.0}%", pct)
+        //         } else {
+        //             "?".to_string()
+        //         }
+        //     }
+        //     _ => "?".to_string(),
+        // };
 
         let free_pct = self.current_dir_total_space_bytes
             .and_then(|total| {
@@ -380,16 +385,16 @@ impl App {
 
         let free_part = self
             .current_dir_free_bytes
-            .map(|bytes| format!("free: {} ({})", Self::format_size(bytes), free_pct))
-            .unwrap_or_else(|| format!("free: ? ({})", free_pct));
+            .map(|bytes| format!("{} {} ({})", free_label, Self::format_size(bytes), free_pct))
+            .unwrap_or_else(|| format!("{} ? ({})", free_label, free_pct));
 
         if self.current_dir_total_size_pending {
-            return Some(format!("folder: scanning... ({}) | {}", folder_pct, free_part));
+            return Some(format!("{} scanning... | {}", folder_label, free_part));
         }
 
         Some(match self.current_dir_total_size_bytes {
-            Some(bytes) => format!("folder: {} ({}) | {}", Self::format_size(bytes), folder_pct, free_part),
-            None => format!("folder: ? ({}) | {}", folder_pct, free_part),
+            Some(bytes) => format!("{} {} | {}", folder_label, Self::format_size(bytes), free_part),
+            None => format!("{} ? | {}", folder_label, free_part),
         })
     }
 

@@ -12,7 +12,7 @@ const PANEL_TABS: &[(&str, u8)] = &[
 pub fn panel_tab_bar_line(active: u8) -> Line<'static> {
     let active_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
     let inactive_style = Style::default().fg(Color::Rgb(100, 100, 100));
-    let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
+    let sep_style = Style::default().fg(Color::Rgb(80, 200, 180));
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, (label, idx)) in PANEL_TABS.iter().enumerate() {
         if i > 0 {

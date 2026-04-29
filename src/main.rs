@@ -4934,7 +4934,7 @@ fn main() -> io::Result<()> {
             } else {
                 app.current_dir_display_path_with_filter()
             };
-            let header_sep = if app.nerd_font_active { " \u{f0256} " } else { " » " };
+            let header_sep = if app.nerd_font_active { "\u{f0256} " } else { " » " };
             let os_icon_span: Option<Span> = if app.nerd_font_active {
                 // Use the remote OS icon if we're inside an SSH/rclone mount
                 let active_remote_icon = app.ssh_mounts.iter()
@@ -4948,29 +4948,47 @@ fn main() -> io::Result<()> {
             } else {
                 None
             };
-            let os_icon_width: u16 = os_icon_span.as_ref()
+            let os_icon_width: u16 = os_icon_span
+                .as_ref()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                 .unwrap_or(0);
-            let mut path_spans: Vec<Span> = Vec::new();
+            let mut middle_spans: Vec<Span> = Vec::new();
             if let Some(icon_span) = os_icon_span {
-                path_spans.push(icon_span);
+                middle_spans.push(icon_span);
             }
-            path_spans.extend([
-                Span::styled(header_identity.as_str(), Style::default().fg(Color::Cyan)),
-                Span::raw(header_sep),
+            if let Some((left_identity, right_identity)) = header_identity.split_once('@') {
+                middle_spans.push(Span::styled(left_identity.to_string(), Style::default().fg(Color::White)));
+                middle_spans.push(Span::styled("@", Style::default().fg(Color::Rgb(120, 120, 120))));
+                middle_spans.push(Span::styled(right_identity.to_string(), Style::default().fg(Color::White)));
+            } else {
+                middle_spans.push(Span::styled(header_identity.as_str(), Style::default().fg(Color::White)));
+            }
+
+            let header_sep_span = if app.nerd_font_active {
+                Span::styled(
+                    header_sep,
+                    Style::default()
+                        .fg(Color::Rgb(100, 160, 240))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(header_sep)
+            };
+            let mut left_spans: Vec<Span> = vec![
+                header_sep_span,
                 if app.mode == AppMode::PathEditing {
                     Span::styled(current_display_path.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
                 } else {
                     Span::raw(current_display_path.as_str())
                 },
-            ]);
+            ];
             if app.integration_enabled("git") {
                 if let Some((branch, is_dirty, tag_info)) = app.cached_git_info_for_current_dir() {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
-                    path_spans.push(Span::styled(" (", branch_style));
-                    path_spans.push(Span::styled(branch, branch_style));
+                    left_spans.push(Span::styled(" (", branch_style));
+                    left_spans.push(Span::styled(branch, branch_style));
                     if is_dirty {
-                        path_spans.push(Span::styled("*", Style::default().fg(Color::White)));
+                        left_spans.push(Span::styled("*", Style::default().fg(Color::White)));
                     }
                     if let Some((tag_name, ahead)) = tag_info {
                         let at_style = Style::default().fg(Color::Rgb(120, 120, 120));
@@ -4980,54 +4998,186 @@ fn main() -> io::Result<()> {
                         } else {
                             tag_name.to_string()
                         };
-                        path_spans.push(Span::styled(" ", branch_style));
-                        path_spans.push(Span::styled("@", at_style));
-                        path_spans.push(Span::styled(" ", branch_style));
-                        path_spans.push(Span::styled(tag_text, tag_style));
+                        left_spans.push(Span::styled("@", at_style));
+                        left_spans.push(Span::styled(tag_text, tag_style));
                     }
-                    path_spans.push(Span::styled(")", branch_style));
+                    left_spans.push(Span::styled(")", branch_style));
                 }
             }
             let header_right = if let Some(total_suffix) = app.current_dir_total_size_header_suffix() {
-                Some((
-                    total_suffix,
-                    Style::default().fg(Color::Rgb(150, 220, 150)),
-                ))
+                let icon_style = Style::default().fg(Color::Rgb(100, 160, 240));
+                let text_style = Style::default().fg(Color::White);
+                let mut spans: Vec<Span> = Vec::new();
+                let mut text_buf = String::new();
+                for ch in total_suffix.chars() {
+                    if ch == '\u{f10b7}' || ch == '\u{f02ca}' {
+                        if !text_buf.is_empty() {
+                            spans.push(Span::styled(text_buf.clone(), text_style));
+                            text_buf.clear();
+                        }
+                        spans.push(Span::styled(ch.to_string(), icon_style));
+                    } else {
+                        text_buf.push(ch);
+                    }
+                }
+                if !text_buf.is_empty() {
+                    spans.push(Span::styled(text_buf, text_style));
+                }
+                Some(Line::from(spans))
             } else if !app.folder_size_enabled {
-                Some((
-                    app.header_clock_text.clone(),
-                    Style::default().fg(Color::White),
-                ))
+                Some(Line::from(vec![
+                    Span::styled(app.header_clock_text.clone(), Style::default().fg(Color::White)),
+                ]))
             } else {
                 None
             };
 
-            if let Some((header_right_text, header_right_style)) = header_right {
-                let suffix_width = UnicodeWidthStr::width(header_right_text.as_str()) as u16;
-                let right_width = suffix_width.saturating_add(1).min(chunks[0].width.saturating_sub(1));
-                if right_width > 0 {
-                    let header_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Min(1), Constraint::Length(right_width)])
-                        .split(chunks[0]);
-                    f.render_widget(Paragraph::new(Line::from(path_spans)), header_chunks[0]);
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(header_right_text, header_right_style),
-                        ]))
-                        .alignment(Alignment::Right),
-                        header_chunks[1],
-                    );
-                } else {
-                    f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
+            let left_content_width: u16 = left_spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                .sum();
+            let middle_content_width = os_icon_width + (UnicodeWidthStr::width(header_identity.as_str()) as u16);
+
+            let min_left_width: u16 = 12;
+            let min_middle_width: u16 = 8;
+            let max_middle_width: u16 = 24;
+            let left_required_width = min_left_width;
+            let left_preferred_width = left_content_width.saturating_add(1).max(min_left_width);
+
+            let mut show_right = header_right.is_some();
+            let mut right_width = header_right
+                .as_ref()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+                        .sum::<u16>()
+                        .saturating_add(1)
+                })
+                .unwrap_or(0)
+                .min(chunks[0].width);
+            let right_required_width = right_width;
+            if right_required_width == 0 {
+                show_right = false;
+            }
+            if show_right {
+                let min_total_with_right = min_left_width
+                    .saturating_add(min_middle_width)
+                    .saturating_add(right_required_width);
+                if chunks[0].width < min_total_with_right {
+                    show_right = false;
                 }
+            }
+            if !show_right {
+                right_width = 0;
+            }
+
+            let total_width = chunks[0].width;
+            let desired_middle_width = middle_content_width
+                .saturating_add(1)
+                .min(max_middle_width);
+            let mut middle_width = desired_middle_width
+                .max(min_middle_width)
+                .min(total_width.saturating_sub(2));
+
+            let centered_middle_start = total_width.saturating_sub(middle_width) / 2;
+            let mut middle_start = centered_middle_start;
+            let mut left_width = middle_start;
+
+            // Left (path+git) priority: if left area is too small, first hide right, then shrink middle.
+            if left_width < left_required_width && show_right {
+                show_right = false;
+                right_width = 0;
+            }
+            if show_right {
+                let right_start = total_width.saturating_sub(right_width);
+                let middle_end = middle_start.saturating_add(middle_width);
+                if middle_end > right_start {
+                    show_right = false;
+                    right_width = 0;
+                }
+            }
+            let max_middle_start = if show_right {
+                total_width
+                    .saturating_sub(right_width)
+                    .saturating_sub(middle_width)
             } else {
-                f.render_widget(Paragraph::new(Line::from(path_spans)), chunks[0]);
+                total_width.saturating_sub(middle_width)
+            };
+            if left_width < left_preferred_width {
+                middle_start = left_preferred_width.min(max_middle_start);
+                left_width = middle_start;
+            }
+            if !show_right {
+                middle_start = middle_start.max(centered_middle_start);
+                left_width = middle_start;
+            }
+            if left_width < left_required_width {
+                let reserved_right = if show_right { right_width } else { 0 };
+                let max_middle_for_left = total_width
+                    .saturating_sub(left_required_width)
+                    .saturating_sub(reserved_right);
+                if max_middle_for_left >= min_middle_width {
+                    middle_width = middle_width.min(max_middle_for_left);
+                    middle_start = if show_right {
+                        left_required_width.min(
+                            total_width
+                                .saturating_sub(right_width)
+                                .saturating_sub(middle_width),
+                        )
+                    } else {
+                        left_required_width.min(total_width.saturating_sub(middle_width))
+                    };
+                    left_width = middle_start;
+                }
+            }
+
+            let left_rect = Rect::new(chunks[0].x, chunks[0].y, left_width, 1);
+            let middle_rect_width = if show_right {
+                middle_width
+            } else {
+                total_width.saturating_sub(middle_start)
+            };
+            let middle_rect = Rect::new(chunks[0].x + middle_start, chunks[0].y, middle_rect_width, 1);
+
+            if left_rect.width > 0 {
+                f.render_widget(
+                    Paragraph::new(Line::from(left_spans.clone())).alignment(Alignment::Left),
+                    left_rect,
+                );
+            }
+            if middle_rect.width > 0 {
+                let middle_alignment = if show_right { Alignment::Center } else { Alignment::Right };
+                f.render_widget(
+                    Paragraph::new(Line::from(middle_spans.clone())).alignment(middle_alignment),
+                    middle_rect,
+                );
+            }
+            if show_right {
+                if let Some(header_right_line) = header_right {
+                    let right_rect = Rect::new(
+                        chunks[0].x + total_width.saturating_sub(right_width),
+                        chunks[0].y,
+                        right_width,
+                        1,
+                    );
+                    if right_rect.width > 0 {
+                        f.render_widget(
+                            Paragraph::new(header_right_line).alignment(Alignment::Right),
+                            right_rect,
+                        );
+                    }
+                }
             }
             if app.mode == AppMode::PathEditing {
-                let prefix_len = format!("{}{}", header_identity, header_sep).chars().count() as u16;
+                let sep_len = UnicodeWidthStr::width(header_sep) as u16;
                 app.clamp_input_cursor();
-                let cursor_x = chunks[0].x + os_icon_width + prefix_len + app.input_cursor as u16;
+                let left_end_x = chunks[0]
+                    .x
+                    .saturating_add(left_width.saturating_sub(1));
+                let left_x = chunks[0].x;
+                let cursor_x = (left_x + sep_len + app.input_cursor as u16)
+                    .min(left_end_x);
                 let cursor_y = chunks[0].y;
                 f.set_cursor(cursor_x, cursor_y);
             }
@@ -5036,9 +5186,9 @@ fn main() -> io::Result<()> {
 
             // --- Table ---
             let term_w = chunks[0].width;
-            let show_date = term_w >= 90;
+            let show_date = term_w >= 50;
             let show_size = term_w >= 70;
-            let show_meta = term_w >= 50;
+            let show_meta = term_w >= 90;
             let show_pct = app.folder_size_enabled && show_size;
             let perms_width = 11usize;
             let group_width = app.meta_group_width.max(1);
@@ -5420,7 +5570,7 @@ fn main() -> io::Result<()> {
                     let limits = app.internal_search_content_limits;
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "Limits: files={}  hits={}  max-file={}",
+                            " Limits: files={}  hits={}  max-file={}",
                             limits.max_files,
                             limits.max_hits,
                             App::format_size(limits.max_file_bytes as u64)
@@ -5449,14 +5599,14 @@ fn main() -> io::Result<()> {
                         )));
                     } else {
                         lines.push(Line::from(Span::styled(
-                            "Ctrl+L open limits editor (live, no restart)",
+                            " Ctrl+L open limits editor",
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
 
                     if app.internal_search_content_pending {
                         lines.push(Line::from(Span::styled(
-                            "Scanning content asynchronously...",
+                            " Scanning content asynchronously...",
                             Style::default().fg(Color::Rgb(120, 200, 255)),
                         )));
                     }
@@ -6142,13 +6292,12 @@ fn main() -> io::Result<()> {
                 let cursor_y = rename_area.y + 1;
                 f.set_cursor(cursor_x.min(rename_area.x + rename_area.width.saturating_sub(1)), cursor_y);
             } else if app.mode == AppMode::Bookmarks {
-                let area = f.size();
                 let bookmarks = App::load_bookmarks();
                 if !bookmarks.is_empty() && app.bookmark_selected >= bookmarks.len() {
                     app.bookmark_selected = bookmarks.len() - 1;
                 }
                 let mut lines: Vec<Line> = vec![Line::from("")];
-                let bm_w = (area.width * 2 / 3).max(50).min(tab_overlay_anchor.width);
+                let bm_w = tab_overlay_anchor.width;
                 let bm_content_w = bm_w.saturating_sub(2) as usize;
                 for (row_idx, (i, path)) in bookmarks.iter().enumerate() {
                     let is_selected = row_idx == app.bookmark_selected;
@@ -6422,11 +6571,9 @@ fn main() -> io::Result<()> {
                     sort_chunks[1],
                 );
             } else if app.mode == AppMode::SshPicker {
-                let area = f.size();
-                let ssh_w = (area.width * 2 / 3).max(60).min(area.width);
-                let ssh_popup_w = ssh_w.min(tab_overlay_anchor.width);
+                let ssh_popup_w = tab_overlay_anchor.width;
                 let ssh_content_w = ssh_popup_w.saturating_sub(2) as usize;
-                let content_w = ssh_w.saturating_sub(4) as usize;
+                let content_w = ssh_popup_w.saturating_sub(4) as usize;
                 let type_w = 6usize;
                 let mounted_w = 10usize;
                 let available_for_alias_and_detail = content_w.saturating_sub(type_w + mounted_w + 3);
@@ -6901,55 +7048,16 @@ fn main() -> io::Result<()> {
                 (" ".to_string(), right_trimmed)
             };
 
-            let mut left_spans: Vec<Span> = Vec::new();
-            let mut left_segment = String::new();
-            let mut left_in_ws = true;
-            for ch in left_status.chars() {
-                let is_ws = ch.is_whitespace();
-                if left_segment.is_empty() {
-                    left_in_ws = is_ws;
-                }
-                if is_ws == left_in_ws {
-                    left_segment.push(ch);
-                } else {
-                    if left_in_ws {
-                        left_spans.push(Span::styled(left_segment.clone(), Style::default().fg(Color::DarkGray)));
-                    } else if let Some(colon_idx) = left_segment.find(':') {
-                        let (key, rest) = left_segment.split_at(colon_idx);
-                        if !key.is_empty() {
-                            left_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::DarkGray)));
-                        }
-                        if let Some(stripped) = rest.strip_prefix(':') {
-                            left_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
-                            left_spans.push(Span::styled(stripped.to_string(), Style::default().fg(Color::White)));
-                        } else {
-                            left_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
-                        }
-                    } else {
-                        left_spans.push(Span::styled(left_segment.clone(), Style::default().fg(Color::DarkGray)));
-                    }
-                    left_segment.clear();
-                    left_segment.push(ch);
-                    left_in_ws = is_ws;
-                }
-            }
-            if !left_segment.is_empty() {
-                if left_in_ws {
-                    left_spans.push(Span::styled(left_segment, Style::default().fg(Color::DarkGray)));
-                } else if let Some(colon_idx) = left_segment.find(':') {
-                    let (key, rest) = left_segment.split_at(colon_idx);
-                    if !key.is_empty() {
-                        left_spans.push(Span::styled(key.to_string(), Style::default().fg(Color::DarkGray)));
-                    }
-                    if let Some(stripped) = rest.strip_prefix(':') {
-                        left_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
-                        left_spans.push(Span::styled(stripped.to_string(), Style::default().fg(Color::White)));
-                    } else {
-                        left_spans.push(Span::styled(rest.to_string(), Style::default().fg(Color::DarkGray)));
-                    }
-                } else {
-                    left_spans.push(Span::styled(left_segment, Style::default().fg(Color::DarkGray)));
-                }
+            let mut left_spans: Vec<Span> = vec![
+                Span::styled(selected_ordinal.to_string(), Style::default().fg(Color::White)),
+                Span::styled("/", Style::default().fg(Color::DarkGray)),
+                Span::styled(total_entries.to_string(), Style::default().fg(Color::White)),
+            ];
+            if !app.clipboard.is_empty() {
+                left_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                left_spans.push(Span::styled("Clipboard", Style::default().fg(Color::DarkGray)));
+                left_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
+                left_spans.push(Span::styled(app.clipboard.len().to_string(), Style::default().fg(Color::White)));
             }
 
             let mut right_spans: Vec<Span> = Vec::new();
