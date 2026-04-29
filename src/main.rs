@@ -7,6 +7,7 @@ use crossterm::{
 use chrono::Local;
 use regex::Regex;
 use ratatui::{prelude::*, widgets::*};
+use ratatui::widgets::BorderType;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -4269,7 +4270,7 @@ fn main() -> io::Result<()> {
                 let cursor_y = chunks[0].y;
                 f.set_cursor(cursor_x, cursor_y);
             }
-            f.render_widget(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)), 
+            f.render_widget(Block::default().borders(Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)), 
                 Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1));
 
             // --- Table ---
@@ -4759,6 +4760,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(lines).block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
                             .title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(120, 190, 255))),
                     ),
@@ -5012,6 +5014,7 @@ fn main() -> io::Result<()> {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
                                 .title(App::panel_tab_bar_line(app.panel_tab))
                                 .border_style(Style::default().fg(Color::Rgb(110, 170, 240))),
                         ),
@@ -5033,7 +5036,7 @@ fn main() -> io::Result<()> {
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
-                f.render_widget(Paragraph::new(prompt_value).block(Block::default().borders(Borders::ALL).title(title)), rename_area);
+                f.render_widget(Paragraph::new(prompt_value).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title)), rename_area);
                 app.clamp_input_cursor();
                 let cursor_x = rename_area.x + 1 + app.input_cursor as u16;
                 let cursor_y = rename_area.y + 1;
@@ -5073,7 +5076,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, bm_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(100, 150, 255)))),
                     bm_area,
                 );
@@ -5144,7 +5147,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(
                     Paragraph::new(lines)
                         .scroll((int_scroll, 0))
-                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(180, 130, 255)))),
                     int_area,
                 );
@@ -5179,7 +5182,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, sort_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(120, 190, 255)))),
                     sort_area,
                 );
@@ -5273,7 +5276,7 @@ fn main() -> io::Result<()> {
                 f.render_widget(Clear, ssh_area);
                 f.render_widget(
                     Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).title(App::panel_tab_bar_line(app.panel_tab))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
                             .border_style(Style::default().fg(Color::Rgb(80, 200, 180)))),
                     ssh_area,
                 );
@@ -5326,7 +5329,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-                        .block(Block::default().borders(Borders::ALL).title(" Confirm Extract ")),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Confirm Extract ")),
                     confirm_area,
                 );
             } else if app.mode == AppMode::ConfirmIntegrationInstall {
@@ -5380,7 +5383,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-                        .block(Block::default().borders(Borders::ALL).title(" Install Integration ")),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Install Integration ")),
                     confirm_area,
                 );
             } else if app.mode == AppMode::ConfirmDelete {
@@ -5431,7 +5434,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(255, 100, 100)))
-                        .block(Block::default().borders(Borders::ALL).title(" Confirm Delete ")),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Confirm Delete ")),
                     confirm_area,
                 );
             }
@@ -5572,7 +5575,7 @@ fn main() -> io::Result<()> {
             status_spans.push(Span::raw(gap));
             status_spans.extend(right_spans);
             let status = Line::from(status_spans);
-            f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
+            f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
             let selected_total_status = if app.copy_rx.is_none() && app.archive_rx.is_none() {
                 app.selected_total_size_status()
             } else {
