@@ -649,6 +649,8 @@ impl App {
                             self.set_status("search: no files found");
                         } else if self.internal_search_candidates_truncated {
                             self.set_status("search indexed first 20000 files");
+                        } else if self.status_message == "search: indexing files asynchronously..." {
+                            self.status_message.clear();
                         }
                         keep_rx = false;
                     } else {

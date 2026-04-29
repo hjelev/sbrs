@@ -28,7 +28,7 @@ pub(crate) struct EntryRenderConfig {
 }
 
 impl App {
-    pub(crate) fn icon_for_path(path: &Path, show_icons: bool, nerd_font_active: bool, is_symlink: bool) -> (String, Style) {
+    pub(crate) fn icon_for_name(name: &str, is_dir: bool, show_icons: bool, nerd_font_active: bool, is_symlink: bool) -> (String, Style) {
         if !show_icons {
             return (String::new(), Style::default());
         }
@@ -37,28 +37,37 @@ impl App {
             return ("\u{f1177}".to_string(), Style::default().fg(Color::Rgb(100, 220, 220)));
         }
 
-        let is_dir = path.is_dir();
         if nerd_font_active {
             if is_dir {
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let dir_style = Style::default()
                     .fg(Color::Rgb(100, 160, 240))
                     .add_modifier(Modifier::BOLD);
-                if let Some((glyph, _)) = ui::icons::named_dir_icon(dir_name) {
+                if let Some((glyph, _)) = ui::icons::named_dir_icon(name) {
                     (glyph.to_string(), dir_style)
                 } else {
                     ("\u{f024b}".to_string(), dir_style)
                 }
-            } else if Self::is_age_protected_file(&path.to_path_buf()) {
-                ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
-            } else if let Some((custom_icon, (r, g, b))) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(named_file_icon)
+            } else if name.trim().is_empty()
+                || Path::new(name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
             {
+                // Draft/partial names in interactive prompts (e.g. empty line, '/')
+                // can lack a valid filename component; avoid calling devicons in that case.
+                ("\u{f15b}".to_string(), Style::default().fg(Color::White))
+            } else if Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("age"))
+                .unwrap_or(false)
+            {
+                ("".to_string(), Style::default().fg(Color::Rgb(230, 190, 90)))
+            } else if let Some((custom_icon, (r, g, b))) = named_file_icon(name) {
                 (custom_icon.to_string(), Style::default().fg(Color::Rgb(r, g, b)))
             } else {
-                let data = icon_for_file(&DevFile::new(path), Some(Theme::Dark));
+                let data = icon_for_file(&DevFile::new(Path::new(name)), Some(Theme::Dark));
                 let color = Color::from_str(data.color).unwrap_or(Color::White);
                 (data.icon.to_string(), Style::default().fg(color))
             }
@@ -72,6 +81,11 @@ impl App {
         } else {
             ("📄".to_string(), Style::default().fg(Color::White))
         }
+    }
+
+    pub(crate) fn icon_for_path(path: &Path, show_icons: bool, nerd_font_active: bool, is_symlink: bool) -> (String, Style) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        Self::icon_for_name(name, path.is_dir(), show_icons, nerd_font_active, is_symlink)
     }
 
     pub(crate) fn build_entry_render_cache(

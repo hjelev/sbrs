@@ -1,5 +1,5 @@
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -288,6 +288,7 @@ struct App {
     no_color: bool,
     show_icons: bool,
     integration_selected: usize,
+    bookmark_selected: usize,
     integration_overrides: HashMap<String, bool>,
     integration_rows_cache: Vec<IntegrationRow>,
     integration_install_key: Option<String>,
@@ -465,6 +466,7 @@ impl App {
             no_color: env_flag_true(&["NO_COLOR"]),
             show_icons: env::var("TERMINAL_ICONS").map(|v| v != "0").unwrap_or(true),
             integration_selected: 0,
+            bookmark_selected: 0,
             integration_overrides: HashMap::new(),
             integration_rows_cache: Vec::new(),
             integration_install_key: None,
@@ -1819,40 +1821,103 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         self.clear_input_edit();
     }
 
-    fn create_entry_from_input(&mut self, is_dir: bool) {
-        let name = self.input_buffer.trim().to_string();
-        if name.is_empty() {
+    fn input_cursor_line_col(&self) -> (usize, usize) {
+        let mut line = 0usize;
+        let mut col = 0usize;
+        for ch in self.input_buffer.chars().take(self.input_cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn active_input_line_text(&self) -> String {
+        let (line_idx, _) = self.input_cursor_line_col();
+        self.input_buffer
+            .split('\n')
+            .nth(line_idx)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn create_entries_from_input(&mut self, default_is_dir: bool) {
+        let mut specs: Vec<(String, bool)> = Vec::new();
+        for raw_line in self.input_buffer.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (name, is_dir) = if let Some(rest) = line.strip_prefix('/') {
+                (rest.trim().to_string(), true)
+            } else {
+                (line.to_string(), default_is_dir)
+            };
+            if !name.is_empty() {
+                specs.push((name, is_dir));
+            }
+        }
+
+        if specs.is_empty() {
             self.set_status("name cannot be empty");
             return;
         }
 
-        let target = self.current_dir.join(&name);
-        if target.exists() {
-            self.set_status("target already exists");
+        let mut created: Vec<String> = Vec::new();
+        let mut failed = 0usize;
+        let mut first_error: Option<String> = None;
+
+        for (name, is_dir) in specs {
+            let target = self.current_dir.join(&name);
+            if target.exists() {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some("target already exists".to_string());
+                }
+                continue;
+            }
+
+            let result = if is_dir {
+                fs::create_dir(&target)
+            } else {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map(|_| ())
+            };
+
+            match result {
+                Ok(()) => created.push(name),
+                Err(e) => {
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(format!("create failed: {}", e));
+                    }
+                }
+            }
+        }
+
+        if created.is_empty() {
+            self.set_status(first_error.unwrap_or_else(|| "create failed".to_string()));
             return;
         }
 
-        let result = if is_dir {
-            fs::create_dir(&target)
-        } else {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map(|_| ())
-        };
+        let last_created = created.last().cloned();
+        self.mode = AppMode::Browsing;
+        self.clear_input_edit();
+        self.refresh_entries_or_status();
+        if let Some(name) = last_created {
+            self.select_entry_named(&name);
+        }
 
-        match result {
-            Ok(()) => {
-                self.mode = AppMode::Browsing;
-                self.clear_input_edit();
-                self.refresh_entries_or_status();
-                self.select_entry_named(&name);
-                self.set_status(if is_dir { "folder created" } else { "file created" });
-            }
-            Err(e) => {
-                self.set_status(format!("create failed: {}", e));
-            }
+        if failed == 0 {
+            self.set_status(format!("created {} item(s)", created.len()));
+        } else {
+            self.set_status(format!("created {} item(s), {} failed", created.len(), failed));
         }
     }
 
@@ -4208,6 +4273,25 @@ fn main() -> io::Result<()> {
         app.pump_notes_progress();
         app.pump_internal_search_candidates_progress();
         app.pump_internal_search_content_progress();
+        let text_input_cursor = matches!(
+            app.mode,
+            AppMode::PathEditing
+                | AppMode::Renaming
+                | AppMode::PasteRenaming
+                | AppMode::NewFile
+                | AppMode::NewFolder
+                | AppMode::ArchiveCreate
+                | AppMode::NoteEditing
+                | AppMode::CommandInput
+                | AppMode::GitCommitMessage
+                | AppMode::GitTagInput
+                | AppMode::InternalSearch
+        );
+        if text_input_cursor {
+            execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBar)?;
+        } else {
+            execute!(terminal.backend_mut(), SetCursorStyle::DefaultUserShape)?;
+        }
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -4601,34 +4685,66 @@ fn main() -> io::Result<()> {
                     tab_overlay_anchor.height,
                 );
 
-                let scope_label = match app.internal_search_scope {
-                    InternalSearchScope::Filename => "Filename",
-                    InternalSearchScope::Content => "Content",
-                };
-                let mut lines: Vec<Line> = vec![
-                    Line::from(vec![
-                        Span::styled("Scope: ", Style::default().fg(Color::Rgb(170, 170, 170))),
-                        Span::styled(scope_label, Style::default().fg(Color::Rgb(120, 220, 180)).add_modifier(Modifier::BOLD)),
-                        Span::styled("  (Ctrl+T to toggle)", Style::default().fg(Color::DarkGray)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Query: ", Style::default().fg(Color::Rgb(170, 170, 170))),
-                        Span::styled(app.input_buffer.as_str(), Style::default().fg(Color::Rgb(255, 220, 120))),
-                    ]),
-                    Line::from(Span::styled(
-                        "Up/Down navigate  Enter open  Ctrl+T toggle scope  Tab/Shift+Tab switch tabs  Esc cancel  Regex: re:pattern or /pattern/i",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ];
+                f.render_widget(Clear, popup_area);
+                let popup_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let popup_inner = popup_block.inner(popup_area);
+                f.render_widget(popup_block, popup_area);
 
-                let mode_line = if app.internal_search_regex_mode {
-                    Span::styled("Mode: regex", Style::default().fg(Color::Rgb(120, 220, 180)))
-                } else if app.internal_search_scope == InternalSearchScope::Content {
-                    Span::styled("Mode: literal", Style::default().fg(Color::Rgb(120, 170, 255)))
+                let search_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(2),
+                    ])
+                    .split(popup_inner);
+                let query_box_area = search_layout[0];
+                let body_area = search_layout[1];
+                let footer_area = search_layout[2];
+
+                let query_box_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(95, 95, 95)));
+                let query_inner = query_box_block.inner(query_box_area);
+                f.render_widget(query_box_block, query_box_area);
+
+                let (mode_text, mode_style) = if app.internal_search_scope == InternalSearchScope::Content {
+                    (
+                        "Scope: Content".to_string(),
+                        Style::default().fg(Color::Rgb(120, 220, 180)),
+                    )
                 } else {
-                    Span::styled("Mode: fuzzy", Style::default().fg(Color::Rgb(120, 170, 255)))
+                    (
+                        "Scope: Filename".to_string(),
+                        Style::default().fg(Color::Rgb(120, 170, 255)),
+                    )
                 };
-                lines.push(Line::from(mode_line));
+                let mode_width = UnicodeWidthStr::width(mode_text.as_str()) as u16;
+                let query_row = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(1), Constraint::Length(mode_width + 1)])
+                    .split(query_inner);
+                let query_input_area = query_row[0];
+                let query_mode_area = query_row[1];
+
+                let query_icon = if app.show_icons && app.nerd_font_active { "\u{f002}" } else { "/" };
+                let query_icon_prefix = format!(" {}  ", query_icon);
+                let query_line = Line::from(vec![
+                    Span::styled(query_icon_prefix.clone(), Style::default().fg(Color::Rgb(120, 180, 255))),
+                    Span::styled(app.input_buffer.as_str(), Style::default().fg(Color::Rgb(255, 220, 120))),
+                ]);
+                f.render_widget(Paragraph::new(query_line), query_input_area);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(mode_text.clone(), mode_style))).alignment(Alignment::Right),
+                    query_mode_area,
+                );
+
+                let mut lines: Vec<Line> = Vec::new();
 
                 if app.internal_search_candidates_pending {
                     lines.push(Line::from(Span::styled(
@@ -4695,7 +4811,8 @@ fn main() -> io::Result<()> {
                 }
 
                 let selected = app.internal_search_selected;
-                let visible_rows = popup_area.height.saturating_sub(2) as usize;
+                let body_content_w = body_area.width as usize;
+                let visible_rows = body_area.height as usize;
                 let header_rows = lines.len();
                 let max_rows = visible_rows.saturating_sub(header_rows).max(1);
                 let offset = if selected >= max_rows {
@@ -4744,8 +4861,39 @@ fn main() -> io::Result<()> {
                                 .fg(Color::Rgb(255, 220, 120))
                                 .add_modifier(Modifier::BOLD)
                         };
-                        let marker = if is_selected { "> " } else { "  " };
+                        let marker = "  ";
                         let mut spans: Vec<Span> = vec![Span::styled(marker, base_style)];
+
+                        let rel_path_for_icon = match result_idx {
+                            InternalSearchResult::Filename { rel_path, .. } => rel_path,
+                            InternalSearchResult::Content { rel_path, .. } => rel_path,
+                        };
+                        let abs_path = app.current_dir.join(rel_path_for_icon);
+                        let is_symlink = abs_path
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
+                        let is_dir = abs_path.is_dir();
+                        let icon_name = rel_path_for_icon
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|name| name.to_string())
+                            .unwrap_or_else(|| rel_path_for_icon.to_string_lossy().into_owned());
+                        let (icon_glyph, icon_style) = App::icon_for_name(
+                            icon_name.as_str(),
+                            is_dir,
+                            app.show_icons,
+                            app.nerd_font_active,
+                            is_symlink,
+                        );
+                        if app.show_icons && !icon_glyph.is_empty() {
+                            let adjusted_icon_style = if is_selected {
+                                icon_style.bg(Color::Rgb(60, 60, 60))
+                            } else {
+                                icon_style
+                            };
+                            spans.push(Span::styled(format!("{} ", icon_glyph), adjusted_icon_style));
+                        }
 
                         match result_idx {
                             InternalSearchResult::Filename { rel_path, match_ranges } => {
@@ -4777,28 +4925,42 @@ fn main() -> io::Result<()> {
                             }
                         }
 
+                        if is_selected {
+                            let used_w: usize = spans
+                                .iter()
+                                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                                .sum();
+                            if body_content_w > used_w {
+                                spans.push(Span::styled(
+                                    " ".repeat(body_content_w - used_w),
+                                    base_style,
+                                ));
+                            }
+                        }
+
                         lines.push(Line::from(spans));
                     }
                 }
 
-                f.render_widget(Clear, popup_area);
+                f.render_widget(Paragraph::new(lines), body_area);
                 f.render_widget(
-                    Paragraph::new(lines).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .title(App::panel_tab_bar_line(app.panel_tab))
-                            .border_style(Style::default().fg(Color::Rgb(120, 190, 255))),
-                    ),
-                    popup_area,
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓:navigate  Enter:open  Ctrl+T:toggle scope  Tab:switch tabs  Regex: re:pattern or /pattern/i",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    footer_area,
                 );
 
                 app.clamp_input_cursor();
-                let query_prefix = "Query: ".chars().count() as u16;
-                let cursor_x = popup_area.x + 1 + query_prefix + app.input_cursor as u16;
-                let cursor_y = popup_area.y + 2;
+                let cursor_x = query_input_area.x
+                    + UnicodeWidthStr::width(query_icon_prefix.as_str()) as u16
+                    + app.input_cursor as u16;
+                let cursor_y = query_input_area.y;
                 f.set_cursor(
-                    cursor_x.min(popup_area.x + popup_area.width.saturating_sub(1)),
+                    cursor_x.min(query_input_area.x + query_input_area.width.saturating_sub(1)),
                     cursor_y,
                 );
             } else if app.mode == AppMode::DbPreview {
@@ -4817,7 +4979,7 @@ fn main() -> io::Result<()> {
 
                 let mut lines: Vec<Line> = vec![
                     Line::from(Span::styled(
-                        "Left/Right switch table  Home/End jump  Esc/q close",
+                        "←→:switch table  Home/End:jump  Esc:close",
                         Style::default().fg(Color::DarkGray),
                     )),
                 ];
@@ -4899,6 +5061,7 @@ fn main() -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .title(format!(" SQLite: {} ", db_title))
+                                .title_style(Style::default().fg(Color::White))
                                 .border_style(Style::default().fg(Color::Rgb(120, 200, 150))),
                         )
                         .wrap(Wrap { trim: true }),
@@ -4913,6 +5076,7 @@ fn main() -> io::Result<()> {
                 let desc_style = Style::default().fg(Color::Rgb(200, 200, 200));
 
                 let mut lines: Vec<Line> = vec![
+                    Line::from(""),
                     Line::from(vec![
                         Span::styled(
                             format!("{:<width$}", "Shortcut", width = shortcut_w),
@@ -4956,8 +5120,7 @@ fn main() -> io::Result<()> {
                     (
                         "Operations",
                         [
-                            ("n", "Create new file"),
-                            ("N", "Create new folder"),
+                            ("n", "Create item(s): name=file, /name=folder, Shift/Alt+Enter or Ctrl+J=new item"),
                             ("Ctrl+n", "Add/edit note for selected item(s)"),
                             ("Ctrl+z", "Drop to shell in current directory"),
                             ("F2 / r", "Rename or bulk rename"),
@@ -4966,6 +5129,7 @@ fn main() -> io::Result<()> {
                             ("x / p", "Toggle executable bit / protect/unprotect file"),
                             ("Z", "Create or extract archive"),
                             ("o", "Open with default GUI app"),
+                            ("", ""),
                         ],
                     ),
                     (
@@ -5017,7 +5181,7 @@ fn main() -> io::Result<()> {
                     }
                 }
 
-                let desired_h = (lines.len() as u16 + 2).max(18);
+                let desired_h = (lines.len() as u16 + 4).max(18);
                 let help_h = desired_h.min(tab_overlay_anchor.height);
                 let help_area = Rect::new(
                     tab_overlay_anchor.x,
@@ -5027,26 +5191,225 @@ fn main() -> io::Result<()> {
                 );
                 f.render_widget(Clear, help_area);
 
-                let visible_lines = (help_area.height as usize).saturating_sub(2);
+                let help_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let help_inner = help_block.inner(help_area);
+                f.render_widget(help_block, help_area);
+                let help_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(help_inner);
+                let help_content_area = help_chunks[0];
+                let help_footer_area = help_chunks[1];
+
+                let visible_lines = help_content_area.height as usize;
                 let total_lines = lines.len();
                 let max_scroll = total_lines.saturating_sub(visible_lines);
                 app.help_max_offset = max_scroll as u16;
                 let clamped_offset = (app.help_scroll_offset as usize).min(max_scroll) as u16;
+                let indented_lines: Vec<Line> = lines
+                    .iter()
+                    .map(|line| {
+                        let mut spans: Vec<Span> = Vec::with_capacity(line.spans.len() + 1);
+                        spans.push(Span::raw(" "));
+                        spans.extend(line.spans.iter().cloned());
+                        Line::from(spans)
+                    })
+                    .collect();
                 
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: true })
-                        .scroll((clamped_offset, 0))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .title(App::panel_tab_bar_line(app.panel_tab))
-                                .border_style(Style::default().fg(Color::Rgb(110, 170, 240))),
-                        ),
+                    Paragraph::new(indented_lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((clamped_offset, 0)),
+                    help_content_area,
+                );
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓/PgUp/PgDn/Home/End:scroll  Tab:switch tabs  Esc:close",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    help_footer_area,
+                );
+            } else if matches!(app.mode, AppMode::NewFile | AppMode::NewFolder) {
+                let area = f.size();
+                let title = " Create ";
+                let dialog_w = (area.width * 2 / 3).max(40).min(area.width.saturating_sub(4).max(1));
+
+                let lines: Vec<&str> = if app.input_buffer.is_empty() {
+                    vec![""]
+                } else {
+                    app.input_buffer.split('\n').collect()
+                };
+                let (cursor_line, cursor_col) = app.input_cursor_line_col();
+                let max_content_lines = area.height.saturating_sub(7).max(1) as usize;
+                let content_lines = lines.len().max(1).min(max_content_lines);
+                let window_start = cursor_line.saturating_sub(content_lines.saturating_sub(1));
+                let window_end = (window_start + content_lines).min(lines.len().max(1));
+                let shown_lines = &lines[window_start..window_end];
+
+                let dialog_h = (shown_lines.len() as u16 + 3).max(4).min(area.height.saturating_sub(2).max(1));
+                let create_area = Rect::new(
+                    (area.width.saturating_sub(dialog_w)) / 2,
+                    (area.height.saturating_sub(dialog_h)) / 2,
+                    dialog_w,
+                    dialog_h,
+                );
+
+                f.render_widget(Clear, create_area);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(title)
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(120, 120, 120)));
+                let input_area = block.inner(create_area);
+                f.render_widget(block, create_area);
+
+                let create_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(input_area);
+                let list_area = create_chunks[0];
+                let help_area = create_chunks[1];
+
+                let mut rendered_lines: Vec<Line> = Vec::new();
+                for line in shown_lines {
+                    let is_dir = if app.mode == AppMode::NewFolder {
+                        true
+                    } else {
+                        line.trim_start().starts_with('/')
+                    };
+                    let icon_name = if is_dir {
+                        line.trim_start().trim_start_matches('/').trim()
+                    } else {
+                        line.trim()
+                    };
+                    let (icon_glyph, icon_style) = App::icon_for_name(
+                        icon_name,
+                        is_dir,
+                        app.show_icons,
+                        app.nerd_font_active,
+                        false,
+                    );
+                    let mut spans = Vec::new();
+                    if app.show_icons && !icon_glyph.is_empty() {
+                        spans.push(Span::styled(format!("{} ", icon_glyph), icon_style));
+                    }
+                    spans.push(Span::styled(*line, Style::default().fg(Color::Rgb(230, 230, 230))));
+                    rendered_lines.push(Line::from(spans));
+                }
+                f.render_widget(Paragraph::new(rendered_lines), list_area);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "(/name = folder, name = file)  Alt+Enter: new line",
+                        Style::default().fg(Color::DarkGray),
+                    ))),
                     help_area,
                 );
-            } else if matches!(app.mode, AppMode::Renaming | AppMode::PasteRenaming | AppMode::NewFile | AppMode::NewFolder | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput | AppMode::GitCommitMessage | AppMode::GitTagInput) {
+
+                let active_line_text = app.active_input_line_text();
+                let active_is_dir = if app.mode == AppMode::NewFolder {
+                    true
+                } else {
+                    active_line_text.trim_start().starts_with('/')
+                };
+                let active_icon_name = if active_is_dir {
+                    active_line_text.trim_start().trim_start_matches('/').trim()
+                } else {
+                    active_line_text.trim()
+                };
+                let (active_icon_glyph, _) = App::icon_for_name(
+                    active_icon_name,
+                    active_is_dir,
+                    app.show_icons,
+                    app.nerd_font_active,
+                    false,
+                );
+                let icon_prefix_width = if app.show_icons && !active_icon_glyph.is_empty() {
+                    UnicodeWidthStr::width(format!("{} ", active_icon_glyph).as_str()) as u16
+                } else {
+                    0
+                };
+
+                app.clamp_input_cursor();
+                let visible_cursor_line = cursor_line.saturating_sub(window_start);
+                let cursor_x = list_area.x + icon_prefix_width + cursor_col as u16;
+                let cursor_y = list_area.y + visible_cursor_line as u16;
+                f.set_cursor(
+                    cursor_x.min(list_area.x + list_area.width.saturating_sub(1)),
+                    cursor_y.min(list_area.y + list_area.height.saturating_sub(1)),
+                );
+            } else if app.mode == AppMode::Renaming {
+                let area = f.size();
+                let selected_entry = app.entries.get(app.selected_index);
+                let old_name = selected_entry
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| app.input_buffer.clone());
+                let selected_path = selected_entry.map(|e| e.path());
+                let selected_is_dir = selected_path.as_ref().map(|p| p.is_dir()).unwrap_or(false);
+                let selected_is_symlink = selected_path
+                    .as_ref()
+                    .and_then(|p| p.symlink_metadata().ok())
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                let dialog_w = (area.width * 2 / 3).max(36).min(area.width.saturating_sub(4).max(1));
+                let dialog_h = 3u16.min(area.height.saturating_sub(2).max(1));
+                let rename_area = Rect::new(
+                    (area.width.saturating_sub(dialog_w)) / 2,
+                    (area.height.saturating_sub(dialog_h)) / 2,
+                    dialog_w,
+                    dialog_h,
+                );
+                let title = format!(" Rename \"{}\" ", old_name);
+                f.render_widget(Clear, rename_area);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(title)
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(120, 120, 120)));
+                let input_area = block.inner(rename_area);
+                f.render_widget(block, rename_area);
+
+                let (icon_glyph, icon_style) = App::icon_for_name(
+                    app.input_buffer.as_str(),
+                    selected_is_dir,
+                    app.show_icons,
+                    app.nerd_font_active,
+                    selected_is_symlink,
+                );
+                let icon_prefix = if app.show_icons && !icon_glyph.is_empty() {
+                    format!("{} ", icon_glyph)
+                } else {
+                    String::new()
+                };
+                let mut spans = Vec::new();
+                if !icon_prefix.is_empty() {
+                    spans.push(Span::styled(icon_prefix.clone(), icon_style));
+                }
+                spans.push(Span::styled(
+                    app.input_buffer.as_str(),
+                    Style::default().fg(Color::Rgb(230, 230, 230)),
+                ));
+                f.render_widget(Paragraph::new(Line::from(spans)), input_area);
+
+                app.clamp_input_cursor();
+                let cursor_x = input_area.x
+                    + UnicodeWidthStr::width(icon_prefix.as_str()) as u16
+                    + app.input_cursor as u16;
+                let cursor_y = input_area.y;
+                f.set_cursor(cursor_x.min(input_area.x + input_area.width.saturating_sub(1)), cursor_y);
+            } else if matches!(app.mode, AppMode::PasteRenaming | AppMode::ArchiveCreate | AppMode::NoteEditing | AppMode::CommandInput | AppMode::GitCommitMessage | AppMode::GitTagInput) {
                 let area = f.size();
                 let rename_area = Rect::new(area.width/4, area.height/2 - 1, area.width/2, 3);
                 f.render_widget(Clear, rename_area);
@@ -5062,7 +5425,7 @@ fn main() -> io::Result<()> {
                     _ => " New Name ",
                 };
                 let prompt_value = app.input_buffer.clone();
-                f.render_widget(Paragraph::new(prompt_value).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title)), rename_area);
+                f.render_widget(Paragraph::new(prompt_value).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title).title_style(Style::default().fg(Color::White))), rename_area);
                 app.clamp_input_cursor();
                 let cursor_x = rename_area.x + 1 + app.input_cursor as u16;
                 let cursor_y = rename_area.y + 1;
@@ -5070,29 +5433,49 @@ fn main() -> io::Result<()> {
             } else if app.mode == AppMode::Bookmarks {
                 let area = f.size();
                 let bookmarks = App::load_bookmarks();
-                let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("Press 0-9 to jump  ·  Tab/Shift+Tab switch tabs  ·  Esc/b/q close", Style::default().fg(Color::DarkGray))),
-                    Line::from(""),
-                ];
-                for (i, path) in &bookmarks {
+                if !bookmarks.is_empty() && app.bookmark_selected >= bookmarks.len() {
+                    app.bookmark_selected = bookmarks.len() - 1;
+                }
+                let mut lines: Vec<Line> = vec![Line::from("")];
+                let bm_w = (area.width * 2 / 3).max(50).min(tab_overlay_anchor.width);
+                let bm_content_w = bm_w.saturating_sub(2) as usize;
+                for (row_idx, (i, path)) in bookmarks.iter().enumerate() {
+                    let is_selected = row_idx == app.bookmark_selected;
+                    let base_style = if is_selected {
+                        Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+
                     let (label, style) = match path {
                         Some(p) => (
-                            format!("[{}]  {}", i, p.display()),
-                            Style::default().fg(Color::Rgb(100, 220, 120)),
+                            format!(" [{}]  {}", i, p.display()),
+                            Style::default().fg(Color::Rgb(100, 220, 120)).patch(base_style),
                         ),
                         None => (
-                            format!("[{}]  (not set)", i),
-                            Style::default().fg(Color::Rgb(80, 80, 80)),
+                            format!(" [{}]  (not set)", i),
+                            Style::default().fg(Color::Rgb(80, 80, 80)).patch(base_style),
                         ),
                     };
-                    lines.push(Line::from(Span::styled(label, style)));
+
+                    let padded_label = if is_selected {
+                        let used_w = UnicodeWidthStr::width(label.as_str());
+                        if bm_content_w > used_w {
+                            format!("{}{}", label, " ".repeat(bm_content_w - used_w))
+                        } else {
+                            label
+                        }
+                    } else {
+                        label
+                    };
+
+                    lines.push(Line::from(Span::styled(padded_label, style)));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Add to your shell config to set bookmarks:", Style::default().fg(Color::Rgb(200, 180, 80)))));
+                lines.push(Line::from(Span::styled(" Add to your shell config to set bookmarks:", Style::default().fg(Color::Rgb(200, 180, 80)))));
                 lines.push(Line::from(Span::styled("  export SB_BOOKMARK_1=\"$HOME/.config\"", Style::default().fg(Color::DarkGray))));
                 lines.push(Line::from(Span::styled("  export SB_BOOKMARK_2=\"/var/log\"", Style::default().fg(Color::DarkGray))));
-                let bm_h = (lines.len() as u16 + 2).max(17).min(tab_overlay_anchor.height);
-                let bm_w = (area.width * 2 / 3).max(50).min(tab_overlay_anchor.width);
+                let bm_h = (lines.len() as u16 + 4).max(17).min(tab_overlay_anchor.height);
                 let bm_area = Rect::new(
                     tab_overlay_anchor.x,
                     tab_overlay_anchor.y,
@@ -5100,41 +5483,63 @@ fn main() -> io::Result<()> {
                     bm_h,
                 );
                 f.render_widget(Clear, bm_area);
+                let bm_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let bm_inner = bm_block.inner(bm_area);
+                f.render_widget(bm_block, bm_area);
+                let bm_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(bm_inner);
+                f.render_widget(Paragraph::new(lines), bm_chunks[0]);
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
-                            .border_style(Style::default().fg(Color::Rgb(100, 150, 255)))),
-                    bm_area,
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓:navigate  Enter/0-9:jump  Tab:switch tabs  Esc:close",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    bm_chunks[1],
                 );
             } else if app.mode == AppMode::Integrations {
                 let area = f.size();
                 let integrations = app.integration_rows_cache.clone();
+                let int_w = (area.width * 5 / 6).max(70).min(tab_overlay_anchor.width);
+                let int_content_w = int_w.saturating_sub(2) as usize;
                 if !integrations.is_empty() && app.integration_selected >= integrations.len() {
                     app.integration_selected = integrations.len() - 1;
                 }
-                let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ navigate  Space toggle  Enter install missing  Tab/Shift+Tab switch tabs  Esc/I/q close", Style::default().fg(Color::DarkGray))),
-                    Line::from(""),
-                ];
+                let mut lines: Vec<Line> = vec![Line::from("")];
                 for (i, row) in integrations.iter().enumerate() {
                     let is_selected = i == app.integration_selected;
-                    let marker = if is_selected { ">" } else { " " };
-                    let status_span = if row.required || (app.integration_enabled(&row.key) && row.available) {
-                        Span::styled(" ✓ ", Style::default().fg(Color::Rgb(100, 220, 120)))
+                    let status_text = if row.required || (app.integration_enabled(&row.key) && row.available) {
+                        " ✓ ".to_string()
                     } else {
-                        Span::styled(" ✕ ", Style::default().fg(Color::Rgb(220, 80, 80)))
+                        " ✕ ".to_string()
+                    };
+                    let status_style = if row.required || (app.integration_enabled(&row.key) && row.available) {
+                        Style::default().fg(Color::Rgb(100, 220, 120))
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 80, 80))
                     };
                     let base_style = if is_selected {
                         Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White)
                     } else {
                         Style::default().fg(Color::Rgb(190, 190, 190))
                     };
-                    let name_span = Span::styled(
-                        format!("{} {:<12}", marker, row.label),
-                        base_style,
-                    );
+                    let name_text = format!("  {:<12}", row.label);
+                    let state_text = format!(" {:<10}", row.state);
+                    let category_text = format!(" {:<9}", row.category);
+                    let purpose_text = format!(" {}", row.description);
+
+                    let name_span = Span::styled(name_text.clone(), base_style);
                     let state_span = Span::styled(
-                        format!(" {:<10}", row.state),
+                        state_text.clone(),
                         if row.required {
                             base_style.fg(Color::Rgb(200, 200, 200))
                         } else if app.integration_enabled(&row.key) {
@@ -5143,26 +5548,33 @@ fn main() -> io::Result<()> {
                             base_style.fg(Color::Rgb(150, 150, 150))
                         },
                     );
-                    let category_span = Span::styled(
-                        format!(" {:<9}", row.category),
-                        base_style,
-                    );
-                    let purpose_span = Span::styled(
-                        format!(" {}", row.description),
-                        base_style,
-                    );
-                    lines.push(Line::from(vec![status_span, name_span, state_span, category_span, purpose_span]));
+                    let category_span = Span::styled(category_text.clone(), base_style);
+                    let purpose_span = Span::styled(purpose_text.clone(), base_style);
+                    let mut spans = vec![
+                        Span::styled(status_text.clone(), status_style.patch(base_style)),
+                        name_span,
+                        state_span,
+                        category_span,
+                        purpose_span,
+                    ];
+
+                    if is_selected {
+                        let used_w = UnicodeWidthStr::width(status_text.as_str())
+                            + UnicodeWidthStr::width(name_text.as_str())
+                            + UnicodeWidthStr::width(state_text.as_str())
+                            + UnicodeWidthStr::width(category_text.as_str())
+                            + UnicodeWidthStr::width(purpose_text.as_str());
+                        if int_content_w > used_w {
+                            spans.push(Span::styled(
+                                " ".repeat(int_content_w - used_w),
+                                base_style,
+                            ));
+                        }
+                    }
+
+                    lines.push(Line::from(spans));
                 }
-                let int_h = (lines.len() as u16 + 2).min(tab_overlay_anchor.height);
-                let int_w = (area.width * 5 / 6).max(70).min(tab_overlay_anchor.width);
-                // Auto-scroll so the selected row stays visible
-                let visible_rows = (int_h as usize).saturating_sub(2); // minus top/bottom borders
-                let selected_line = app.integration_selected + 2; // +2 for hint line + blank line
-                let int_scroll = if selected_line + 1 <= visible_rows {
-                    0u16
-                } else {
-                    (selected_line + 1 - visible_rows) as u16
-                };
+                let int_h = (lines.len() as u16 + 4).min(tab_overlay_anchor.height);
                 let int_area = Rect::new(
                     tab_overlay_anchor.x,
                     tab_overlay_anchor.y,
@@ -5170,23 +5582,72 @@ fn main() -> io::Result<()> {
                     int_h,
                 );
                 f.render_widget(Clear, int_area);
+                let int_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let int_inner = int_block.inner(int_area);
+                f.render_widget(int_block, int_area);
+                let int_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(int_inner);
+                let visible_rows = int_chunks[0].height as usize;
+                let selected_line = app.integration_selected + 1;
+                let int_scroll = if selected_line + 1 <= visible_rows {
+                    0u16
+                } else {
+                    (selected_line + 1 - visible_rows) as u16
+                };
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .scroll((int_scroll, 0))
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
-                            .border_style(Style::default().fg(Color::Rgb(180, 130, 255)))),
-                    int_area,
+                    Paragraph::new(lines).scroll((int_scroll, 0)),
+                    int_chunks[0],
+                );
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓:navigate  Space:toggle  Enter:install missing  Tab:switch tabs  Esc:close",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    int_chunks[1],
                 );
             } else if app.mode == AppMode::SortMenu {
                 let options = App::sort_mode_options();
-                let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("↑↓ pick  Enter/→ apply  Shift+Tab/Tab switch tabs  Esc/q/← close", Style::default().fg(Color::DarkGray))),
-                    Line::from(""),
-                ];
+                let sort_w = tab_overlay_anchor.width;
+                let sort_content_w = sort_w.saturating_sub(2) as usize;
+                let mut lines: Vec<Line> = vec![Line::from("")];
                 for (idx, mode) in options.iter().enumerate() {
                     let is_selected = idx == app.sort_menu_selected;
                     let is_current = *mode == app.sort_mode;
-                    let row_text = format!("{}", mode.label());
+                    let (nerd_icon, fallback_icon) = match mode {
+                        SortMode::NameAsc => ("\u{f15d}", "[A-Z]"),
+                        SortMode::NameDesc => ("\u{f15e}", "[Z-A]"),
+                        SortMode::ExtensionAsc => ("\u{f1c9}", "[EXT]"),
+                        SortMode::SizeAsc => ("\u{f160}", "[SZ+]"),
+                        SortMode::SizeDesc => ("\u{f161}", "[SZ-]"),
+                        SortMode::ModifiedNewest => ("\u{f017}", "[NEW]"),
+                        SortMode::ModifiedOldest => ("\u{f1da}", "[OLD]"),
+                    };
+                    let sort_icon = if app.nerd_font_active {
+                        nerd_icon
+                    } else {
+                        fallback_icon
+                    };
+                    let row_text = format!(" {}  {}", sort_icon, mode.label());
+                    let row_text = if is_selected {
+                        let used_w = UnicodeWidthStr::width(row_text.as_str());
+                        if sort_content_w > used_w {
+                            format!("{}{}", row_text, " ".repeat(sort_content_w - used_w))
+                        } else {
+                            row_text
+                        }
+                    } else {
+                        row_text
+                    };
                     let style = if is_selected {
                         Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White)
                     } else if is_current {
@@ -5197,8 +5658,7 @@ fn main() -> io::Result<()> {
                     lines.push(Line::from(Span::styled(row_text, style)));
                 }
 
-                let sort_h = (lines.len() as u16 + 2).max(10).min(tab_overlay_anchor.height);
-                let sort_w = tab_overlay_anchor.width;
+                let sort_h = (lines.len() as u16 + 4).max(10).min(tab_overlay_anchor.height);
                 let sort_area = Rect::new(
                     tab_overlay_anchor.x,
                     tab_overlay_anchor.y,
@@ -5206,15 +5666,34 @@ fn main() -> io::Result<()> {
                     sort_h,
                 );
                 f.render_widget(Clear, sort_area);
+                let sort_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let sort_inner = sort_block.inner(sort_area);
+                f.render_widget(sort_block, sort_area);
+                let sort_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(sort_inner);
+                f.render_widget(Paragraph::new(lines), sort_chunks[0]);
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
-                            .border_style(Style::default().fg(Color::Rgb(120, 190, 255)))),
-                    sort_area,
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓:navigate  Enter:apply  Tab:switch tabs  Esc:close",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    sort_chunks[1],
                 );
             } else if app.mode == AppMode::SshPicker {
                 let area = f.size();
                 let ssh_w = (area.width * 2 / 3).max(60).min(area.width);
+                let ssh_popup_w = ssh_w.min(tab_overlay_anchor.width);
+                let ssh_content_w = ssh_popup_w.saturating_sub(2) as usize;
                 let content_w = ssh_w.saturating_sub(4) as usize;
                 let type_w = 6usize;
                 let mounted_w = 10usize;
@@ -5243,10 +5722,7 @@ fn main() -> io::Result<()> {
                     out
                 };
 
-                let mut lines: Vec<Line> = vec![
-                    Line::from(Span::styled("\u{2191}\u{2193}: navigate  Enter/→: open or mount  Shift+Tab/Tab: switch tabs  u/Delete: unmount  Esc/q: close", Style::default().fg(Color::DarkGray))),
-                    Line::from(""),
-                ];
+                let mut lines: Vec<Line> = vec![Line::from("")];
                 if app.remote_entries.is_empty() {
                     lines.push(Line::from(Span::styled(" No SSH/rclone/media mounts or mounted archives found", Style::default().fg(Color::Rgb(180, 80, 80)))));
                 } else {
@@ -5282,8 +5758,18 @@ fn main() -> io::Result<()> {
                         );
                         let detail_col = trunc(&detail, detail_w);
                         let label = format!(" {} {} {}{}", type_col, alias_col, detail_col, mount_tag);
+                        let label = if is_selected {
+                            let used_w = UnicodeWidthStr::width(label.as_str());
+                            if ssh_content_w > used_w {
+                                format!("{}{}", label, " ".repeat(ssh_content_w - used_w))
+                            } else {
+                                label
+                            }
+                        } else {
+                            label
+                        };
                         let style = if is_selected {
-                            Style::default().fg(Color::Rgb(20, 20, 30)).bg(Color::Rgb(80, 200, 180)).add_modifier(Modifier::BOLD)
+                            Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).add_modifier(Modifier::BOLD)
                         } else if is_mounted {
                             Style::default().fg(Color::Rgb(80, 220, 160))
                         } else {
@@ -5292,19 +5778,36 @@ fn main() -> io::Result<()> {
                         lines.push(Line::from(Span::styled(label, style)));
                     }
                 }
-                let ssh_h = (lines.len() as u16 + 2).max(8).min(tab_overlay_anchor.height);
+                let ssh_h = (lines.len() as u16 + 4).max(8).min(tab_overlay_anchor.height);
                 let ssh_area = Rect::new(
                     tab_overlay_anchor.x,
                     tab_overlay_anchor.y,
-                    ssh_w.min(tab_overlay_anchor.width),
+                    ssh_popup_w,
                     ssh_h,
                 );
                 f.render_widget(Clear, ssh_area);
+                let ssh_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(App::panel_tab_bar_line(app.panel_tab))
+                    .title_style(Style::default().fg(Color::White))
+                    .border_style(Style::default().fg(Color::Rgb(80, 200, 180)));
+                let ssh_inner = ssh_block.inner(ssh_area);
+                f.render_widget(ssh_block, ssh_area);
+                let ssh_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(2)])
+                    .split(ssh_inner);
+                f.render_widget(Paragraph::new(lines), ssh_chunks[0]);
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(App::panel_tab_bar_line(app.panel_tab))
-                            .border_style(Style::default().fg(Color::Rgb(80, 200, 180)))),
-                    ssh_area,
+                    Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " ↑↓:navigate  Enter/→:open or mount  Tab:switch tabs  u/Delete:unmount  Esc:close",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    ssh_chunks[1],
                 );
             } else if app.mode == AppMode::ConfirmExtract {
                 let area = f.size();
@@ -5355,7 +5858,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Confirm Extract ")),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Confirm Extract ").title_style(Style::default().fg(Color::White))),
                     confirm_area,
                 );
             } else if app.mode == AppMode::ConfirmIntegrationInstall {
@@ -5409,7 +5912,7 @@ fn main() -> io::Result<()> {
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Install Integration ")),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Install Integration ").title_style(Style::default().fg(Color::White))),
                     confirm_area,
                 );
             } else if app.mode == AppMode::ConfirmDelete {
@@ -5478,6 +5981,7 @@ fn main() -> io::Result<()> {
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .title(title)
+                    .title_style(Style::default().fg(Color::White))
                     .border_style(Style::default().fg(Color::Rgb(255, 100, 100)));
                 let inner = block.inner(confirm_area);
                 f.render_widget(block, confirm_area);
@@ -6028,9 +6532,6 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Char('n') => {
                         app.begin_input_edit(AppMode::NewFile, String::new());
-                    }
-                    KeyCode::Char('N') => {
-                        app.begin_input_edit(AppMode::NewFolder, String::new());
                     }
                     KeyCode::Char('Z') => {
                         app.run_zip_action();
@@ -6851,9 +7352,16 @@ fn main() -> io::Result<()> {
                 },
                 AppMode::NewFile | AppMode::NewFolder => match key.code {
                     KeyCode::Enter => {
-                        let is_dir = app.mode == AppMode::NewFolder;
-                        app.create_entry_from_input(is_dir);
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            || key.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            app.input_insert_char('\n');
+                        } else {
+                            let default_is_dir = app.mode == AppMode::NewFolder;
+                            app.create_entries_from_input(default_is_dir);
+                        }
                     }
+
                     KeyCode::Esc => {
                         app.clear_input_edit();
                         app.mode = AppMode::Browsing;
@@ -7111,6 +7619,23 @@ fn main() -> io::Result<()> {
                         app.panel_tab = 3;
                         app.refresh_remote_entries();
                         app.mode = AppMode::SshPicker;
+                    }
+                    KeyCode::Up => {
+                        app.bookmark_selected = app.bookmark_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let max_idx = App::load_bookmarks().len().saturating_sub(1);
+                        app.bookmark_selected = (app.bookmark_selected + 1).min(max_idx);
+                    }
+                    KeyCode::Enter | KeyCode::Right => {
+                        let idx = app.bookmark_selected;
+                        if let Ok(path_str) = env::var(format!("SB_BOOKMARK_{}", idx)) {
+                            let path = PathBuf::from(&path_str);
+                            if path.is_dir() {
+                                app.try_enter_dir(path);
+                            }
+                        }
+                        app.mode = AppMode::Browsing;
                     }
                     KeyCode::Char(c @ '0'..='9') => {
                         let idx = (c as u8 - b'0') as usize;
