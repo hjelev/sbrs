@@ -1,3 +1,25 @@
+// --- Scrollbar corner rendering helper ---
+fn render_scrollbar_corners(f: &mut Frame, area: Rect, can_draw_scrollbar: bool, border_color: Color) {
+    if !can_draw_scrollbar { return; }
+    let corner_x = area.x + area.width.saturating_sub(1);
+    let top_corner_y = area.y.saturating_sub(1);
+    let bottom_corner_y = area.y + area.height;
+    let corner_style = Style::default().fg(border_color);
+    f.render_widget(
+        Paragraph::new(Span::styled("╮", corner_style)),
+        Rect::new(corner_x, top_corner_y, 1, 1),
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled("╯", corner_style)),
+        Rect::new(corner_x, bottom_corner_y, 1, 1),
+    );
+}
+
+impl App {
+    fn mode_shows_main_scrollbar(&self) -> bool {
+        matches!(self.mode, AppMode::Browsing | AppMode::PathEditing)
+    }
+}
 use crossterm::{
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{
@@ -303,6 +325,8 @@ struct App {
     help_max_offset: u16,
     confirm_delete_scroll_offset: u16,
     confirm_delete_max_offset: u16,
+    file_list_scroll_dragging: bool,
+    file_list_scroll_grab_offset: u16,
     confirm_delete_button_focus: u8,
     git_info_cache: Option<GitInfoCache>,
     git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool, Option<(String, u64)>)>)>>,
@@ -482,6 +506,8 @@ impl App {
             help_max_offset: 0,
             confirm_delete_scroll_offset: 0,
             confirm_delete_max_offset: 0,
+            file_list_scroll_dragging: false,
+            file_list_scroll_grab_offset: 0,
             confirm_delete_button_focus: 0,
             git_info_cache: None,
             git_info_rx: None,
@@ -4790,11 +4816,109 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
+    fn main_table_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        if self.mode != AppMode::Browsing {
+            return None;
+        }
+        let chunks = Layout::default()
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(area);
+        let table_area = Rect::new(
+            chunks[0].x,
+            chunks[0].y + 2,
+            chunks[0].width,
+            chunks[0].height.saturating_sub(2),
+        );
+        if table_area.height == 0 || table_area.width <= 2 {
+            return None;
+        }
+        let needs_scroll = self.entries.len() > table_area.height as usize;
+        if !needs_scroll {
+            return None;
+        }
+        Some(Rect::new(
+            table_area.x + table_area.width.saturating_sub(1),
+            table_area.y,
+            1,
+            table_area.height,
+        ))
+    }
+
+    fn scroll_main_list_from_scrollbar_row(&mut self, area: Rect, row: u16, grab_offset: u16) {
+        let Some(sb_area) = self.main_table_scrollbar_area(area) else {
+            return;
+        };
+        let track_h = sb_area.height as usize;
+        if track_h == 0 || self.entries.is_empty() {
+            return;
+        }
+        let visible_rows = sb_area.height.max(1) as usize;
+        let total_rows = self.entries.len();
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+        if max_scroll == 0 {
+            return;
+        }
+
+        let thumb_h = ((visible_rows * track_h + total_rows.saturating_sub(1)) / total_rows)
+            .max(1)
+            .min(track_h);
+        let scroll_space = track_h.saturating_sub(thumb_h);
+        if scroll_space == 0 {
+            return;
+        }
+
+        let row_rel = row.saturating_sub(sb_area.y) as usize;
+        let thumb_top = row_rel.saturating_sub(grab_offset as usize).min(scroll_space);
+        let target_offset = (thumb_top * max_scroll + (scroll_space / 2)) / scroll_space;
+        let target_index = target_offset.min(self.entries.len().saturating_sub(1));
+        self.selected_index = target_index;
+        self.table_state.select(Some(target_index));
+    }
+
     fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> Option<KeyEvent> {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(true),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(false),
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(sb_area) = self.main_table_scrollbar_area(area) {
+                    if mouse.column >= sb_area.x
+                        && mouse.column < sb_area.x + sb_area.width
+                        && mouse.row >= sb_area.y
+                        && mouse.row < sb_area.y + sb_area.height
+                    {
+                        let track_h = sb_area.height as usize;
+                        let visible_rows = sb_area.height.max(1) as usize;
+                        let total_rows = self.entries.len();
+                        let max_scroll = total_rows.saturating_sub(visible_rows);
+                        if track_h > 0 && max_scroll > 0 {
+                            let offset = self.table_state.offset().min(max_scroll);
+                            let thumb_h = ((visible_rows * track_h + total_rows.saturating_sub(1)) / total_rows)
+                                .max(1)
+                                .min(track_h);
+                            let scroll_space = track_h.saturating_sub(thumb_h);
+                            let thumb_y = if max_scroll == 0 {
+                                0
+                            } else {
+                                (offset * scroll_space + (max_scroll / 2)) / max_scroll
+                            };
+                            let row_rel = mouse.row.saturating_sub(sb_area.y) as usize;
+                            let in_thumb = row_rel >= thumb_y && row_rel < thumb_y + thumb_h;
+                            self.file_list_scroll_grab_offset = if in_thumb {
+                                (row_rel.saturating_sub(thumb_y)) as u16
+                            } else {
+                                (thumb_h / 2) as u16
+                            };
+                            self.file_list_scroll_dragging = true;
+                            self.scroll_main_list_from_scrollbar_row(
+                                area,
+                                mouse.row,
+                                self.file_list_scroll_grab_offset,
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.file_list_scroll_dragging = false;
                 if self.handle_tab_close_click(mouse.column, mouse.row, area) {
                     return None;
                 }
@@ -4805,6 +4929,19 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                     return Some(key);
                 }
                 let _ = self.handle_confirm_delete_click(mouse.column, mouse.row, area);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.file_list_scroll_dragging {
+                    self.scroll_main_list_from_scrollbar_row(
+                        area,
+                        mouse.row,
+                        self.file_list_scroll_grab_offset,
+                    );
+                    return None;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.file_list_scroll_dragging = false;
             }
             _ => {}
         }
@@ -5383,8 +5520,15 @@ fn main() -> io::Result<()> {
                 .highlight_symbol(""); 
 
             let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
-            app.page_size = (table_area.height as usize).saturating_sub(1).max(1);
-            f.render_stateful_widget(table, table_area, &mut app.table_state);
+            let needs_scroll = app.entries.len() > table_area.height as usize;
+            let can_draw_scrollbar = app.mode_shows_main_scrollbar() && table_area.width > 2 && needs_scroll;
+            let list_area = if can_draw_scrollbar {
+                Rect::new(table_area.x, table_area.y, table_area.width.saturating_sub(1), table_area.height)
+            } else {
+                table_area
+            };
+            app.page_size = (list_area.height as usize).saturating_sub(1).max(1);
+            f.render_stateful_widget(table, list_area, &mut app.table_state);
 
             if app.entries.is_empty() {
                 f.render_widget(
@@ -5395,7 +5539,7 @@ fn main() -> io::Result<()> {
                             .add_modifier(Modifier::ITALIC),
                     )))
                     .alignment(Alignment::Left),
-                    table_area,
+                    list_area,
                 );
             }
 
@@ -5409,11 +5553,11 @@ fn main() -> io::Result<()> {
                         let offset = app.table_state.offset();
                         if selected_idx >= offset {
                             let row_in_view = selected_idx - offset;
-                            if row_in_view < table_area.height as usize {
+                            if row_in_view < list_area.height as usize {
                                 let row_area = Rect::new(
-                                    table_area.x,
-                                    table_area.y + row_in_view as u16,
-                                    table_area.width,
+                                    list_area.x,
+                                    list_area.y + row_in_view as u16,
+                                    list_area.width,
                                     1,
                                 );
                                 let is_marked = app.marked_indices.contains(&selected_idx);
@@ -5463,6 +5607,50 @@ fn main() -> io::Result<()> {
                             }
                         }
                     }
+                }
+            }
+
+            // --- Bottom divider border ---
+            let bottom_border_y = table_area.y + table_area.height;
+            if app.mode_shows_main_scrollbar() && bottom_border_y < chunks[0].y + chunks[0].height {
+                f.render_widget(Block::default().borders(Borders::TOP).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)), 
+                    Rect::new(chunks[0].x, bottom_border_y, chunks[0].width, 1));
+            }
+
+            if can_draw_scrollbar {
+                let sb_area = Rect::new(
+                    table_area.x + table_area.width.saturating_sub(1),
+                    table_area.y,
+                    1,
+                    table_area.height,
+                );
+                let track_h = sb_area.height as usize;
+                if track_h > 0 {
+                    let visible_rows = list_area.height.max(1) as usize;
+                    let total_rows = app.entries.len();
+                    let max_scroll = total_rows.saturating_sub(visible_rows);
+                    let offset = app.table_state.offset().min(max_scroll);
+                    let thumb_h = ((visible_rows * track_h + total_rows.saturating_sub(1)) / total_rows)
+                        .max(1)
+                        .min(track_h);
+                    let scroll_space = track_h.saturating_sub(thumb_h);
+                    let thumb_y = if max_scroll == 0 {
+                        0
+                    } else {
+                        (offset * scroll_space + (max_scroll / 2)) / max_scroll
+                    };
+
+                    let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                    for row in 0..track_h {
+                        let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                        let (ch, color) = if in_thumb {
+                            ("┃", Color::Rgb(120, 200, 190))
+                        } else {
+                            ("│", Color::DarkGray)
+                        };
+                        sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                    }
+                    f.render_widget(Paragraph::new(sb_lines), sb_area);
                 }
             }
 
@@ -7152,6 +7340,13 @@ fn main() -> io::Result<()> {
                     Paragraph::new(line_msg).style(msg_style),
                     msg_area,
                 );
+            }
+
+            // Render scrollbar corners on top of all other elements only if no overlay is active
+            if app.mode_shows_main_scrollbar() && !app.entries.is_empty() {
+                let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height.saturating_sub(2));
+                let can_draw_scrollbar = table_area.width > 2 && app.entries.len() > table_area.height as usize;
+                render_scrollbar_corners(f, table_area, can_draw_scrollbar, Color::DarkGray);
             }
         })?;
 
