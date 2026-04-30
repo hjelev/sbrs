@@ -5064,6 +5064,13 @@ fn main() -> io::Result<()> {
                 .constraints([Constraint::Min(3), Constraint::Length(2)])
                 .split(f.size());
 
+            // Pre-calculate if scrollbar will be visible for header alignment
+            let scrollbar_visible_in_main = {
+                let table_area_height = chunks[0].height.saturating_sub(2);
+                let needs_scroll = app.entries.len() > table_area_height as usize;
+                app.mode_shows_main_scrollbar() && chunks[0].width > 2 && needs_scroll
+            };
+
             // --- Header ---
             let header_identity = app.current_header_identity(&user, &hostname);
             let current_display_path = if app.mode == AppMode::PathEditing {
@@ -5306,8 +5313,9 @@ fn main() -> io::Result<()> {
             }
             if show_right {
                 if let Some(header_right_line) = header_right {
+                    let scrollbar_offset = if scrollbar_visible_in_main { 1 } else { 0 };
                     let right_rect = Rect::new(
-                        chunks[0].x + total_width.saturating_sub(right_width),
+                        chunks[0].x + total_width.saturating_sub(right_width).saturating_sub(scrollbar_offset),
                         chunks[0].y,
                         right_width,
                         1,
@@ -5830,6 +5838,10 @@ fn main() -> io::Result<()> {
                 } else {
                     0
                 };
+                let search_total_rows = app.internal_search_results.len();
+                let search_max_scroll = search_total_rows.saturating_sub(max_rows);
+                let search_scroll_offset = offset.min(search_max_scroll);
+                let can_draw_search_scrollbar = body_area.width > 2 && search_total_rows > max_rows;
 
                 if let Some(err) = &app.internal_search_regex_error {
                     lines.push(Line::from(Span::styled(
@@ -5999,6 +6011,38 @@ fn main() -> io::Result<()> {
                 }
 
                 f.render_widget(Paragraph::new(lines), body_area);
+                if can_draw_search_scrollbar {
+                    let sb_area = Rect::new(
+                        popup_area.x + popup_area.width.saturating_sub(1),
+                        body_area.y,
+                        1,
+                        body_area.height,
+                    );
+                    let track_h = sb_area.height as usize;
+                    if track_h > 0 {
+                        let thumb_h = ((max_rows * track_h + search_total_rows.saturating_sub(1)) / search_total_rows)
+                            .max(1)
+                            .min(track_h);
+                        let scroll_space = track_h.saturating_sub(thumb_h);
+                        let thumb_y = if search_max_scroll == 0 {
+                            0
+                        } else {
+                            (search_scroll_offset * scroll_space + (search_max_scroll / 2)) / search_max_scroll
+                        };
+
+                        let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                        for row in 0..track_h {
+                            let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                            let (ch, color) = if in_thumb {
+                                ("┃", Color::Rgb(120, 240, 220))
+                            } else {
+                                ("│", Color::Rgb(80, 200, 180))
+                            };
+                            sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                        }
+                        f.render_widget(Paragraph::new(sb_lines), sb_area);
+                    }
+                }
                 f.render_widget(
                     Paragraph::new(vec![
                         Line::from(""),
@@ -6269,11 +6313,16 @@ fn main() -> io::Result<()> {
                 let help_content_area = help_chunks[0];
                 let help_footer_area = help_chunks[1];
 
-                let visible_lines = help_content_area.height as usize;
+                let needs_scroll = lines.len() > help_content_area.height as usize;
+                let can_draw_scrollbar = help_content_area.width > 2 && needs_scroll;
+                let help_text_area = help_content_area;
+
+                let visible_lines = help_text_area.height as usize;
                 let total_lines = lines.len();
                 let max_scroll = total_lines.saturating_sub(visible_lines);
                 app.help_max_offset = max_scroll as u16;
                 let clamped_offset = (app.help_scroll_offset as usize).min(max_scroll) as u16;
+                app.help_scroll_offset = clamped_offset;
                 let indented_lines: Vec<Line> = lines
                     .iter()
                     .map(|line| {
@@ -6288,8 +6337,41 @@ fn main() -> io::Result<()> {
                     Paragraph::new(indented_lines)
                         .wrap(Wrap { trim: false })
                         .scroll((clamped_offset, 0)),
-                    help_content_area,
+                    help_text_area,
                 );
+                if can_draw_scrollbar {
+                    let sb_area = Rect::new(
+                        help_area.x + help_area.width.saturating_sub(1),
+                        help_content_area.y,
+                        1,
+                        help_content_area.height,
+                    );
+                    let track_h = sb_area.height as usize;
+                    if track_h > 0 {
+                        let offset = clamped_offset as usize;
+                        let thumb_h = ((visible_lines * track_h + total_lines.saturating_sub(1)) / total_lines)
+                            .max(1)
+                            .min(track_h);
+                        let scroll_space = track_h.saturating_sub(thumb_h);
+                        let thumb_y = if max_scroll == 0 {
+                            0
+                        } else {
+                            (offset * scroll_space + (max_scroll / 2)) / max_scroll
+                        };
+
+                        let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                        for row in 0..track_h {
+                            let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                            let (ch, color) = if in_thumb {
+                                ("┃", Color::Rgb(120, 240, 220))
+                            } else {
+                                ("│", Color::Rgb(80, 200, 180))
+                            };
+                            sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                        }
+                        f.render_widget(Paragraph::new(sb_lines), sb_area);
+                    }
+                }
                 f.render_widget(
                     Paragraph::new(vec![
                         Line::from(""),
@@ -6671,16 +6753,53 @@ fn main() -> io::Result<()> {
                     .constraints([Constraint::Min(1), Constraint::Length(2)])
                     .split(int_inner);
                 let visible_rows = int_chunks[0].height as usize;
+                let total_rows = lines.len();
+                let max_scroll = total_rows.saturating_sub(visible_rows);
                 let selected_line = app.integration_selected + 1;
                 let int_scroll = if selected_line + 1 <= visible_rows {
-                    0u16
+                    0usize
                 } else {
-                    (selected_line + 1 - visible_rows) as u16
-                };
+                    selected_line + 1 - visible_rows
+                }
+                .min(max_scroll);
+                let can_draw_scrollbar = int_chunks[0].width > 2 && total_rows > visible_rows;
+
                 f.render_widget(
-                    Paragraph::new(lines).scroll((int_scroll, 0)),
+                    Paragraph::new(lines).scroll((int_scroll as u16, 0)),
                     int_chunks[0],
                 );
+                if can_draw_scrollbar {
+                    let sb_area = Rect::new(
+                        int_area.x + int_area.width.saturating_sub(1),
+                        int_chunks[0].y,
+                        1,
+                        int_chunks[0].height,
+                    );
+                    let track_h = sb_area.height as usize;
+                    if track_h > 0 {
+                        let thumb_h = ((visible_rows * track_h + total_rows.saturating_sub(1)) / total_rows)
+                            .max(1)
+                            .min(track_h);
+                        let scroll_space = track_h.saturating_sub(thumb_h);
+                        let thumb_y = if max_scroll == 0 {
+                            0
+                        } else {
+                            (int_scroll * scroll_space + (max_scroll / 2)) / max_scroll
+                        };
+
+                        let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                        for row in 0..track_h {
+                            let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                            let (ch, color) = if in_thumb {
+                                ("┃", Color::Rgb(120, 240, 220))
+                            } else {
+                                ("│", Color::Rgb(80, 200, 180))
+                            };
+                            sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                        }
+                        f.render_widget(Paragraph::new(sb_lines), sb_area);
+                    }
+                }
                 f.render_widget(
                     Paragraph::new(vec![
                         Line::from(""),
@@ -7085,18 +7204,15 @@ fn main() -> io::Result<()> {
 
                     let list_block = Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Rgb(90, 90, 90)));
                     let list_frame_area = sections[0];
                     let list_inner = list_block.inner(list_frame_area);
                     f.render_widget(list_block, list_frame_area);
 
                     let needs_scroll = to_delete.len() > list_inner.height as usize;
-                    let can_draw_scrollbar = list_inner.width > 4 && needs_scroll;
-                    let list_area = if can_draw_scrollbar {
-                        Rect::new(list_inner.x, list_inner.y, list_inner.width.saturating_sub(1), list_inner.height)
-                    } else {
-                        list_inner
-                    };
+                    let can_draw_scrollbar = list_inner.width > 2 && needs_scroll;
+                    let list_area = list_inner;
                     let visible_rows = list_area.height.max(1) as usize;
                     let max_scroll = to_delete.len().saturating_sub(visible_rows);
                     app.confirm_delete_max_offset = max_scroll as u16;
@@ -7110,7 +7226,7 @@ fn main() -> io::Result<()> {
                             Style::default().fg(Color::Rgb(210, 170, 170)),
                         )));
                     } else {
-                        let row_name_max = list_area.width.saturating_sub(4) as usize;
+                        let row_name_max = list_area.width.saturating_sub(2) as usize;
                         let truncate = |s: &str, max: usize| -> String {
                             if max <= 1 {
                                 return "…".to_string();
@@ -7146,7 +7262,7 @@ fn main() -> io::Result<()> {
 
                     if can_draw_scrollbar {
                         let sb_area = Rect::new(
-                            list_inner.x + list_inner.width.saturating_sub(1),
+                            list_frame_area.x + list_frame_area.width.saturating_sub(1),
                             list_inner.y,
                             1,
                             list_inner.height,
@@ -7171,9 +7287,9 @@ fn main() -> io::Result<()> {
                             for row in 0..track_h {
                                 let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
                                 let (ch, color) = if in_thumb {
-                                    ("█", Color::Rgb(255, 120, 120))
+                                    ("┃", Color::Rgb(120, 120, 120))
                                 } else {
-                                    ("│", Color::Rgb(90, 70, 70))
+                                    ("│", Color::Rgb(90, 90, 90))
                                 };
                                 sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
                             }
