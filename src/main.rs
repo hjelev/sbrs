@@ -5072,33 +5072,47 @@ fn main() -> io::Result<()> {
                 app.current_dir_display_path_with_filter()
             };
             let header_sep = if app.nerd_font_active { "\u{f0256} " } else { " » " };
-            let os_icon_span: Option<Span> = if app.nerd_font_active {
+            let os_icon_info: Option<(&'static str, Color)> = if app.nerd_font_active {
                 // Use the remote OS icon if we're inside an SSH/rclone mount
                 let active_remote_icon = app.ssh_mounts.iter()
                     .filter(|m| app.current_dir.starts_with(&m.mount_path))
                     .last()
                     .and_then(|m| m.remote_os_icon);
-                let icon_source = active_remote_icon.or(app.os_icon);
-                icon_source.map(|(glyph, color)| {
-                    Span::styled(format!("{} ", glyph), Style::default().fg(color))
-                })
+                active_remote_icon.or(app.os_icon)
             } else {
                 None
             };
-            let os_icon_width: u16 = os_icon_span
-                .as_ref()
-                .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
-                .unwrap_or(0);
             let mut middle_spans: Vec<Span> = Vec::new();
-            if let Some(icon_span) = os_icon_span {
-                middle_spans.push(icon_span);
-            }
-            if let Some((left_identity, right_identity)) = header_identity.split_once('@') {
-                middle_spans.push(Span::styled(left_identity.to_string(), Style::default().fg(Color::White)));
-                middle_spans.push(Span::styled("@", Style::default().fg(Color::Rgb(120, 120, 120))));
-                middle_spans.push(Span::styled(right_identity.to_string(), Style::default().fg(Color::White)));
+            let os_icon_width: u16;
+            if let (Some((glyph, color)), Some((left_identity, right_identity))) =
+                (os_icon_info, header_identity.split_once('@'))
+            {
+                // Pad icon with a space on each side so the glyph has breathing room
+                // and renders at a readable size across different terminals.
+                let icon_text = format!("{} ", glyph);
+                os_icon_width = UnicodeWidthStr::width(icon_text.as_str()) as u16;
+                middle_spans.push(Span::raw(left_identity.to_string()));
+                middle_spans.push(Span::styled(icon_text, Style::default().fg(color)));
+                middle_spans.push(Span::raw(right_identity.to_string()));
             } else {
-                middle_spans.push(Span::styled(header_identity.as_str(), Style::default().fg(Color::White)));
+                // Fallback: prepend icon (with trailing space) then identity
+                let os_icon_span: Option<Span> = os_icon_info.map(|(glyph, color)| {
+                    Span::styled(format!("{} ", glyph), Style::default().fg(color))
+                });
+                os_icon_width = os_icon_span
+                    .as_ref()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                    .unwrap_or(0);
+                if let Some(icon_span) = os_icon_span {
+                    middle_spans.push(icon_span);
+                }
+                if let Some((left_identity, right_identity)) = header_identity.split_once('@') {
+                    middle_spans.push(Span::raw(left_identity.to_string()));
+                    middle_spans.push(Span::styled("@", Style::default().fg(Color::Rgb(120, 120, 120))));
+                    middle_spans.push(Span::raw(right_identity.to_string()));
+                } else {
+                    middle_spans.push(Span::raw(header_identity.as_str()));
+                }
             }
 
             let header_sep_span = if app.nerd_font_active {
