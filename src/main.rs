@@ -266,6 +266,20 @@ enum InternalSearchCandidatesMsg {
     },
 }
 
+enum PreviewContentMsg {
+    Ready {
+        request_id: u64,
+        path: PathBuf,
+        lines: Vec<String>,
+        footer: Option<String>,
+    },
+    Failed {
+        request_id: u64,
+        path: PathBuf,
+        message: String,
+    },
+}
+
 struct App {
     current_dir: PathBuf,
     entries: Vec<fs::DirEntry>,
@@ -386,6 +400,14 @@ struct App {
     db_preview_output_lines: Vec<String>,
     db_preview_row_limit: usize,
     db_preview_error: Option<String>,
+    preview_enabled: bool,
+    preview_scroll_offset: usize,
+    preview_target_path: Option<PathBuf>,
+    preview_lines: Vec<String>,
+    preview_footer: Option<String>,
+    preview_rx: Option<Receiver<PreviewContentMsg>>,
+    preview_request_id: u64,
+    preview_pending: bool,
 }
 
 const ZIP_BASED_EXTENSIONS: &[&str] = &[
@@ -567,6 +589,14 @@ impl App {
             db_preview_output_lines: Vec::new(),
             db_preview_row_limit: 8,
             db_preview_error: None,
+            preview_enabled: false,
+            preview_scroll_offset: 0,
+            preview_target_path: None,
+            preview_lines: Vec::new(),
+            preview_footer: None,
+            preview_rx: None,
+            preview_request_id: 0,
+            preview_pending: false,
         };
         app.refresh_header_clock_if_needed();
         app.refresh_entries()?;
@@ -583,6 +613,246 @@ impl App {
         }
         self.header_clock_minute_key = Some(minute_key);
         self.header_clock_text = now.format("%Y-%m-%d %H:%M").to_string();
+    }
+
+    fn toggle_preview_mode(&mut self) {
+        self.preview_enabled = !self.preview_enabled;
+        self.preview_scroll_offset = 0;
+        if self.preview_enabled {
+            self.preview_lines = vec!["Loading preview...".to_string()];
+            self.preview_footer = None;
+            self.request_preview_for_selected();
+        } else {
+            self.preview_target_path = None;
+            self.preview_lines.clear();
+            self.preview_footer = None;
+            self.preview_pending = false;
+            self.preview_rx = None;
+        }
+    }
+
+    fn request_preview_for_selected(&mut self) {
+        if !self.preview_enabled {
+            return;
+        }
+        let Some(path) = self.entries.get(self.selected_index).map(|e| e.path()) else {
+            self.preview_lines = vec!["No selection".to_string()];
+            self.preview_footer = None;
+            self.preview_target_path = None;
+            self.preview_pending = false;
+            self.preview_rx = None;
+            return;
+        };
+
+        if self.preview_target_path.as_ref() == Some(&path) && (self.preview_pending || !self.preview_lines.is_empty()) {
+            return;
+        }
+
+        self.preview_request_id = self.preview_request_id.saturating_add(1);
+        let request_id = self.preview_request_id;
+        self.preview_target_path = Some(path.clone());
+        self.preview_pending = true;
+        self.preview_scroll_offset = 0;
+        self.preview_lines = vec!["Loading preview...".to_string()];
+        self.preview_footer = None;
+
+        let use_bat = self.integration_active("bat");
+        let use_file = self.integration_active("file");
+        let show_icons = self.show_icons;
+        let nerd_font_active = self.nerd_font_active;
+        let (tx, rx) = mpsc::channel();
+        self.preview_rx = Some(rx);
+        thread::spawn(move || {
+            let msg = App::build_preview_content(
+                request_id,
+                path,
+                use_bat,
+                use_file,
+                show_icons,
+                nerd_font_active,
+            );
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn pump_preview_progress(&mut self) {
+        let Some(rx) = self.preview_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(PreviewContentMsg::Ready {
+                request_id,
+                path,
+                lines,
+                footer,
+            }) => {
+                if request_id == self.preview_request_id {
+                    self.preview_target_path = Some(path);
+                    self.preview_lines = lines;
+                    self.preview_footer = footer;
+                    self.preview_pending = false;
+                    self.preview_scroll_offset = 0;
+                }
+            }
+            Ok(PreviewContentMsg::Failed {
+                request_id,
+                path,
+                message,
+            }) => {
+                if request_id == self.preview_request_id {
+                    self.preview_target_path = Some(path);
+                    self.preview_lines = vec![message];
+                    self.preview_footer = None;
+                    self.preview_pending = false;
+                    self.preview_scroll_offset = 0;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.preview_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.preview_pending = false;
+            }
+        }
+    }
+
+    fn build_preview_content(
+        request_id: u64,
+        path: PathBuf,
+        use_bat: bool,
+        use_file: bool,
+        show_icons: bool,
+        nerd_font_active: bool,
+    ) -> PreviewContentMsg {
+        if path.is_dir() {
+            let mut entries = Vec::new();
+            let mut names = Vec::new();
+            if let Ok(read_dir) = fs::read_dir(&path) {
+                for item in read_dir.flatten().take(500) {
+                    names.push(item.path());
+                }
+            }
+            names.sort_by(|a, b| {
+                let a_name = a
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let b_name = b
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                a_name.cmp(&b_name)
+            });
+
+            for entry_path in names {
+                let file_name = entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry_path.to_string_lossy().into_owned());
+                let is_symlink = entry_path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                let is_dir = entry_path.is_dir();
+                let (icon_glyph, _) = App::icon_for_name(
+                    &file_name,
+                    is_dir,
+                    show_icons,
+                    nerd_font_active,
+                    is_symlink,
+                );
+                let icon_prefix = if show_icons && !icon_glyph.is_empty() {
+                    format!("{} ", icon_glyph)
+                } else {
+                    String::new()
+                };
+                let suffix = if is_dir { "/" } else { "" };
+                entries.push(format!("{}{}{}", icon_prefix, file_name, suffix));
+            }
+
+            if entries.is_empty() {
+                entries.push("[empty folder]".to_string());
+            }
+
+            let footer = App::compute_total_display_bytes(&path)
+                .ok()
+                .map(|bytes| format!("Total: {}", App::format_size(bytes)));
+            return PreviewContentMsg::Ready {
+                request_id,
+                path,
+                lines: entries,
+                footer,
+            };
+        }
+
+        if !path.exists() {
+            return PreviewContentMsg::Failed {
+                request_id,
+                path,
+                message: "[file not found]".to_string(),
+            };
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+
+        if App::is_binary_file(&path) {
+            lines.push("[binary file]".to_string());
+            if use_file {
+                if let Ok(out) = Command::new("file").arg("-b").arg(&path).output() {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !text.is_empty() {
+                        lines.push(text);
+                    }
+                }
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let footer = Some(format!("Size: {}", App::format_size(size)));
+            return PreviewContentMsg::Ready {
+                request_id,
+                path,
+                lines,
+                footer,
+            };
+        }
+
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size > 10 * 1024 * 1024 {
+            lines.push("[preview truncated: file larger than 10MB]".to_string());
+        }
+
+        if use_bat {
+            if let Ok(out) = Command::new("bat")
+                .args(["--paging=never", "--style=plain", "--color=never", "--line-range", "1:220"])
+                .arg(&path)
+                .output()
+            {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    lines.extend(text.lines().take(220).map(|s| s.to_string()));
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            let mut bytes = Vec::new();
+            if let Ok(mut file) = fs::File::open(&path) {
+                let _ = file.read_to_end(&mut bytes);
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            lines.extend(text.lines().take(220).map(|s| s.to_string()));
+        }
+
+        if lines.is_empty() {
+            lines.push("[no preview output]".to_string());
+        }
+
+        let footer = Some(format!("Size: {}", App::format_size(size)));
+        PreviewContentMsg::Ready {
+            request_id,
+            path,
+            lines,
+            footer,
+        }
     }
 
     fn age_encrypt_file_interactive(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
@@ -5040,6 +5310,8 @@ fn main() -> io::Result<()> {
         app.pump_notes_progress();
         app.pump_internal_search_candidates_progress();
         app.pump_internal_search_content_progress();
+        app.pump_preview_progress();
+        app.request_preview_for_selected();
         let text_input_cursor = matches!(
             app.mode,
             AppMode::PathEditing
@@ -5060,15 +5332,22 @@ fn main() -> io::Result<()> {
             execute!(terminal.backend_mut(), SetCursorStyle::DefaultUserShape)?;
         }
         terminal.draw(|f| {
+            let footer_height = if app.preview_enabled { 1 } else { 2 };
+            let header_reserved_rows = if app.preview_enabled { 1 } else { 2 };
             let chunks = Layout::default()
-                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .constraints([Constraint::Min(3), Constraint::Length(footer_height)])
                 .split(f.size());
 
             // Pre-calculate if scrollbar will be visible for header alignment
             let scrollbar_visible_in_main = {
-                let table_area_height = chunks[0].height.saturating_sub(2);
+                let table_area_height = chunks[0].height.saturating_sub(header_reserved_rows);
                 let needs_scroll = app.entries.len() > table_area_height as usize;
-                app.mode_shows_main_scrollbar() && chunks[0].width > 2 && needs_scroll
+                let table_area_width = if app.preview_enabled {
+                    (chunks[0].width * 33 / 100).max(1)
+                } else {
+                    chunks[0].width
+                };
+                app.mode_shows_main_scrollbar() && table_area_width > 2 && needs_scroll
             };
 
             // --- Header ---
@@ -5340,14 +5619,44 @@ fn main() -> io::Result<()> {
                 let cursor_y = chunks[0].y;
                 f.set_cursor(cursor_x, cursor_y);
             }
-            f.render_widget(Block::default().borders(Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)), 
-                Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1));
+            if !app.preview_enabled {
+                f.render_widget(Block::default().borders(Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)), 
+                    Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1));
+            }
 
             // --- Table ---
-            let term_w = chunks[0].width;
-            let show_date = term_w >= 50;
-            let show_size = term_w >= 70;
-            let show_meta = term_w >= 90;
+            let content_area = Rect::new(
+                chunks[0].x,
+                chunks[0].y + header_reserved_rows,
+                chunks[0].width,
+                chunks[0].height.saturating_sub(header_reserved_rows),
+            );
+            let (list_frame_area, preview_frame_area) = if app.preview_enabled {
+                let split = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                    .split(content_area);
+                (split[0], Some(split[1]))
+            } else {
+                (content_area, None)
+            };
+
+            if app.preview_enabled {
+                let left_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray));
+                f.render_widget(left_block, list_frame_area);
+            }
+
+            let term_w = if app.preview_enabled {
+                list_frame_area.width.saturating_sub(2)
+            } else {
+                chunks[0].width
+            };
+            let show_date = !app.preview_enabled && term_w >= 50;
+            let show_size = !app.preview_enabled && term_w >= 70;
+            let show_meta = !app.preview_enabled && term_w >= 90;
             let show_pct = app.folder_size_enabled && show_size;
             let perms_width = 11usize;
             let group_width = app.meta_group_width.max(1);
@@ -5541,7 +5850,16 @@ fn main() -> io::Result<()> {
                 .highlight_style(selection_style)
                 .highlight_symbol(""); 
 
-            let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height - 2);
+            let table_area = if app.preview_enabled {
+                Rect::new(
+                    list_frame_area.x + 1,
+                    list_frame_area.y + 1,
+                    list_frame_area.width.saturating_sub(2),
+                    list_frame_area.height.saturating_sub(2),
+                )
+            } else {
+                content_area
+            };
             let needs_scroll = app.entries.len() > table_area.height as usize;
             let can_draw_scrollbar = app.mode_shows_main_scrollbar() && table_area.width > 2 && needs_scroll;
             let list_area = if can_draw_scrollbar {
@@ -5634,14 +5952,18 @@ fn main() -> io::Result<()> {
 
             // --- Bottom divider border ---
             let bottom_border_y = table_area.y + table_area.height;
-            if app.mode_shows_main_scrollbar() && bottom_border_y < chunks[0].y + chunks[0].height {
+            if !app.preview_enabled && app.mode_shows_main_scrollbar() && bottom_border_y < chunks[0].y + chunks[0].height {
                 f.render_widget(Block::default().borders(Borders::TOP).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)), 
                     Rect::new(chunks[0].x, bottom_border_y, chunks[0].width, 1));
             }
 
             if can_draw_scrollbar {
                 let sb_area = Rect::new(
-                    table_area.x + table_area.width.saturating_sub(1),
+                    if app.preview_enabled {
+                        list_frame_area.x + list_frame_area.width.saturating_sub(1)
+                    } else {
+                        table_area.x + table_area.width.saturating_sub(1)
+                    },
                     table_area.y,
                     1,
                     table_area.height,
@@ -5673,6 +5995,109 @@ fn main() -> io::Result<()> {
                         sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
                     }
                     f.render_widget(Paragraph::new(sb_lines), sb_area);
+                }
+            }
+
+            if let Some(preview_area) = preview_frame_area {
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Preview ")
+                    .border_style(Style::default().fg(Color::DarkGray));
+                let preview_inner = preview_block.inner(preview_area);
+                f.render_widget(preview_block, preview_area);
+
+                let preview_chunks = if app.preview_footer.is_some() && preview_inner.height > 1 {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(1)])
+                        .split(preview_inner)
+                } else {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(0)])
+                        .split(preview_inner)
+                };
+                let preview_body = preview_chunks[0];
+                let preview_footer_area = preview_chunks[1];
+
+                let preview_needs_scroll = app.preview_lines.len() > preview_body.height as usize;
+                let preview_can_draw_scrollbar = preview_body.width > 2 && preview_needs_scroll;
+                let preview_text_area = if preview_can_draw_scrollbar {
+                    Rect::new(
+                        preview_body.x,
+                        preview_body.y,
+                        preview_body.width.saturating_sub(1),
+                        preview_body.height,
+                    )
+                } else {
+                    preview_body
+                };
+
+                let visible_rows = preview_text_area.height.max(1) as usize;
+                let max_scroll = app.preview_lines.len().saturating_sub(visible_rows);
+                let offset = app.preview_scroll_offset.min(max_scroll);
+                app.preview_scroll_offset = offset;
+
+                let mut preview_lines: Vec<Line> = Vec::new();
+                for line in app.preview_lines.iter().skip(offset).take(visible_rows) {
+                    preview_lines.push(Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(Color::Rgb(210, 210, 210)),
+                    )));
+                }
+                if preview_lines.is_empty() {
+                    preview_lines.push(Line::from(Span::styled(
+                        "No preview",
+                        Style::default().fg(Color::Rgb(140, 140, 140)),
+                    )));
+                }
+                f.render_widget(Paragraph::new(preview_lines), preview_text_area);
+
+                if let Some(footer_text) = app.preview_footer.as_ref() {
+                    if preview_footer_area.height > 0 {
+                        f.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                footer_text.clone(),
+                                Style::default().fg(Color::Rgb(120, 200, 190)),
+                            )))
+                            .alignment(Alignment::Right),
+                            preview_footer_area,
+                        );
+                    }
+                }
+
+                if preview_can_draw_scrollbar {
+                    let sb_area = Rect::new(
+                        preview_area.x + preview_area.width.saturating_sub(1),
+                        preview_body.y,
+                        1,
+                        preview_body.height,
+                    );
+                    let track_h = sb_area.height as usize;
+                    if track_h > 0 {
+                        let thumb_h = ((visible_rows * track_h + app.preview_lines.len().saturating_sub(1))
+                            / app.preview_lines.len())
+                            .max(1)
+                            .min(track_h);
+                        let scroll_space = track_h.saturating_sub(thumb_h);
+                        let thumb_y = if max_scroll == 0 {
+                            0
+                        } else {
+                            (offset * scroll_space + (max_scroll / 2)) / max_scroll
+                        };
+                        let mut sb_lines: Vec<Line> = Vec::with_capacity(track_h);
+                        for row in 0..track_h {
+                            let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+                            let (ch, color) = if in_thumb {
+                                ("┃", Color::Rgb(120, 200, 190))
+                            } else {
+                                ("│", Color::DarkGray)
+                            };
+                            sb_lines.push(Line::from(Span::styled(ch, Style::default().fg(color))));
+                        }
+                        f.render_widget(Paragraph::new(sb_lines), sb_area);
+                    }
                 }
             }
 
@@ -7423,7 +7848,12 @@ fn main() -> io::Result<()> {
             status_spans.push(Span::raw(gap));
             status_spans.extend(right_spans);
             let status = Line::from(status_spans);
-            f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray))), chunks[1]);
+            let footer_block = if app.preview_enabled {
+                Block::default()
+            } else {
+                Block::default().borders(Borders::TOP).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray))
+            };
+            f.render_widget(Paragraph::new(status).block(footer_block), chunks[1]);
             let selected_total_status = if app.copy_rx.is_none() && app.archive_rx.is_none() {
                 app.selected_total_size_status()
             } else {
@@ -7474,9 +7904,27 @@ fn main() -> io::Result<()> {
 
             // Render scrollbar corners on top of all other elements only if no overlay is active
             if app.mode_shows_main_scrollbar() && !app.entries.is_empty() {
-                let table_area = Rect::new(chunks[0].x, chunks[0].y + 2, chunks[0].width, chunks[0].height.saturating_sub(2));
-                let can_draw_scrollbar = table_area.width > 2 && app.entries.len() > table_area.height as usize;
-                render_scrollbar_corners(f, table_area, can_draw_scrollbar, Color::DarkGray);
+                let table_area = Rect::new(
+                    chunks[0].x,
+                    chunks[0].y + header_reserved_rows,
+                    chunks[0].width,
+                    chunks[0].height.saturating_sub(header_reserved_rows),
+                );
+                if app.preview_enabled {
+                    let split = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                        .split(table_area);
+                    let left_can_draw_scrollbar = split[0].width > 2 && app.entries.len() > split[0].height as usize;
+                    render_scrollbar_corners(f, split[0], left_can_draw_scrollbar, Color::DarkGray);
+
+                    let preview_visible_rows = split[1].height.saturating_sub(2) as usize;
+                    let right_can_draw_scrollbar = split[1].width > 2 && app.preview_lines.len() > preview_visible_rows;
+                    render_scrollbar_corners(f, split[1], right_can_draw_scrollbar, Color::DarkGray);
+                } else {
+                    let can_draw_scrollbar = table_area.width > 2 && app.entries.len() > table_area.height as usize;
+                    render_scrollbar_corners(f, table_area, can_draw_scrollbar, Color::DarkGray);
+                }
             }
         })?;
 
@@ -7501,6 +7949,9 @@ fn main() -> io::Result<()> {
             match app.mode {
                 AppMode::Browsing => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('`') => {
+                        app.toggle_preview_mode();
+                    }
                     KeyCode::Char(';') => {
                         app.begin_input_edit(AppMode::CommandInput, String::new());
                     }
@@ -7833,8 +8284,22 @@ fn main() -> io::Result<()> {
                         };
                         app.move_selection_delta(delta);
                     }
-                    KeyCode::PageUp => { app.selected_index = app.selected_index.saturating_sub(app.page_size); app.table_state.select(Some(app.selected_index)); }
-                    KeyCode::PageDown => { if !app.entries.is_empty() { app.selected_index = (app.selected_index + app.page_size).min(app.entries.len() - 1); app.table_state.select(Some(app.selected_index)); } }
+                    KeyCode::PageUp => {
+                        if app.preview_enabled {
+                            app.preview_scroll_offset = app.preview_scroll_offset.saturating_sub(8);
+                        } else {
+                            app.selected_index = app.selected_index.saturating_sub(app.page_size);
+                            app.table_state.select(Some(app.selected_index));
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if app.preview_enabled {
+                            app.preview_scroll_offset = app.preview_scroll_offset.saturating_add(8);
+                        } else if !app.entries.is_empty() {
+                            app.selected_index = (app.selected_index + app.page_size).min(app.entries.len() - 1);
+                            app.table_state.select(Some(app.selected_index));
+                        }
+                    }
                     KeyCode::Home => { app.selected_index = 0; app.table_state.select(Some(0)); }
                     KeyCode::End => { if !app.entries.is_empty() { app.selected_index = app.entries.len() - 1; app.table_state.select(Some(app.selected_index)); } }
                     KeyCode::Left | KeyCode::Backspace => {
