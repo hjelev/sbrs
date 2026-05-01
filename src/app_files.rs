@@ -96,6 +96,13 @@ impl App {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_svg_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("svg"))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn is_audio_file(path: &PathBuf) -> bool {
         const AUDIO_EXTENSIONS: &[&str] = &[
             "mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "aif", "alac", "mid", "midi",

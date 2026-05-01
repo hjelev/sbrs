@@ -705,6 +705,7 @@ impl App {
 
         let use_bat = Self::integration_availability_and_detail("bat").0;
         let use_file = Self::integration_availability_and_detail("file").0;
+        let use_resvg = self.integration_active("resvg");
         let show_icons = self.show_icons;
         let nerd_font_active = self.nerd_font_active;
         let (tx, rx) = mpsc::channel();
@@ -715,6 +716,7 @@ impl App {
                 path,
                 use_bat,
                 use_file,
+                use_resvg,
                 show_icons,
                 nerd_font_active,
             );
@@ -781,6 +783,7 @@ impl App {
         path: PathBuf,
         use_bat: bool,
         use_file: bool,
+        use_resvg: bool,
         show_icons: bool,
         nerd_font_active: bool,
     ) -> PreviewContentMsg {
@@ -851,6 +854,24 @@ impl App {
                 request_id,
                 path,
                 message: "[file not found]".to_string(),
+            };
+        }
+
+        if App::is_svg_file(&path) && use_resvg {
+            let image_rgb = App::decode_svg_to_rgb_scaled(&path);
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let footer = Some(format!("Size: {}", App::format_size(size)));
+            let lines = if image_rgb.is_none() {
+                vec!["[svg could not be rendered]".to_string()]
+            } else {
+                Vec::new()
+            };
+            return PreviewContentMsg::Ready {
+                request_id,
+                path,
+                lines,
+                footer,
+                image_rgb,
             };
         }
 
@@ -7962,19 +7983,21 @@ fn main() -> io::Result<()> {
                                 let _ = app.preview_archive_contents(&selected_path);
                                 terminal.clear()?;
                             }
-                            else if App::is_image_file(&selected_path) {
+                            else if App::is_image_file(&selected_path)
+                                || (App::is_svg_file(&selected_path) && app.integration_active("resvg")) {
+                                let is_bitmap_image = App::is_image_file(&selected_path);
                                 if app.preview_images_with_native(selected_path.clone())? {
                                     terminal.clear()?;
                                 } else if app.preview_images_with_halfblock_fullscreen(selected_path.clone())? {
                                     terminal.clear()?;
-                                } else if app.integration_active("viu") {
+                                } else if is_bitmap_image && app.integration_active("viu") {
                                     app.preview_images_with_viu(selected_path)?;
                                     terminal.clear()?;
-                                } else if app.integration_active("chafa") {
+                                } else if is_bitmap_image && app.integration_active("chafa") {
                                     app.preview_images_with_chafa(selected_path)?;
                                     terminal.clear()?;
                                 } else {
-                                    app.set_status("image preview unavailable (native, halfblock, viu, chafa)");
+                                    app.set_status("image preview unavailable (native, halfblock, viu, chafa, resvg)");
                                 }
                             }
                             else if App::is_markdown_file(&selected_path) && app.integration_active("glow") {

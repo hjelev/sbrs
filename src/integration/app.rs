@@ -7,6 +7,7 @@ use std::{
 
 use crossterm::{
     cursor::MoveTo,
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen,
@@ -107,7 +108,7 @@ impl App {
 
     pub(crate) fn show_brew_setup_guidance(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         println!("Homebrew was not found on this system.");
         println!();
@@ -123,7 +124,7 @@ impl App {
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
         Ok(())
@@ -158,7 +159,7 @@ impl App {
         let brew = brew_path.unwrap_or_default();
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
         println!("Installing integration '{}' with Homebrew", key);
 
@@ -214,7 +215,7 @@ impl App {
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))?;
         enable_raw_mode()?;
 

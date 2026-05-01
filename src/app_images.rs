@@ -1,6 +1,10 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    env, fs,
+    hash::{Hash, Hasher},
     io::{self, Cursor, Write},
     path::PathBuf,
+    process::{Command, Stdio},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -66,6 +70,57 @@ fn avg_pixel(
 }
 
 impl App {
+    fn supports_image_slideshow_path(&self, path: &PathBuf) -> bool {
+        Self::is_image_file(path) || (self.integration_active("resvg") && Self::is_svg_file(path))
+    }
+
+    fn slideshow_images(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .map(|e| e.path())
+            .filter(|path| self.supports_image_slideshow_path(path))
+            .collect()
+    }
+
+    fn renderable_image_path(path: &PathBuf) -> Result<PathBuf, String> {
+        if Self::is_svg_file(path) {
+            return Self::svg_to_temp_png(path)
+                .ok_or_else(|| "SVG could not be rendered with resvg".to_string());
+        }
+        Ok(path.clone())
+    }
+
+    pub(crate) fn svg_to_temp_png(path: &PathBuf) -> Option<PathBuf> {
+        if !Self::is_svg_file(path) {
+            return None;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let hash = hasher.finish();
+        let output_path = env::temp_dir().join(format!("sbrs_svg_{hash:016x}.png"));
+        let _ = fs::remove_file(&output_path);
+
+        let status = Command::new("resvg")
+            .arg(path)
+            .arg(&output_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() || !output_path.exists() {
+            let _ = fs::remove_file(&output_path);
+            return None;
+        }
+
+        Some(output_path)
+    }
+
+    pub(crate) fn decode_svg_to_rgb_scaled(path: &PathBuf) -> Option<(Vec<u8>, u32, u32)> {
+        let png_path = Self::svg_to_temp_png(path)?;
+        Self::decode_image_to_rgb_scaled(&png_path)
+    }
+
     /// Compute a centered, aspect-preserving cell rectangle for native image protocols.
     /// Uses a 1:2 cell aspect model (terminal cells are roughly twice as tall as wide).
     pub(crate) fn fit_native_image_area(area: Rect, img_w: u32, img_h: u32) -> Rect {
@@ -103,12 +158,7 @@ impl App {
         &mut self,
         start_path: PathBuf,
     ) -> io::Result<bool> {
-        let images: Vec<PathBuf> = self
-            .entries
-            .iter()
-            .map(|e| e.path())
-            .filter(Self::is_image_file)
-            .collect();
+        let images = self.slideshow_images();
 
         if images.is_empty() {
             return Ok(false);
@@ -159,8 +209,9 @@ impl App {
 
                 let (tw, th) = crossterm::terminal::size().map_err(|e| e.to_string())?;
                 let image_rows = th.saturating_sub(1).max(1);
+                let render_path = Self::renderable_image_path(&images[idx])?;
 
-                if let Some((rgb, iw, ih)) = Self::decode_image_to_rgb_scaled(&images[idx]) {
+                if let Some((rgb, iw, ih)) = Self::decode_image_to_rgb_scaled(&render_path) {
                     Self::draw_halfblock_terminal(&rgb, iw, ih, tw, image_rows)
                         .map_err(|e| e.to_string())?;
                 } else {
@@ -477,12 +528,7 @@ impl App {
             return Ok(false);
         }
 
-        let images: Vec<PathBuf> = self
-            .entries
-            .iter()
-            .map(|e| e.path())
-            .filter(Self::is_image_file)
-            .collect();
+        let images = self.slideshow_images();
 
         if images.is_empty() {
             return Ok(false);
@@ -531,7 +577,8 @@ impl App {
             loop {
                 execute!(io::stdout(), TermClear(ClearType::All), MoveTo(0, 0))
                     .map_err(|e| e.to_string())?;
-                Self::emit_native_image_protocol(&images[idx], protocol, 2400)?;
+                let render_path = Self::renderable_image_path(&images[idx])?;
+                Self::emit_native_image_protocol(&render_path, protocol, 2400)?;
 
                 println!(
                     "\n  [{}]  {}/{}  [←/→ prev/next (exits at ends), q/Esc/Enter exit]",
