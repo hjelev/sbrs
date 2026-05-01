@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod dialogs;
 pub mod icons;
 pub mod list_render;
 pub mod list_temperature;
