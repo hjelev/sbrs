@@ -408,6 +408,7 @@ struct App {
     preview_rx: Option<Receiver<PreviewContentMsg>>,
     preview_request_id: u64,
     preview_pending: bool,
+    preview_cache: HashMap<PathBuf, (Vec<String>, Option<String>)>,
 }
 
 const ZIP_BASED_EXTENSIONS: &[&str] = &[
@@ -597,6 +598,7 @@ impl App {
             preview_rx: None,
             preview_request_id: 0,
             preview_pending: false,
+            preview_cache: HashMap::new(),
         };
         app.refresh_header_clock_if_needed();
         app.refresh_entries()?;
@@ -648,6 +650,15 @@ impl App {
             return;
         }
 
+        if let Some(cached) = self.preview_cache.get(&path).cloned() {
+            self.preview_target_path = Some(path);
+            self.preview_lines = cached.0;
+            self.preview_footer = cached.1;
+            self.preview_pending = false;
+            self.preview_scroll_offset = 0;
+            return;
+        }
+
         self.preview_request_id = self.preview_request_id.saturating_add(1);
         let request_id = self.preview_request_id;
         self.preview_target_path = Some(path.clone());
@@ -656,8 +667,8 @@ impl App {
         self.preview_lines = vec!["Loading preview...".to_string()];
         self.preview_footer = None;
 
-        let use_bat = self.integration_active("bat");
-        let use_file = self.integration_active("file");
+        let use_bat = Self::integration_availability_and_detail("bat").0;
+        let use_file = Self::integration_availability_and_detail("file").0;
         let show_icons = self.show_icons;
         let nerd_font_active = self.nerd_font_active;
         let (tx, rx) = mpsc::channel();
@@ -687,7 +698,9 @@ impl App {
                 footer,
             }) => {
                 if request_id == self.preview_request_id {
-                    self.preview_target_path = Some(path);
+                    self.preview_target_path = Some(path.clone());
+                    self.preview_cache
+                        .insert(path.clone(), (lines.clone(), footer.clone()));
                     self.preview_lines = lines;
                     self.preview_footer = footer;
                     self.preview_pending = false;
@@ -794,6 +807,26 @@ impl App {
         }
 
         let mut lines: Vec<String> = Vec::new();
+
+        if App::is_image_file(&path) {
+            lines.push("[image preview unavailable in pane]".to_string());
+            if use_file {
+                if let Ok(out) = Command::new("file").arg("-b").arg(&path).output() {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !text.is_empty() {
+                        lines.push(text);
+                    }
+                }
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let footer = Some(format!("Size: {}", App::format_size(size)));
+            return PreviewContentMsg::Ready {
+                request_id,
+                path,
+                lines,
+                footer,
+            };
+        }
 
         if App::is_binary_file(&path) {
             lines.push("[binary file]".to_string());
@@ -1484,7 +1517,7 @@ fi
 
 while true; do
   clear
-  chafa -- "${paths[$idx]}"
+    chafa --format symbols --colors none --polite on --relative off --optimize 0 -- "${paths[$idx]}"
   printf '\n[←/→ prev/next (exits at ends), q/Esc/Enter exit]\n'
 
   IFS= read -rsn1 key || break
@@ -1535,6 +1568,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
+        Self::drain_pending_terminal_events();
 
         if let Some(name) = images[idx].file_name() {
             self.select_entry_named(&name.to_string_lossy());
@@ -1583,7 +1617,7 @@ fi
 
 while true; do
   clear
-  viu -- "${paths[$idx]}"
+    viu -b -- "${paths[$idx]}"
   printf '\n[←/→ prev/next (exits at ends), q/Esc/Enter exit]\n'
 
   IFS= read -rsn1 key || break
@@ -1634,12 +1668,28 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
 
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         enable_raw_mode()?;
+        Self::drain_pending_terminal_events();
 
         if let Some(name) = images[idx].file_name() {
             self.select_entry_named(&name.to_string_lossy());
         }
 
         Ok(())
+    }
+
+    fn drain_pending_terminal_events() {
+        let mut drained = 0usize;
+        while drained < 512 {
+            match event::poll(Duration::from_millis(0)) {
+                Ok(true) => {
+                    if event::read().is_err() {
+                        break;
+                    }
+                    drained += 1;
+                }
+                Ok(false) | Err(_) => break,
+            }
+        }
     }
 
     fn create_temp_selection_path(prefix: &str) -> PathBuf {
