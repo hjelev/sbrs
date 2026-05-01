@@ -8,18 +8,19 @@ pub struct IntegrationRow {
     pub category: String,
     pub description: String,
     pub available: bool,
+    pub partially_supported: bool,
     pub required: bool,
 }
 
-pub fn build_integration_rows<FEnabled, FAvailable>(
+pub fn build_integration_rows<FEnabled, FSupport>(
     all_on: bool,
     catalog: Vec<IntegrationSpec>,
     mut is_enabled: FEnabled,
-    mut availability: FAvailable,
+    mut support: FSupport,
 ) -> Vec<IntegrationRow>
 where
     FEnabled: FnMut(&str) -> bool,
-    FAvailable: FnMut(&str) -> bool,
+    FSupport: FnMut(&str) -> (bool, bool),
 {
     let mut rows = Vec::new();
     rows.push(IntegrationRow {
@@ -33,16 +34,21 @@ where
         category: "global".to_string(),
         description: "Toggle all optional integrations on/off".to_string(),
         available: true,
+        partially_supported: false,
         required: false,
     });
 
     for spec in catalog {
-        let available = availability(spec.key);
+        let (available, partially_supported) = support(spec.key);
         let enabled = is_enabled(spec.key);
         let state = if spec.required {
             "[required]".to_string()
+        } else if !available && !partially_supported {
+            "[missing]".to_string()
         } else if enabled && available {
             "[active]".to_string()
+        } else if enabled && partially_supported {
+            "[partial]".to_string()
         } else if enabled {
             "[on]".to_string()
         } else {
@@ -56,6 +62,7 @@ where
             category: spec.category.to_string(),
             description: spec.description.to_string(),
             available,
+            partially_supported,
             required: spec.required,
         });
     }

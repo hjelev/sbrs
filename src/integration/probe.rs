@@ -105,20 +105,25 @@ pub fn bat_tool() -> Option<String> {
 }
 
 pub fn integration_availability_and_detail(key: &str) -> (bool, String) {
+    let (available, _, detail) = integration_support_and_detail(key);
+    (available, detail)
+}
+
+pub fn integration_support_and_detail(key: &str) -> (bool, bool, String) {
     match key {
         "$EDITOR" => {
             let editor_var = env::var("EDITOR").unwrap_or_else(|_| "(not set)".to_string());
             let editor_cmd = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
             let (ok, path) = integration_probe(&editor_cmd);
             if ok {
-                (true, path)
+                (true, false, path)
             } else {
-                (false, format!("$EDITOR={}", editor_var))
+                (false, false, format!("$EDITOR={}", editor_var))
             }
         }
         "age" => {
             let (age_ok, age_path) = integration_probe("age");
-            (age_ok, age_path)
+            (age_ok, false, age_path)
         }
         "zip" => {
             let (zip_ok, zip_path) = integration_probe("zip");
@@ -132,7 +137,7 @@ pub fn integration_availability_and_detail(key: &str) -> (bool, String) {
             } else {
                 String::new()
             };
-            (zip_ok || unzip_ok, detail)
+            (zip_ok || unzip_ok, false, detail)
         }
         "sox" => {
             let (play_ok, play_path) = integration_probe("play");
@@ -144,34 +149,48 @@ pub fn integration_availability_and_detail(key: &str) -> (bool, String) {
             } else {
                 String::new()
             };
-            (play_ok || sox_ok, detail)
+            (play_ok || sox_ok, false, detail)
         }
         "bat" => {
             if let Some(path) = bat_tool() {
-                (true, path)
+                (true, false, path)
             } else {
-                (false, String::new())
+                (false, false, String::new())
             }
         }
-        "tar" => integration_probe("tar"),
+        "tar" => {
+            let (ok, detail) = integration_probe("tar");
+            (ok, false, detail)
+        }
         "7z" => {
             if let Some(path) = seven_zip_tool() {
-                (true, path)
+                (true, false, path)
             } else {
-                (false, String::new())
+                (false, false, String::new())
             }
         }
         "rar" => {
             if let Some(path) = rar_tool() {
-                (true, path)
+                (true, false, path)
             } else {
-                (false, String::new())
+                (false, false, String::new())
             }
         }
         "image-native" => {
             let (protocol, detail) = terminal_image_protocol();
-            (protocol != TerminalImageProtocol::Unsupported, detail)
+            if protocol != TerminalImageProtocol::Unsupported {
+                (true, false, detail)
+            } else {
+                (
+                    false,
+                    true,
+                    "no native protocol detected (halfblock fallback available)".to_string(),
+                )
+            }
         }
-        other => integration_probe(other),
+        other => {
+            let (ok, detail) = integration_probe(other);
+            (ok, false, detail)
+        }
     }
 }

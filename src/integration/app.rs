@@ -100,8 +100,9 @@ impl App {
         self.integration_install_key = Some(row.key);
         self.integration_install_package = Some(package.to_string());
         self.integration_install_brew_path = Self::brew_command_path();
+        self.confirm_integration_install_button_focus = 0;
         self.mode = AppMode::ConfirmIntegrationInstall;
-        self.set_status("confirm integration install: y to continue");
+        self.set_status("confirm integration install");
     }
 
     pub(crate) fn show_brew_setup_guidance(&mut self) -> io::Result<()> {
@@ -241,6 +242,10 @@ impl App {
         probe::integration_availability_and_detail(key)
     }
 
+    pub(crate) fn integration_support_and_detail(key: &str) -> (bool, bool, String) {
+        probe::integration_support_and_detail(key)
+    }
+
     pub(crate) fn terminal_image_protocol() -> (probe::TerminalImageProtocol, String) {
         probe::terminal_image_protocol()
     }
@@ -273,6 +278,11 @@ impl App {
 
     pub(crate) fn set_all_optional_integrations(&mut self, enabled: bool) {
         for spec in Self::integration_catalog().iter().filter(|s| !s.required) {
+            let (available, partially_supported, _) =
+                Self::integration_support_and_detail(spec.key);
+            if !available && !partially_supported {
+                continue;
+            }
             self.integration_overrides
                 .insert(spec.key.to_string(), enabled);
         }
@@ -290,7 +300,11 @@ impl App {
             self.all_optional_integrations_enabled(),
             Self::integration_catalog(),
             |key| self.integration_enabled(key),
-            |key| Self::integration_availability_and_detail(key).0,
+            |key| {
+                let (available, partially_supported, _) =
+                    Self::integration_support_and_detail(key);
+                (available, partially_supported)
+            },
         )
     }
 

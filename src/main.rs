@@ -344,6 +344,7 @@ struct App {
     file_list_scroll_dragging: bool,
     file_list_scroll_grab_offset: u16,
     confirm_delete_button_focus: u8,
+    confirm_integration_install_button_focus: u8,
     git_info_cache: Option<GitInfoCache>,
     git_info_rx: Option<Receiver<(PathBuf, Option<(String, bool, Option<(String, u64)>)>)>>,
     folder_size_enabled: bool,
@@ -538,6 +539,7 @@ impl App {
             file_list_scroll_dragging: false,
             file_list_scroll_grab_offset: 0,
             confirm_delete_button_focus: 0,
+            confirm_integration_install_button_focus: 0,
             git_info_cache: None,
             git_info_rx: None,
             folder_size_enabled: false,
@@ -4874,6 +4876,100 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         false
     }
 
+    fn handle_confirm_integration_install_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if self.mode != AppMode::ConfirmIntegrationInstall {
+            return false;
+        }
+
+        let key = self
+            .integration_install_key
+            .clone()
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let package = self
+            .integration_install_package
+            .clone()
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let brew_display = self
+            .integration_install_brew_path
+            .clone()
+            .unwrap_or_else(|| "brew (not found)".to_string());
+
+        let mut msg_lines: Vec<String> = vec![
+            "Install missing integration?".to_string(),
+            String::new(),
+            format!(" Integration: {}", key),
+            format!(" Package:     {}", package),
+            format!(" Command:     {} install {}", brew_display, package),
+            String::new(),
+        ];
+        if self.integration_install_brew_path.is_none() {
+            msg_lines.push("Homebrew is not installed; setup guidance will be shown first.".to_string());
+            msg_lines.push(String::new());
+        }
+        msg_lines.push("  Enter: activate selected button   ←/→/Tab: switch".to_string());
+
+        let content_w = msg_lines
+            .iter()
+            .map(|line| line.chars().count() as u16)
+            .max()
+            .unwrap_or(36);
+        let content_h = msg_lines.len() as u16;
+        let max_w = area.width.saturating_sub(4).max(1);
+        let max_h = area.height.saturating_sub(4).max(1);
+        let dialog_w = (content_w + 2).max(56).min(max_w);
+        let full_dialog_h = (content_h + 4).max(10).min(max_h);
+        let dialog_h = full_dialog_h;
+        let confirm_area = Rect::new(
+            (area.width.saturating_sub(dialog_w)) / 2,
+            (area.height.saturating_sub(dialog_h)) / 2,
+            dialog_w,
+            dialog_h,
+        );
+
+        let inner = Rect::new(
+            confirm_area.x.saturating_add(1),
+            confirm_area.y.saturating_add(1),
+            confirm_area.width.saturating_sub(2),
+            confirm_area.height.saturating_sub(2),
+        );
+        if inner.width == 0 || inner.height == 0 {
+            return false;
+        }
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let button_area = sections[1];
+        if row != button_area.y {
+            return false;
+        }
+
+        let prefix_w = 2u16;
+        let ok_w = "  OK  ".chars().count() as u16;
+        let gap_w = 4u16;
+        let cancel_w = "  Cancel  ".chars().count() as u16;
+        let total_w = prefix_w + ok_w + gap_w + cancel_w;
+        if button_area.width < total_w {
+            return false;
+        }
+
+        let start_x = button_area.x + (button_area.width - total_w) / 2;
+        let ok_start = start_x + prefix_w;
+        let cancel_start = ok_start + ok_w + gap_w;
+
+        if column >= ok_start && column < ok_start + ok_w {
+            self.confirm_integration_install_button_focus = 0;
+            return true;
+        }
+        if column >= cancel_start && column < cancel_start + cancel_w {
+            self.confirm_integration_install_button_focus = 1;
+            return true;
+        }
+
+        false
+    }
+
     fn inner_with_borders(area: Rect) -> Rect {
         Rect::new(
             area.x.saturating_add(1),
@@ -5297,6 +5393,9 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                     return Some(key);
                 }
                 let _ = self.handle_confirm_delete_click(mouse.column, mouse.row, area);
+                if self.handle_confirm_integration_install_click(mouse.column, mouse.row, area) {
+                    return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.file_list_scroll_dragging {
@@ -6455,7 +6554,7 @@ fn main() -> io::Result<()> {
                 if app.internal_search_results.is_empty() {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        "No matches",
+                        " No matches",
                         Style::default().fg(Color::Rgb(180, 90, 90)),
                     )));
                 } else {
@@ -7272,11 +7371,17 @@ fn main() -> io::Result<()> {
                     let is_selected = i == app.integration_selected;
                     let status_text = if row.required || (app.integration_enabled(&row.key) && row.available) {
                         " ✓ ".to_string()
+                    } else if app.integration_enabled(&row.key) && row.partially_supported {
+                        " ✓ ".to_string()
                     } else {
                         " ✕ ".to_string()
                     };
                     let status_style = if row.required || (app.integration_enabled(&row.key) && row.available) {
                         Style::default().fg(Color::Rgb(100, 220, 120))
+                    } else if app.integration_enabled(&row.key) && row.partially_supported {
+                        Style::default().fg(Color::Rgb(245, 200, 90))
+                    } else if !row.available && !row.partially_supported {
+                        Style::default().fg(Color::Rgb(220, 80, 80))
                     } else {
                         Style::default().fg(Color::Rgb(220, 80, 80))
                     };
@@ -7295,6 +7400,10 @@ fn main() -> io::Result<()> {
                         state_text.clone(),
                         if row.required {
                             base_style.fg(Color::Rgb(200, 200, 200))
+                        } else if !row.available && !row.partially_supported {
+                            base_style.fg(Color::Rgb(220, 80, 80))
+                        } else if app.integration_enabled(&row.key) && row.partially_supported {
+                            base_style.fg(Color::Rgb(245, 200, 90))
                         } else if app.integration_enabled(&row.key) {
                             base_style.fg(Color::Rgb(255, 220, 140))
                         } else {
@@ -7693,7 +7802,7 @@ fn main() -> io::Result<()> {
                     msg_lines.push(String::new());
                 }
 
-                msg_lines.push("  y = install    n / Esc = cancel".to_string());
+                msg_lines.push("  Enter: activate selected button   ←/→/Tab: switch".to_string());
 
                 let msg = msg_lines.join("\n");
                 let content_w = msg_lines
@@ -7707,9 +7816,10 @@ fn main() -> io::Result<()> {
                 let dialog_w = (content_w + 2)
                     .max(56)
                     .min(max_w);
-                let dialog_h = (content_h + 2)
-                    .max(8)
+                let full_dialog_h = (content_h + 4)
+                    .max(10)
                     .min(max_h);
+                let dialog_h = full_dialog_h;
                 let confirm_area = Rect::new(
                     (area.width.saturating_sub(dialog_w)) / 2,
                     (area.height.saturating_sub(dialog_h)) / 2,
@@ -7717,13 +7827,62 @@ fn main() -> io::Result<()> {
                     dialog_h,
                 );
                 f.render_widget(Clear, confirm_area);
+                let title = if app.nerd_font_active {
+                    " \u{f01da} Install Integration "
+                } else {
+                    " Install Integration "
+                };
+
+                let inner = Rect::new(
+                    confirm_area.x.saturating_add(1),
+                    confirm_area.y.saturating_add(1),
+                    confirm_area.width.saturating_sub(2),
+                    confirm_area.height.saturating_sub(2),
+                );
                 f.render_widget(
                     Paragraph::new(msg)
                         .wrap(Wrap { trim: true })
                         .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Install Integration ").title_style(Style::default().fg(Color::White))),
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title).title_style(Style::default().fg(Color::White))),
                     confirm_area,
                 );
+
+                if inner.width > 0 && inner.height > 0 {
+                    let sections = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(1)])
+                        .split(inner);
+
+                    let ok_focused = app.confirm_integration_install_button_focus == 0;
+                    let cancel_focused = !ok_focused;
+                    let ok_style = if ok_focused {
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 30))
+                            .bg(Color::Rgb(120, 220, 140))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(200, 220, 200))
+                    };
+                    let cancel_style = if cancel_focused {
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 30))
+                            .bg(Color::Rgb(200, 200, 220))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 200, 200))
+                    };
+
+                    let button_line = Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("  OK  ", ok_style),
+                        Span::styled("    ", Style::default()),
+                        Span::styled("  Cancel  ", cancel_style),
+                    ]);
+                    f.render_widget(
+                        Paragraph::new(button_line).alignment(Alignment::Center),
+                        sections[1],
+                    );
+                }
             } else if app.mode == AppMode::ConfirmDelete {
                 let area = f.size();
                 let to_delete = app.delete_targets();
@@ -9321,6 +9480,13 @@ fn main() -> io::Result<()> {
                             } else {
                                 let catalog = App::integration_catalog();
                                 if let Some(spec) = catalog.get(app.integration_selected - 1) {
+                                    let (available, partially_supported, _) =
+                                        App::integration_support_and_detail(spec.key);
+                                    if !available && !partially_supported {
+                                        app.set_status(format!("{} is missing and cannot be toggled", spec.key));
+                                        app.refresh_integration_rows_cache();
+                                        continue;
+                                    }
                                     let current = app.integration_enabled(spec.key);
                                     app.set_integration_enabled(spec.key, !current);
                                 }
@@ -9564,14 +9730,32 @@ fn main() -> io::Result<()> {
                     _ => {}
                 },
                 AppMode::ConfirmIntegrationInstall => match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        app.confirm_integration_install_button_focus = 0;
+                    }
+                    KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                        app.confirm_integration_install_button_focus = 1;
+                    }
                     KeyCode::Char('y') => {
+                        app.confirm_integration_install_button_focus = 0;
                         app.confirm_integration_install()?;
                         terminal.clear()?;
                     }
                     KeyCode::Char('n') | KeyCode::Esc => {
+                        app.confirm_integration_install_button_focus = 1;
                         app.mode = AppMode::Integrations;
                         app.clear_integration_install_prompt();
                         app.set_status("integration install cancelled");
+                    }
+                    KeyCode::Enter => {
+                        if app.confirm_integration_install_button_focus == 0 {
+                            app.confirm_integration_install()?;
+                            terminal.clear()?;
+                        } else {
+                            app.mode = AppMode::Integrations;
+                            app.clear_integration_install_prompt();
+                            app.set_status("integration install cancelled");
+                        }
                     }
                     _ => {}
                 },
