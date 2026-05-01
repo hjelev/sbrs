@@ -3,6 +3,56 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalImageProtocol {
+    Kitty,
+    Iterm2Inline,
+    Sixel,
+    Unsupported,
+}
+
+impl TerminalImageProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            TerminalImageProtocol::Kitty => "kitty",
+            TerminalImageProtocol::Iterm2Inline => "iterm2-inline",
+            TerminalImageProtocol::Sixel => "sixel",
+            TerminalImageProtocol::Unsupported => "unsupported",
+        }
+    }
+}
+
+pub fn terminal_image_protocol() -> (TerminalImageProtocol, String) {
+    let term = env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase();
+
+    if env::var_os("KITTY_WINDOW_ID").is_some()
+        || env::var_os("KONSOLE_VERSION").is_some()
+        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+        || term.contains("kitty")
+        || term.contains("konsole")
+        || term_program.contains("warp")
+    {
+        return (TerminalImageProtocol::Kitty, "env-detected kitty protocol".to_string());
+    }
+
+    if term_program.contains("iterm") || term_program.contains("wezterm") {
+        return (
+            TerminalImageProtocol::Iterm2Inline,
+            "env-detected iTerm2 inline protocol".to_string(),
+        );
+    }
+
+    if env::var_os("WT_SESSION").is_some() || term.contains("foot") {
+        return (TerminalImageProtocol::Sixel, "env-detected sixel protocol".to_string());
+    }
+
+    (
+        TerminalImageProtocol::Unsupported,
+        "no known image protocol detected".to_string(),
+    )
+}
+
 pub fn integration_probe(cmd: &str) -> (bool, String) {
     if let Ok(out) = Command::new("which").arg(cmd).output() {
         if out.status.success() {
@@ -117,6 +167,10 @@ pub fn integration_availability_and_detail(key: &str) -> (bool, String) {
             } else {
                 (false, String::new())
             }
+        }
+        "image-native" => {
+            let (protocol, detail) = terminal_image_protocol();
+            (protocol != TerminalImageProtocol::Unsupported, detail)
         }
         other => integration_probe(other),
     }

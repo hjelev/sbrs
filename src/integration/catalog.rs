@@ -32,8 +32,9 @@ pub fn integration_catalog() -> Vec<IntegrationSpec> {
         IntegrationSpec { key: "fuse-zip", description: "browse zip-based archives as folders", category: "archive", required: false },
         IntegrationSpec { key: "archivemount", description: "browse tar/zip archives as folders (Enter)", category: "archive", required: false },
         IntegrationSpec { key: "sox", description: "play audio files on Enter", category: "preview", required: false },
-        IntegrationSpec { key: "viu", description: "image preview on Enter (preferred)", category: "preview", required: false },
-        IntegrationSpec { key: "chafa", description: "image preview on Enter", category: "preview", required: false },
+        IntegrationSpec { key: "image-native", description: "native terminal image protocol preview (kitty/iterm2/sixel)", category: "preview", required: false },
+        IntegrationSpec { key: "viu", description: "image preview on Enter (fallback)", category: "preview", required: false },
+        IntegrationSpec { key: "chafa", description: "image preview on Enter (fallback)", category: "preview", required: false },
         IntegrationSpec { key: "sshfs", description: "mount SSH hosts via S picker", category: "network", required: false },
         IntegrationSpec { key: "rclone", description: "mount rclone remotes via S picker", category: "network", required: false },
         IntegrationSpec { key: "tmux", description: "split shell + less preview (i), editor (E)", category: "terminal", required: false },
@@ -48,7 +49,7 @@ pub fn integration_catalog() -> Vec<IntegrationSpec> {
 
 pub fn integration_brew_package(key: &str) -> Option<&'static str> {
     match key {
-        "__all_optional__" | "$EDITOR" | "less" | "pbcopy" => None,
+        "__all_optional__" | "$EDITOR" | "less" | "pbcopy" | "image-native" => None,
         "git" => Some("git"),
         "bat" => Some("bat"),
         "glow" => Some("glow"),

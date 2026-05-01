@@ -241,6 +241,10 @@ impl App {
         probe::integration_availability_and_detail(key)
     }
 
+    pub(crate) fn terminal_image_protocol() -> (probe::TerminalImageProtocol, String) {
+        probe::terminal_image_protocol()
+    }
+
     pub(crate) fn integration_enabled(&self, key: &str) -> bool {
         if Self::integration_catalog()
             .iter()

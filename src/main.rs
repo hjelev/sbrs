@@ -49,6 +49,7 @@ use unicode_width::UnicodeWidthStr;
 mod integration;
 mod app_archive;
 mod app_git;
+mod app_images;
 mod app_input;
 mod app_files;
 mod app_meta;
@@ -272,6 +273,7 @@ enum PreviewContentMsg {
         path: PathBuf,
         lines: Vec<String>,
         footer: Option<String>,
+        image_rgb: Option<(Vec<u8>, u32, u32)>,
     },
     Failed {
         request_id: u64,
@@ -409,6 +411,10 @@ struct App {
     preview_request_id: u64,
     preview_pending: bool,
     preview_cache: HashMap<PathBuf, (Vec<String>, Option<String>)>,
+    preview_native_area: Option<Rect>,
+    preview_native_last_key: Option<String>,
+    preview_image_rgb: Option<(Vec<u8>, u32, u32)>,
+    preview_image_png: Option<Vec<u8>>,
 }
 
 const ZIP_BASED_EXTENSIONS: &[&str] = &[
@@ -599,6 +605,10 @@ impl App {
             preview_request_id: 0,
             preview_pending: false,
             preview_cache: HashMap::new(),
+            preview_native_area: None,
+            preview_native_last_key: None,
+            preview_image_rgb: None,
+            preview_image_png: None,
         };
         app.refresh_header_clock_if_needed();
         app.refresh_entries()?;
@@ -623,13 +633,28 @@ impl App {
         if self.preview_enabled {
             self.preview_lines = vec!["Loading preview...".to_string()];
             self.preview_footer = None;
+            self.preview_image_rgb = None;
+            self.preview_image_png = None;
+            self.preview_native_last_key = None;
             self.request_preview_for_selected();
         } else {
+            if self.preview_native_last_key.is_some()
+                && matches!(
+                    Self::terminal_image_protocol().0,
+                    crate::integration::probe::TerminalImageProtocol::Kitty
+                )
+            {
+                let _ = Self::clear_kitty_pane_images();
+            }
             self.preview_target_path = None;
             self.preview_lines.clear();
             self.preview_footer = None;
             self.preview_pending = false;
             self.preview_rx = None;
+            self.preview_native_area = None;
+            self.preview_native_last_key = None;
+            self.preview_image_rgb = None;
+            self.preview_image_png = None;
         }
     }
 
@@ -643,20 +668,29 @@ impl App {
             self.preview_target_path = None;
             self.preview_pending = false;
             self.preview_rx = None;
+            self.preview_image_rgb = None;
+            self.preview_image_png = None;
             return;
         };
 
-        if self.preview_target_path.as_ref() == Some(&path) && (self.preview_pending || !self.preview_lines.is_empty()) {
+        if self.preview_target_path.as_ref() == Some(&path) && (self.preview_pending || !self.preview_lines.is_empty() || self.preview_image_rgb.is_some()) {
             return;
         }
 
-        if let Some(cached) = self.preview_cache.get(&path).cloned() {
-            self.preview_target_path = Some(path);
-            self.preview_lines = cached.0;
-            self.preview_footer = cached.1;
-            self.preview_pending = false;
-            self.preview_scroll_offset = 0;
-            return;
+        // Path changed: clear stale image data.
+        self.preview_image_rgb = None;
+        self.preview_image_png = None;
+
+        // Image files skip text cache (their render path uses decoded RGB).
+        if !Self::is_image_file(&path) {
+            if let Some(cached) = self.preview_cache.get(&path).cloned() {
+                self.preview_target_path = Some(path);
+                self.preview_lines = cached.0;
+                self.preview_footer = cached.1;
+                self.preview_pending = false;
+                self.preview_scroll_offset = 0;
+                return;
+            }
         }
 
         self.preview_request_id = self.preview_request_id.saturating_add(1);
@@ -696,13 +730,22 @@ impl App {
                 path,
                 lines,
                 footer,
+                image_rgb,
             }) => {
                 if request_id == self.preview_request_id {
                     self.preview_target_path = Some(path.clone());
-                    self.preview_cache
-                        .insert(path.clone(), (lines.clone(), footer.clone()));
+                    if image_rgb.is_none() {
+                        self.preview_cache
+                            .insert(path.clone(), (lines.clone(), footer.clone()));
+                    }
                     self.preview_lines = lines;
                     self.preview_footer = footer;
+                    if let Some((ref rgb, w, h)) = image_rgb {
+                        self.preview_image_png = App::encode_rgb_to_png(rgb, w, h);
+                    } else {
+                        self.preview_image_png = None;
+                    }
+                    self.preview_image_rgb = image_rgb;
                     self.preview_pending = false;
                     self.preview_scroll_offset = 0;
                 }
@@ -716,6 +759,8 @@ impl App {
                     self.preview_target_path = Some(path);
                     self.preview_lines = vec![message];
                     self.preview_footer = None;
+                self.preview_image_rgb = None;
+                self.preview_image_png = None;
                     self.preview_pending = false;
                     self.preview_scroll_offset = 0;
                 }
@@ -795,6 +840,7 @@ impl App {
                 path,
                 lines: entries,
                 footer,
+                image_rgb: None,
             };
         }
 
@@ -806,27 +852,25 @@ impl App {
             };
         }
 
-        let mut lines: Vec<String> = Vec::new();
-
         if App::is_image_file(&path) {
-            lines.push("[image preview unavailable in pane]".to_string());
-            if use_file {
-                if let Ok(out) = Command::new("file").arg("-b").arg(&path).output() {
-                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !text.is_empty() {
-                        lines.push(text);
-                    }
-                }
-            }
+            let image_rgb = App::decode_image_to_rgb_scaled(&path);
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let footer = Some(format!("Size: {}", App::format_size(size)));
+            let lines = if image_rgb.is_none() {
+                vec!["[image could not be decoded]".to_string()]
+            } else {
+                Vec::new()
+            };
             return PreviewContentMsg::Ready {
                 request_id,
                 path,
                 lines,
                 footer,
+                image_rgb,
             };
         }
+
+        let mut lines: Vec<String> = Vec::new();
 
         if App::is_binary_file(&path) {
             lines.push("[binary file]".to_string());
@@ -845,6 +889,7 @@ impl App {
                 path,
                 lines,
                 footer,
+                image_rgb: None,
             };
         }
 
@@ -885,6 +930,7 @@ impl App {
             path,
             lines,
             footer,
+            image_rgb: None,
         }
     }
 
@@ -1522,7 +1568,8 @@ while true; do
 
   IFS= read -rsn1 key || break
   if [[ "$key" == $'\x1b' ]]; then
-    IFS= read -rsn2 key2
+        # Read arrow-sequence tail without blocking so lone Esc exits immediately.
+        IFS= read -rsn2 -t 0.02 key2 || key2=""
     key+="$key2"
   fi
 
@@ -1622,7 +1669,8 @@ while true; do
 
   IFS= read -rsn1 key || break
   if [[ "$key" == $'\x1b' ]]; then
-    IFS= read -rsn2 key2
+        # Read arrow-sequence tail without blocking so lone Esc exits immediately.
+        IFS= read -rsn2 -t 0.02 key2 || key2=""
     key+="$key2"
   fi
 
@@ -5461,14 +5509,18 @@ fn main() -> io::Result<()> {
             } else {
                 Span::raw(header_sep)
             };
-            let mut left_spans: Vec<Span> = vec![
-                header_sep_span,
-                if app.mode == AppMode::PathEditing {
-                    Span::styled(current_display_path.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
-                } else {
-                    Span::raw(current_display_path.as_str())
-                },
-            ];
+            let mut left_spans: Vec<Span> = if app.preview_enabled {
+                vec![]
+            } else {
+                vec![
+                    header_sep_span,
+                    if app.mode == AppMode::PathEditing {
+                        Span::styled(current_display_path.as_str(), Style::default().fg(Color::Rgb(255, 220, 120)))
+                    } else {
+                        Span::raw(current_display_path.as_str())
+                    },
+                ]
+            };
             if app.integration_enabled("git") {
                 if let Some((branch, is_dirty, tag_info)) = app.cached_git_info_for_current_dir() {
                     let branch_style = Style::default().fg(Color::Rgb(100, 150, 255));
@@ -5692,9 +5744,40 @@ fn main() -> io::Result<()> {
             };
 
             if app.preview_enabled {
+                let path_text = if app.mode == AppMode::PathEditing {
+                    app.input_buffer.clone()
+                } else {
+                    app.current_dir_display_path_with_filter()
+                };
+                let cwd_symlink = fs::symlink_metadata(&app.current_dir)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                let (folder_icon, folder_icon_style) = App::icon_for_path(
+                    &app.current_dir,
+                    app.show_icons,
+                    app.nerd_font_active,
+                    cwd_symlink,
+                );
+                let mut left_title_spans: Vec<Span> = Vec::new();
+                left_title_spans.push(Span::raw(" "));
+                if !folder_icon.is_empty() {
+                    left_title_spans.push(Span::styled(folder_icon, folder_icon_style));
+                    left_title_spans.push(Span::raw(" "));
+                }
+                if app.mode == AppMode::PathEditing {
+                    left_title_spans.push(Span::styled(
+                        path_text,
+                        Style::default().fg(Color::Rgb(255, 220, 120)),
+                    ));
+                } else {
+                    left_title_spans.push(Span::styled(path_text, Style::default().fg(Color::White)));
+                }
+                left_title_spans.push(Span::raw(" "));
+
                 let left_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .title(Line::from(left_title_spans))
                     .border_style(Style::default().fg(Color::DarkGray));
                 f.render_widget(left_block, list_frame_area);
             }
@@ -6048,11 +6131,45 @@ fn main() -> io::Result<()> {
                 }
             }
 
+            app.preview_native_area = None;
             if let Some(preview_area) = preview_frame_area {
+                let title_path = app
+                    .preview_target_path
+                    .clone()
+                    .or_else(|| app.entries.get(app.selected_index).map(|e| e.path()));
+                let preview_title = if let Some(path) = title_path {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or("Preview")
+                        .to_string();
+                    let is_symlink = fs::symlink_metadata(&path)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    let (icon_glyph, icon_style) = App::icon_for_path(
+                        &path,
+                        app.show_icons,
+                        app.nerd_font_active,
+                        is_symlink,
+                    );
+                    let mut spans = Vec::new();
+                    spans.push(Span::raw(" "));
+                    if !icon_glyph.is_empty() {
+                        spans.push(Span::styled(icon_glyph, icon_style));
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::styled(name, Style::default().fg(Color::Rgb(220, 220, 220))));
+                    spans.push(Span::raw(" "));
+                    Line::from(spans)
+                } else {
+                    Line::from(Span::raw(" Preview "))
+                };
+
                 let preview_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Preview ")
+                    .title(preview_title)
                     .border_style(Style::default().fg(Color::DarkGray));
                 let preview_inner = preview_block.inner(preview_area);
                 f.render_widget(preview_block, preview_area);
@@ -6084,25 +6201,35 @@ fn main() -> io::Result<()> {
                     preview_body
                 };
 
+                app.preview_native_area = Some(preview_text_area);
+
                 let visible_rows = preview_text_area.height.max(1) as usize;
                 let max_scroll = app.preview_lines.len().saturating_sub(visible_rows);
                 let offset = app.preview_scroll_offset.min(max_scroll);
                 app.preview_scroll_offset = offset;
 
-                let mut preview_lines: Vec<Line> = Vec::new();
-                for line in app.preview_lines.iter().skip(offset).take(visible_rows) {
-                    preview_lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(Color::Rgb(210, 210, 210)),
-                    )));
-                }
-                if preview_lines.is_empty() {
-                    preview_lines.push(Line::from(Span::styled(
-                        "No preview",
-                        Style::default().fg(Color::Rgb(140, 140, 140)),
-                    )));
-                }
-                f.render_widget(Paragraph::new(preview_lines), preview_text_area);
+                let rendered_lines: Vec<Line> = if let Some((ref rgb, iw, ih)) = app.preview_image_rgb {
+                    App::halfblock_lines(rgb, iw, ih, preview_text_area.width, preview_text_area.height)
+                } else {
+                    let mut tlines: Vec<Line> = app
+                        .preview_lines
+                        .iter()
+                        .skip(offset)
+                        .take(visible_rows)
+                        .map(|line| Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().fg(Color::Rgb(210, 210, 210)),
+                        )))
+                        .collect();
+                    if tlines.is_empty() {
+                        tlines.push(Line::from(Span::styled(
+                            "No preview",
+                            Style::default().fg(Color::Rgb(140, 140, 140)),
+                        )));
+                    }
+                    tlines
+                };
+                f.render_widget(Paragraph::new(rendered_lines), preview_text_area);
 
                 if let Some(footer_text) = app.preview_footer.as_ref() {
                     if preview_footer_area.height > 0 {
@@ -7961,22 +8088,63 @@ fn main() -> io::Result<()> {
                     chunks[0].height.saturating_sub(header_reserved_rows),
                 );
                 if app.preview_enabled {
-                    let split = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
-                        .split(table_area);
-                    let left_can_draw_scrollbar = split[0].width > 2 && app.entries.len() > split[0].height as usize;
-                    render_scrollbar_corners(f, split[0], left_can_draw_scrollbar, Color::DarkGray);
-
-                    let preview_visible_rows = split[1].height.saturating_sub(2) as usize;
-                    let right_can_draw_scrollbar = split[1].width > 2 && app.preview_lines.len() > preview_visible_rows;
-                    render_scrollbar_corners(f, split[1], right_can_draw_scrollbar, Color::DarkGray);
+                    // In split preview mode, extra corner overlays can clash with the
+                    // rounded pane border; skip the synthetic scrollbar corners.
                 } else {
                     let can_draw_scrollbar = table_area.width > 2 && app.entries.len() > table_area.height as usize;
                     render_scrollbar_corners(f, table_area, can_draw_scrollbar, Color::DarkGray);
                 }
             }
         })?;
+
+        // After ratatui has drawn, overlay native Kitty GP image in the preview pane
+        // for terminals that support it (Ghostty, Kitty, etc.).
+        let kitty_protocol = matches!(
+            App::terminal_image_protocol().0,
+            crate::integration::probe::TerminalImageProtocol::Kitty
+        );
+        if kitty_protocol && app.preview_enabled {
+            if let (Some(area), Some(ref png), Some((_, iw, ih))) = (
+                app.preview_native_area,
+                app.preview_image_png.as_ref(),
+                app.preview_image_rgb.as_ref(),
+            ) {
+                let fit = App::fit_native_image_area(area, *iw, *ih);
+                let path_key = app
+                    .preview_target_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<no-path>".to_string());
+                let draw_key = format!(
+                    "{}|{}x{}|{}:{}:{}:{}",
+                    path_key, iw, ih, fit.x, fit.y, fit.width, fit.height
+                );
+
+                if app.preview_native_last_key.as_deref() != Some(draw_key.as_str()) {
+                    let _ = App::clear_kitty_pane_images();
+                    let _ = App::emit_kitty_pane(
+                        png,
+                        *iw,
+                        *ih,
+                        fit.x,
+                        fit.y,
+                        fit.width,
+                        fit.height,
+                    );
+                    app.preview_native_last_key = Some(draw_key);
+                }
+            } else if app.preview_native_last_key.is_some() {
+                // Switched from image -> non-image (folder/text/etc.): clear once.
+                let _ = App::clear_kitty_pane_images();
+                app.preview_native_last_key = None;
+            }
+        } else if app.preview_native_last_key.is_some() {
+            // Preview disabled (or no longer Kitty): clear once and stop tracking.
+            if kitty_protocol {
+                let _ = App::clear_kitty_pane_images();
+            }
+            app.preview_native_last_key = None;
+        }
 
         let mut next_key: Option<KeyEvent> = deferred_key.take();
         if next_key.is_none() && event::poll(Duration::from_millis(80))? {
@@ -8266,8 +8434,7 @@ fn main() -> io::Result<()> {
                         } else {
                             "hidden files: hidden"
                         });
-                    }
-                    KeyCode::F(2) | KeyCode::Char('r') => {
+
                         if app.marked_indices.len() > 1 {
                             if !app.integration_active("vidir") {
                                 app.set_status("vidir not found in PATH");
@@ -8377,13 +8544,20 @@ fn main() -> io::Result<()> {
                                 let _ = app.preview_archive_contents(&selected_path);
                                 terminal.clear()?;
                             }
-                            else if App::is_image_file(&selected_path) && app.integration_active("viu") {
-                                app.preview_images_with_viu(selected_path)?;
-                                terminal.clear()?;
-                            }
-                            else if App::is_image_file(&selected_path) && app.integration_active("chafa") {
-                                app.preview_images_with_chafa(selected_path)?;
-                                terminal.clear()?;
+                            else if App::is_image_file(&selected_path) {
+                                if app.preview_images_with_native(selected_path.clone())? {
+                                    terminal.clear()?;
+                                } else if app.preview_images_with_halfblock_fullscreen(selected_path.clone())? {
+                                    terminal.clear()?;
+                                } else if app.integration_active("viu") {
+                                    app.preview_images_with_viu(selected_path)?;
+                                    terminal.clear()?;
+                                } else if app.integration_active("chafa") {
+                                    app.preview_images_with_chafa(selected_path)?;
+                                    terminal.clear()?;
+                                } else {
+                                    app.set_status("image preview unavailable (native, halfblock, viu, chafa)");
+                                }
                             }
                             else if App::is_markdown_file(&selected_path) && app.integration_active("glow") {
                                 disable_raw_mode()?;
