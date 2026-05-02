@@ -56,6 +56,28 @@ pub fn panel_tab_hit_test(relative_x: u16) -> Option<u8> {
     None
 }
 
+pub fn shortcut_footer_line(entries: &[(&'static str, &'static str)]) -> Line<'static> {
+    let shortcut_style = Style::default().fg(Color::White);
+    let desc_style = Style::default().fg(Color::DarkGray);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+
+    for (idx, (shortcut, description)) in entries.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled("  ", sep_style));
+        }
+        spans.push(Span::styled(*shortcut, shortcut_style));
+        spans.push(Span::styled(":", shortcut_style));
+        spans.push(Span::styled(*description, desc_style));
+    }
+
+    Line::from(spans)
+}
+
+pub fn shortcut_footer_lines(entries: &[(&'static str, &'static str)]) -> Vec<Line<'static>> {
+    vec![Line::from(""), shortcut_footer_line(entries)]
+}
+
 pub fn render_integrations_overlay<F>(
     f: &mut Frame,
     area: Rect,
@@ -176,8 +198,18 @@ where
     .min(max_scroll);
     let can_draw_scrollbar = int_chunks[0].width > 2 && total_rows > visible_rows;
 
+    let indented_lines: Vec<Line> = lines
+        .iter()
+        .map(|line| {
+            let mut spans: Vec<Span> = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::raw(" "));
+            spans.extend(line.spans.iter().cloned());
+            Line::from(spans)
+        })
+        .collect();
+
     f.render_widget(
-        Paragraph::new(lines).scroll((int_scroll as u16, 0)),
+        Paragraph::new(indented_lines).scroll((int_scroll as u16, 0)),
         int_chunks[0],
     );
     if can_draw_scrollbar {
@@ -213,13 +245,13 @@ where
         }
     }
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " ↑↓:navigate  Space:toggle  Enter:install missing  Tab:switch tabs  Esc:close",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+        Paragraph::new(shortcut_footer_lines(&[
+            ("↑↓", "navigate"),
+            ("Space", "toggle"),
+            ("Enter", "install missing"),
+            ("Tab", "switch tabs"),
+            ("Esc", "close"),
+        ])),
         int_chunks[1],
     );
 }
@@ -439,13 +471,11 @@ pub fn render_help_overlay(
         }
     }
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " ↑↓/PgUp/PgDn/Home/End:scroll  Tab:switch tabs  Esc:close",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+        Paragraph::new(shortcut_footer_lines(&[
+            ("↑↓/PgUp/PgDn/Home/End", "scroll"),
+            ("Tab", "switch tabs"),
+            ("Esc", "close"),
+        ])),
         help_footer_area,
     );
 
@@ -532,13 +562,12 @@ pub fn render_bookmarks_overlay(
         .split(bm_inner);
     f.render_widget(Paragraph::new(lines), bm_chunks[0]);
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " ↑↓:navigate  Enter/0-9:jump  Tab:switch tabs  Esc:close",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+        Paragraph::new(shortcut_footer_lines(&[
+            ("↑↓", "navigate"),
+            ("Enter/0-9", "jump"),
+            ("Tab", "switch tabs"),
+            ("Esc", "close"),
+        ])),
         bm_chunks[1],
     );
 }
@@ -627,13 +656,12 @@ pub fn render_sort_overlay(
         .split(sort_inner);
     f.render_widget(Paragraph::new(lines), sort_chunks[0]);
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " ↑↓:navigate  Enter:apply  Tab:switch tabs  Esc:close",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+        Paragraph::new(shortcut_footer_lines(&[
+            ("↑↓", "navigate"),
+            ("Enter", "apply"),
+            ("Tab", "switch tabs"),
+            ("Esc", "close"),
+        ])),
         sort_chunks[1],
     );
 }

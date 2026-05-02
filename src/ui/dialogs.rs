@@ -10,12 +10,16 @@ pub fn confirm_integration_install_msg_lines(
     brew_display: &str,
     brew_missing: bool,
 ) -> Vec<String> {
+    let brew_command = Path::new(brew_display)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(brew_display);
+
     let mut msg_lines: Vec<String> = vec![
-        "Install missing integration?".to_string(),
         String::new(),
         format!(" Integration: {}", key),
         format!(" Package:     {}", package),
-        format!(" Command:     {} install {}", brew_display, package),
+        format!(" Command:     {} install {}", brew_command, package),
         String::new(),
     ];
 
@@ -24,7 +28,6 @@ pub fn confirm_integration_install_msg_lines(
         msg_lines.push(String::new());
     }
 
-    msg_lines.push("  Enter: activate selected button   ←/→/Tab: switch".to_string());
     msg_lines
 }
 
@@ -38,7 +41,7 @@ pub fn confirm_integration_install_dialog_area(area: Rect, msg_lines: &[String])
     let max_w = area.width.saturating_sub(4).max(1);
     let max_h = area.height.saturating_sub(4).max(1);
     let dialog_w = (content_w + 2).max(56).min(max_w);
-    let dialog_h = (content_h + 4).max(10).min(max_h);
+    let dialog_h = (content_h + 4).max(8).min(max_h);
     Rect::new(
         (area.width.saturating_sub(dialog_w)) / 2,
         (area.height.saturating_sub(dialog_h)) / 2,
@@ -81,7 +84,7 @@ pub fn confirm_ok_cancel_button_layout(area: Rect) -> Option<(Rect, u16, u16, u1
 
 pub fn render_confirm_integration_install_dialog(
     f: &mut Frame,
-    msg: String,
+    msg_lines: &[String],
     confirm_area: Rect,
     button_focus: u8,
     nerd_font_active: bool,
@@ -94,18 +97,49 @@ pub fn render_confirm_integration_install_dialog(
         " Install Integration "
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .title_style(Style::default().fg(Color::White));
+    let inner = block.inner(confirm_area);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(1),
+        inner.height,
+    );
+    f.render_widget(block, confirm_area);
+
+    let content_lines: Vec<Line<'static>> = msg_lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return Line::from(Span::raw(" "));
+            }
+
+            let content = line.strip_prefix(' ').unwrap_or(line.as_str());
+            if let Some((label, value)) = content.split_once(':') {
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{}:", label),
+                        Style::default().fg(Color::Rgb(140, 200, 255)),
+                    ),
+                    Span::styled(value.to_string(), Style::default().fg(Color::White)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(content.to_string(), Style::default().fg(Color::Rgb(140, 200, 255))),
+                ])
+            }
+        })
+        .collect();
+
     f.render_widget(
-        Paragraph::new(msg)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Rgb(140, 200, 255)))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(title)
-                    .title_style(Style::default().fg(Color::White)),
-            ),
-        confirm_area,
+        Paragraph::new(content_lines).wrap(Wrap { trim: false }),
+        content_area,
     );
 
     if let Some((button_area, _, _, _, _)) = confirm_ok_cancel_button_layout(confirm_area) {

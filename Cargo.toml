@@ -1,6 +1,6 @@
 [package]
 name = "sbrs"
-version = "0.5.6"
+version = "0.5.10"
 edition = "2024"
 description = "Shell Buddy (sb)"
 repository = "https://github.com/hjelev/sbrs"

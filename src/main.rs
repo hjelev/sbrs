@@ -5434,7 +5434,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                 }
                 let _ = self.handle_confirm_delete_click(mouse.column, mouse.row, area);
                 if self.handle_confirm_integration_install_click(mouse.column, mouse.row, area) {
-                    return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return None;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -6785,13 +6785,13 @@ fn main() -> io::Result<()> {
                     }
                 }
                 f.render_widget(
-                    Paragraph::new(vec![
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            " ↑↓:navigate  Enter:open  Ctrl+T:toggle scope  Tab:switch tabs  Regex: re:pattern or /pattern/i",
-                            Style::default().fg(Color::DarkGray),
-                        )),
-                    ]),
+                    Paragraph::new(ui::panels::shortcut_footer_lines(&[
+                        ("↑↓", "navigate"),
+                        ("Enter", "open"),
+                        ("Ctrl+T", "toggle scope"),
+                        ("Regex", "re:pattern or /pattern/i"),
+                        ("Tab", "switch tabs"),
+                    ])),
                     footer_area,
                 );
 
@@ -7265,13 +7265,13 @@ fn main() -> io::Result<()> {
                     .split(ssh_inner);
                 f.render_widget(Paragraph::new(lines), ssh_chunks[0]);
                 f.render_widget(
-                    Paragraph::new(vec![
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            " ↑↓:navigate  Enter/→:open or mount  Tab:switch tabs  u/Delete:unmount  Esc:close",
-                            Style::default().fg(Color::DarkGray),
-                        )),
-                    ]),
+                    Paragraph::new(ui::panels::shortcut_footer_lines(&[
+                        ("↑↓", "navigate"),
+                        ("Enter/→", "open or mount"),
+                        ("u/Delete", "unmount"),
+                        ("Tab", "switch tabs"),
+                        ("Esc", "close"),
+                    ])),
                     ssh_chunks[1],
                 );
             } else if app.mode == AppMode::ConfirmExtract {
@@ -7329,12 +7329,10 @@ fn main() -> io::Result<()> {
             } else if app.mode == AppMode::ConfirmIntegrationInstall {
                 let area = f.size();
                 let msg_lines = app.confirm_integration_install_msg_lines();
-
-                let msg = msg_lines.join("\n");
                 let confirm_area = app.confirm_integration_install_dialog_area(area);
                 ui::dialogs::render_confirm_integration_install_dialog(
                     f,
-                    msg,
+                    &msg_lines,
                     confirm_area,
                     app.confirm_integration_install_button_focus,
                     app.nerd_font_active,
