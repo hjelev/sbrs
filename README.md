@@ -126,8 +126,12 @@ Use the installer there if you want the fastest setup without building from sour
 ## Core Controls
 
 - `q` / `Esc`: quit
+- `\``: toggle preview pane
 - `Enter` / `Right`: open entry / preview file
 - `Left` / `Backspace`: go to parent / leave mounted view
+- mouse left-click: select clicked entry
+- mouse double left-click: open clicked entry (same behavior as `Right`)
+- mouse right-click: go to parent / leave mounted view (same behavior as `Left`)
 - `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`: navigation
 - `Space`: mark/unmark current entry
 - `*`: toggle all marks

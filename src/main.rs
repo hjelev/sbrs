@@ -20,6 +20,9 @@ impl App {
         matches!(self.mode, AppMode::Browsing | AppMode::PathEditing)
     }
 }
+
+const MAIN_LIST_DOUBLE_CLICK_WINDOW_MS: u64 = 320;
+
 use crossterm::{
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{
@@ -353,6 +356,7 @@ struct App {
     folder_size_scan_id: u64,
     tree_expansion_levels: HashMap<PathBuf, usize>,
     tree_last_tap: Option<(char, Instant)>,
+    main_list_last_click: Option<(PathBuf, usize, Instant)>,
     tree_row_prefixes: Vec<String>,
     current_dir_total_size_rx: Option<Receiver<CurrentDirTotalSizeMsg>>,
     current_dir_total_size_scan_id: u64,
@@ -548,6 +552,7 @@ impl App {
             folder_size_scan_id: 0,
             tree_expansion_levels: HashMap::new(),
             tree_last_tap: None,
+            main_list_last_click: None,
             tree_row_prefixes: Vec::new(),
             current_dir_total_size_rx: None,
             current_dir_total_size_scan_id: 0,
@@ -5320,32 +5325,123 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         }
     }
 
-    fn main_table_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+    fn main_table_and_list_areas(&self, area: Rect) -> Option<(Rect, Rect)> {
         if self.mode != AppMode::Browsing {
             return None;
         }
+
+        let footer_height = if self.preview_enabled { 1 } else { 2 };
+        let header_reserved_rows = if self.preview_enabled { 1 } else { 2 };
         let chunks = Layout::default()
-            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .constraints([Constraint::Min(3), Constraint::Length(footer_height)])
             .split(area);
-        let table_area = Rect::new(
+
+        let content_area = Rect::new(
             chunks[0].x,
-            chunks[0].y + 2,
+            chunks[0].y + header_reserved_rows,
             chunks[0].width,
-            chunks[0].height.saturating_sub(2),
+            chunks[0].height.saturating_sub(header_reserved_rows),
         );
-        if table_area.height == 0 || table_area.width <= 2 {
+
+        let list_frame_area = if self.preview_enabled {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                .split(content_area)[0]
+        } else {
+            content_area
+        };
+
+        let table_area = if self.preview_enabled {
+            Rect::new(
+                list_frame_area.x + 1,
+                list_frame_area.y + 1,
+                list_frame_area.width.saturating_sub(2),
+                list_frame_area.height.saturating_sub(2),
+            )
+        } else {
+            content_area
+        };
+
+        if table_area.height == 0 || table_area.width == 0 {
             return None;
         }
+
         let needs_scroll = self.entries.len() > table_area.height as usize;
-        if !needs_scroll {
+        let can_draw_scrollbar = self.mode_shows_main_scrollbar() && table_area.width > 2 && needs_scroll;
+        let list_area = if can_draw_scrollbar {
+            Rect::new(
+                table_area.x,
+                table_area.y,
+                table_area.width.saturating_sub(1),
+                table_area.height,
+            )
+        } else {
+            table_area
+        };
+
+        Some((table_area, list_area))
+    }
+
+    fn main_table_scrollbar_area(&self, area: Rect) -> Option<Rect> {
+        let (table_area, list_area) = self.main_table_and_list_areas(area)?;
+        if list_area.width >= table_area.width || list_area.height == 0 {
             return None;
         }
+
         Some(Rect::new(
-            table_area.x + table_area.width.saturating_sub(1),
-            table_area.y,
+            list_area.x + list_area.width,
+            list_area.y,
             1,
-            table_area.height,
+            list_area.height,
         ))
+    }
+
+    fn handle_main_list_click(&mut self, column: u16, row: u16, area: Rect) -> Option<KeyEvent> {
+        let (_, list_area) = self.main_table_and_list_areas(area)?;
+        if list_area.width == 0 || list_area.height == 0 {
+            return None;
+        }
+        if column < list_area.x
+            || column >= list_area.x + list_area.width
+            || row < list_area.y
+            || row >= list_area.y + list_area.height
+        {
+            return None;
+        }
+
+        let row_rel = row.saturating_sub(list_area.y) as usize;
+        let target_idx = self.table_state.offset().saturating_add(row_rel);
+        if target_idx >= self.entries.len() {
+            return None;
+        }
+
+        self.selected_index = target_idx;
+        self.table_state.select(Some(target_idx));
+
+        let now = Instant::now();
+        let is_double_click = self
+            .main_list_last_click
+            .as_ref()
+            .map(|(last_dir, last_idx, last_ts)| {
+                *last_idx == target_idx
+                    && *last_dir == self.current_dir
+                    && now.duration_since(*last_ts)
+                        <= Duration::from_millis(MAIN_LIST_DOUBLE_CLICK_WINDOW_MS)
+            })
+            .unwrap_or(false);
+
+        self.main_list_last_click = if is_double_click {
+            None
+        } else {
+            Some((self.current_dir.clone(), target_idx, now))
+        };
+
+        if is_double_click {
+            Some(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+        } else {
+            None
+        }
     }
 
     fn scroll_main_list_from_scrollbar_row(&mut self, area: Rect, row: u16, grab_offset: u16) {
@@ -5383,6 +5479,12 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
         match mouse.kind {
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(true),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(false),
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.file_list_scroll_dragging = false;
+                if matches!(self.mode, AppMode::Browsing | AppMode::PathEditing) {
+                    return Some(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(sb_area) = self.main_table_scrollbar_area(area) {
                     if mouse.column >= sb_area.x
@@ -5423,6 +5525,9 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                     }
                 }
                 self.file_list_scroll_dragging = false;
+                if let Some(key) = self.handle_main_list_click(mouse.column, mouse.row, area) {
+                    return Some(key);
+                }
                 if self.handle_tab_close_click(mouse.column, mouse.row, area) {
                     return None;
                 }
