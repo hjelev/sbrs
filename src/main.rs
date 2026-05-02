@@ -7976,7 +7976,9 @@ fn main() -> io::Result<()> {
                         } else {
                             "hidden files: hidden"
                         });
+                    }
 
+                    KeyCode::F(2) | KeyCode::Char('r') => {
                         if app.marked_indices.len() > 1 {
                             if !app.integration_active("vidir") {
                                 app.set_status("vidir not found in PATH");
