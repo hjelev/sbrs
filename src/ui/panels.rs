@@ -470,7 +470,7 @@ pub fn render_help_overlay(
     }
     f.render_widget(
         Paragraph::new(shortcut_footer_lines(&[
-            ("↑↓/PgUp/PgDn/Home/End", "scroll"),
+            ("↑↓", "navigate"),
             ("Tab", "switch tabs"),
             ("Esc", "close"),
         ])),
