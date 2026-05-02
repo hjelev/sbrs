@@ -5145,13 +5145,13 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
             }
             AppMode::Integrations => {
                 let overlay = Self::tab_overlay_anchor(area);
-                let integrations = self.integration_rows_cache.clone();
-                if integrations.is_empty() {
+                let integrations_len = self.integration_rows_cache.len();
+                if integrations_len == 0 {
                     return None;
                 }
 
                 let int_w = (area.width * 5 / 6).max(70).min(overlay.width);
-                let int_h = (integrations.len() as u16 + 1 + 4).min(overlay.height);
+                let int_h = (integrations_len as u16 + 1 + 4).min(overlay.height);
                 let int_area = Rect::new(overlay.x, overlay.y, int_w, int_h);
                 let int_inner = Self::inner_with_borders(int_area);
                 let int_chunks = Layout::default()
@@ -5175,7 +5175,7 @@ printf '%s\n' "${paths[$idx]}" > "$out_file"
                     selected_line + 1 - visible_rows
                 };
                 let line_idx = int_scroll + row.saturating_sub(content.y) as usize;
-                if line_idx >= 1 && line_idx <= integrations.len() {
+                if line_idx >= 1 && line_idx <= integrations_len {
                     self.integration_selected = line_idx - 1;
                     return Some(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
                 }
@@ -7229,9 +7229,10 @@ fn main() -> io::Result<()> {
                 );
             } else if app.mode == AppMode::Integrations {
                 let area = f.size();
-                let integrations = app.integration_rows_cache.clone();
-                if !integrations.is_empty() && app.integration_selected >= integrations.len() {
-                    app.integration_selected = integrations.len() - 1;
+                if !app.integration_rows_cache.is_empty()
+                    && app.integration_selected >= app.integration_rows_cache.len()
+                {
+                    app.integration_selected = app.integration_rows_cache.len() - 1;
                 }
 
                 ui::panels::render_integrations_overlay(
@@ -7239,9 +7240,8 @@ fn main() -> io::Result<()> {
                     area,
                     tab_overlay_anchor,
                     app.panel_tab,
-                    &integrations,
+                    &app.integration_rows_cache,
                     app.integration_selected,
-                    |key| app.integration_enabled(key),
                 );
             } else if app.mode == AppMode::SortMenu {
                 let options = App::sort_mode_options();

@@ -78,35 +78,34 @@ pub fn shortcut_footer_lines(entries: &[(&'static str, &'static str)]) -> Vec<Li
     vec![Line::from(""), shortcut_footer_line(entries)]
 }
 
-pub fn render_integrations_overlay<F>(
+pub fn render_integrations_overlay(
     f: &mut Frame,
     area: Rect,
     tab_overlay_anchor: Rect,
     panel_tab: u8,
     integrations: &[IntegrationRow],
     integration_selected: usize,
-    is_integration_enabled: F,
-)
-where
-    F: Fn(&str) -> bool,
-{
+) {
     let int_w = (area.width * 5 / 6).max(70).min(tab_overlay_anchor.width);
     let int_content_w = int_w.saturating_sub(2) as usize;
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     for (i, row) in integrations.iter().enumerate() {
         let is_selected = i == integration_selected;
-        let status_text = if row.required || (is_integration_enabled(&row.key) && row.available) {
+        let is_enabled = matches!(
+            row.state.as_str(),
+            "[required]" | "[active]" | "[partial]" | "[on]"
+        );
+        let status_text = if row.required || (is_enabled && row.available) {
             " ✓ ".to_string()
-        } else if is_integration_enabled(&row.key) && row.partially_supported {
+        } else if is_enabled && row.partially_supported {
             " ✓ ".to_string()
         } else {
             " ✕ ".to_string()
         };
-        let status_style = if row.required || (is_integration_enabled(&row.key) && row.available)
-        {
+        let status_style = if row.required || (is_enabled && row.available) {
             Style::default().fg(Color::Rgb(100, 220, 120))
-        } else if is_integration_enabled(&row.key) && row.partially_supported {
+        } else if is_enabled && row.partially_supported {
             Style::default().fg(Color::Rgb(245, 200, 90))
         } else {
             Style::default().fg(Color::Rgb(220, 80, 80))
@@ -128,9 +127,9 @@ where
                 base_style.fg(Color::Rgb(200, 200, 200))
             } else if !row.available && !row.partially_supported {
                 base_style.fg(Color::Rgb(220, 80, 80))
-            } else if is_integration_enabled(&row.key) && row.partially_supported {
+            } else if is_enabled && row.partially_supported {
                 base_style.fg(Color::Rgb(245, 200, 90))
-            } else if is_integration_enabled(&row.key) {
+            } else if is_enabled {
                 base_style.fg(Color::Rgb(255, 220, 140))
             } else {
                 base_style.fg(Color::Rgb(150, 150, 150))
